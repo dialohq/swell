@@ -1,0 +1,9 @@
+target/
+node_modules/
+dist/
+.swell/
+*.tsbuildinfo
+.devenv/
+.direnv/
+result
+result-*

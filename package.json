@@ -1,0 +1,12 @@
+{
+  "name": "swell-monorepo",
+  "private": true,
+  "workspaces": [
+    "packages/*",
+    "examples/*"
+  ],
+  "scripts": {
+    "build:runtime": "npm run -w packages/runtime build",
+    "typecheck": "npm run -ws --if-present typecheck"
+  }
+}
