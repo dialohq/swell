@@ -2,8 +2,8 @@ name: CI
 
 on:
   push:
-    branches: [main]
   pull_request:
+  workflow_dispatch:
 
 # CI does one thing: build every derivation under the flake's
 # `checks.<system>` output in parallel via nix-fast-build. The Nix store
