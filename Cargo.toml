@@ -3,6 +3,9 @@ resolver = "2"
 # Members are added as each crate lands — see the per-crate PRs.
 members = [
     "crates/swell-analyzer",
+    "crates/swell-scanner",
+    "crates/swell-codegen",
+    "crates/swell-cli",
 ]
 
 [workspace.package]
