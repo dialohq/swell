@@ -1,7 +1,9 @@
 [workspace]
 resolver = "2"
 # Members are added as each crate lands — see the per-crate PRs.
-members = []
+members = [
+    "crates/swell-analyzer",
+]
 
 [workspace.package]
 version = "0.1.0"
