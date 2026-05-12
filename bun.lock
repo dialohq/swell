@@ -4,6 +4,27 @@
   "workspaces": {
     "": {
       "name": "swell-monorepo",
+      "peerDependencies": {
+        "pg": "^8.0.0",
+        "pg-query-stream": "^4.0.0",
+        "postgres": "^3.4.0",
+      },
+      "optionalPeers": [
+        "pg",
+        "pg-query-stream",
+        "postgres",
+      ],
+    },
+    "examples/basic": {
+      "name": "swell-example-basic",
+      "version": "0.0.0",
+      "dependencies": {
+        "swell": "*",
+      },
+      "devDependencies": {
+        "@types/node": "^20.0.0",
+        "typescript": "^5.4.0",
+      },
     },
     "packages/runtime": {
       "name": "swell",
@@ -31,6 +52,8 @@
     "postgres": ["postgres@3.4.9", "", {}, "sha512-GD3qdB0x1z9xgFI6cdRD6xu2Sp2WCOEoe3mtnyB5Ee0XrrL5Pe+e4CCnJrRMnL1zYtRDZmQQVbvOttLnKDLnaw=="],
 
     "swell": ["swell@workspace:packages/runtime"],
+
+    "swell-example-basic": ["swell-example-basic@workspace:examples/basic"],
 
     "typescript": ["typescript@5.9.3", "", { "bin": { "tsc": "bin/tsc", "tsserver": "bin/tsserver" } }, "sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw=="],
 

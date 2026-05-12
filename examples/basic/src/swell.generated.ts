@@ -5,6 +5,14 @@ import { createTypedSql, type AnyDriver, type Json, type TypedSql } from "swell"
 
 // Per-package query registry — one entry per analysed `sql.<method>` call site.
 export type QueryRegistry = {
+  "SELECT count(*) AS n FROM users WHERE org_id = $1": { params: [string | null]; row: { n: string } };
+  "SELECT display_name FROM users WHERE id = $1": { params: [string | null]; row: { display_name: string | null } };
+  "SELECT id, coalesce(display_name, email) AS \"label!\" FROM users WHERE id = $1": { params: [string | null]; row: { id: string; label: string } };
+  "SELECT id, email FROM users WHERE id = $1": { params: [string | null]; row: { id: string; email: string } };
+  "SELECT jsonb_build_object('id', u.id, 'email', u.email, 'name', u.display_name) AS profile FROM users u WHERE u.id = $1": { params: [string | null]; row: { profile: { id: string; email: string; name: string | null } } };
+  "SELECT o.name, jsonb_agg(jsonb_build_object('id', u.id, 'email', u.email)) AS members FROM orgs o JOIN users u ON u.org_id = o.id WHERE o.id = $1 GROUP BY o.id, o.name": { params: [string | null]; row: { name: string; members: { id: string; email: string }[] | null } };
+  "SELECT role FROM users WHERE id = $1": { params: [string | null]; row: { role: "admin" | "member" } };
+  "SELECT u.email, p.body, p.published_at FROM users u LEFT JOIN posts p ON p.author_id = u.id WHERE u.org_id = $1": { params: [string | null]; row: { email: string; body: string | null; published_at: Date | null } };
 };
 
 export type Sql = TypedSql<QueryRegistry>;

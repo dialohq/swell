@@ -1,12 +1,43 @@
 {
-  "name": "swell-monorepo",
-  "private": true,
+  "name": "swell",
+  "version": "0.1.0",
+  "description": "Statically-typed inline Postgres queries for TypeScript",
+  "license": "MIT OR Apache-2.0",
+  "type": "module",
+  "main": "./packages/runtime/dist/index.js",
+  "types": "./packages/runtime/dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./packages/runtime/dist/index.d.ts",
+      "import": "./packages/runtime/dist/index.js"
+    },
+    "./testing": {
+      "types": "./packages/runtime/dist/testing.d.ts",
+      "import": "./packages/runtime/dist/testing.js"
+    }
+  },
+  "files": ["packages/runtime/dist", "packages/runtime/package.json"],
+  "peerDependencies": {
+    "postgres": "^3.4.0",
+    "pg": "^8.0.0",
+    "pg-query-stream": "^4.0.0"
+  },
+  "peerDependenciesMeta": {
+    "postgres": { "optional": true },
+    "pg": { "optional": true },
+    "pg-query-stream": { "optional": true }
+  },
   "workspaces": [
     "packages/*",
     "examples/*"
   ],
   "scripts": {
-    "build:runtime": "npm run -w packages/runtime build",
-    "typecheck": "npm run -ws --if-present typecheck"
+    "build:runtime": "bun run --cwd packages/runtime build",
+    "typecheck": "bun run --cwd packages/runtime typecheck"
+  },
+  "private": false,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dialohq/swell.git"
   }
 }

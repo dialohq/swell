@@ -1,6 +1,13 @@
 target/
 node_modules/
+
+# Ignore stray `dist/` everywhere except the runtime's published output —
+# that one is committed so the repo is installable directly via
+# `github:dialohq/swell#<ref>` (bun fetches the tree; consumers resolve
+# `swell` to `packages/runtime/dist` via the root package.json's exports).
 dist/
+!packages/runtime/dist/
+
 .swell/
 *.tsbuildinfo
 .devenv/

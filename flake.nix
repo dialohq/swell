@@ -61,7 +61,7 @@
           pname = "swell-runtime-typecheck";
           version = "0.1.0";
           src = ./.;
-          npmDepsHash = "sha256-rWPHy6BXEMynTefJ1raAIeXWT2tJ4coQpuN9AmrXbwQ=";
+          npmDepsHash = "sha256-AkkX7GmKX/KdeDkGkky92OC4NogYnlRMn4VdQeQ6NDM=";
           dontNpmBuild = true;
           # Run tsc directly against the runtime sources. No `dist/` is
           # emitted (`--noEmit`); a marker file is the derivation output.
