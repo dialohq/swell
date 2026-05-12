@@ -51,6 +51,29 @@
           LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
           BINDGEN_EXTRA_CLANG_ARGS = bindgenExtraClangArgs;
         };
+
+        # `tsc --noEmit` over packages/runtime, wrapped as a derivation so
+        # it lands in `checks.<system>` and runs under nix-fast-build. Deps
+        # come from the workspace's npm lockfile committed at the repo
+        # root; buildNpmPackage materialises them in a sandboxed
+        # node_modules (no live npm-registry access).
+        runtimeTypecheck = pkgs.buildNpmPackage {
+          pname = "swell-runtime-typecheck";
+          version = "0.1.0";
+          src = ./.;
+          npmDepsHash = "sha256-rWPHy6BXEMynTefJ1raAIeXWT2tJ4coQpuN9AmrXbwQ=";
+          dontNpmBuild = true;
+          # Run tsc directly against the runtime sources. No `dist/` is
+          # emitted (`--noEmit`); a marker file is the derivation output.
+          installPhase = ''
+            runHook preInstall
+            cd packages/runtime
+            npx tsc -p tsconfig.json --noEmit
+            mkdir -p $out
+            touch $out/ok
+            runHook postInstall
+          '';
+        };
       in
       {
         devShells.default = pkgs.mkShell ({
@@ -67,17 +90,8 @@
           '';
         } // commonEnv);
 
-        # Per-branch checks live here. They're picked up by `nix flake check`
-        # and `nix-fast-build .#checks` — CI just runs the latter. Adding a
-        # new build/test step means adding a derivation here; nix's
-        # content-addressed cache means each one only re-runs when its
-        # actual inputs change.
-        #
-        # Branch evolution:
-        #   - main:        no checks (scaffolding only)
-        #   - feat/runtime: adds `runtime-typecheck`
-        #   - feat/analyzer: adds `cargo-build` + `cargo-test`
-        #   - feat/codegen: inherits both; same checks scale to more crates
-        checks = { };
+        checks = {
+          runtime-typecheck = runtimeTypecheck;
+        };
       });
 }
