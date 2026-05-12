@@ -11,7 +11,10 @@
   };
 
   outputs = { self, nixpkgs, flake-utils, rust-overlay }:
-    flake-utils.lib.eachDefaultSystem (system:
+    # Linux only for now — the analyzer's bindgen path bakes in glibc-dev
+    # headers, which doesn't make sense on Darwin. Widen this once
+    # cross-platform is needed.
+    flake-utils.lib.eachSystem [ "x86_64-linux" "aarch64-linux" ] (system:
       let
         pkgs = import nixpkgs {
           inherit system;
