@@ -74,6 +74,31 @@
             runHook postInstall
           '';
         };
+
+        # Cargo build over the workspace, wrapped as a derivation. Deps
+        # are vendored from Cargo.lock; the build is hermetic. Tests that
+        # need a live Postgres run via `nix develop -c cargo test` (see
+        # README) — they're outside the CI check because nix's sandbox
+        # blocks network and the integration tests are intentionally
+        # fail-loud about that.
+        cargoBuild = pkgs.rustPlatform.buildRustPackage ({
+          pname = "swell";
+          version = "0.1.0";
+          src = pkgs.lib.cleanSourceWith {
+            src = ./.;
+            filter = path: _type:
+              let p = baseNameOf (toString path); in
+              !(builtins.elem p [ "target" "node_modules" "result" ".swell" ]);
+          };
+          cargoLock.lockFile = ./Cargo.lock;
+          inherit nativeBuildInputs;
+          buildInputs = buildInputs;
+          # Don't run cargo tests in this derivation — they need a live
+          # Postgres which the nix sandbox can't provide. Tests run via
+          # `nix develop -c cargo test --workspace` in dev / a separate
+          # workflow with a postgres service.
+          doCheck = false;
+        } // commonEnv);
       in
       {
         devShells.default = pkgs.mkShell ({
@@ -92,6 +117,7 @@
 
         checks = {
           runtime-typecheck = runtimeTypecheck;
+          cargo-build = cargoBuild;
         };
       });
 }
