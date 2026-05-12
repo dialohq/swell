@@ -166,15 +166,12 @@ pub async fn load_type_catalog(client: &Client, schemas: &[String]) -> anyhow::R
     }
 
     // ------------ Safe built-in JSON helpers ------------
-    // Verify that each unqualified name we transform in `json_shape.rs`
-    // resolves under the live `search_path` to the *real* `pg_catalog`
-    // function — i.e. no user-defined shadow exists. We compare the
-    // OID returned by `to_regproc(name)` (which respects search_path) to
-    // the OID stored in `pg_catalog.pg_proc` for the catalog version. If
-    // they match, the name is "safe" to use unqualified in inference. If
-    // they don't match (or to_regproc returns NULL, meaning ambiguous or
-    // missing), we drop the unqualified form — `pg_catalog.X` still works
-    // because it's explicitly qualified at the call site.
+    // For each unqualified name we transform in `json_shape.rs`, verify
+    // that no user-defined function with the same name lives in any
+    // schema in the current `search_path`. If none does, the unqualified
+    // reference resolves to `pg_catalog` and is safe to transform. If a
+    // shadow exists we drop it — `pg_catalog.X` still works because the
+    // schema qualification is explicit at the call site.
     cat.safe_builtin_procs = load_safe_builtin_procs(client).await?;
 
     Ok(cat)
@@ -196,9 +193,16 @@ const SAFE_BUILTIN_CANDIDATES: &[&str] = &[
 ];
 
 async fn load_safe_builtin_procs(client: &Client) -> anyhow::Result<BTreeMap<String, u32>> {
-    // For each candidate name, pair: (resolved OID via to_regproc, canonical
-    // pg_catalog OID via pg_proc lookup). Keep the name iff both are present
-    // and equal. Run as one round-trip via `unnest` to avoid N queries.
+    // For each candidate name, return the canonical `pg_catalog` OID iff:
+    //   (a) the name exists in `pg_catalog`, AND
+    //   (b) no function with the same name lives in any user-listed schema
+    //       in the current `search_path` — i.e. the unqualified reference
+    //       is not shadowed.
+    //
+    // We avoid `to_regproc(name)`: most JSON helpers (`jsonb_build_object`,
+    // `jsonb_object_agg`, …) are variadic, and `to_regproc` errors on
+    // ambiguous-without-argument-types names, which would kill the whole
+    // probe. Shadow-detection is equivalent in effect and avoids that.
     let names: Vec<String> =
         SAFE_BUILTIN_CANDIDATES.iter().map(|s| s.to_string()).collect();
 
@@ -210,7 +214,6 @@ async fn load_safe_builtin_procs(client: &Client) -> anyhow::Result<BTreeMap<Str
             )
             SELECT
                 c.name,
-                to_regproc(c.name)::oid AS resolved_oid,
                 (
                     SELECT p.oid
                     FROM pg_catalog.pg_proc p
@@ -219,6 +222,14 @@ async fn load_safe_builtin_procs(client: &Client) -> anyhow::Result<BTreeMap<Str
                     LIMIT 1
                 ) AS catalog_oid
             FROM candidates c
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM pg_catalog.pg_proc p
+                JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+                WHERE p.proname = c.name
+                  AND n.nspname <> 'pg_catalog'
+                  AND n.nspname = ANY(current_schemas(false))
+            )
             "#,
             &[&names],
         )
@@ -227,12 +238,9 @@ async fn load_safe_builtin_procs(client: &Client) -> anyhow::Result<BTreeMap<Str
     let mut out = BTreeMap::new();
     for row in &rows {
         let name: String = row.get(0);
-        let resolved: Option<u32> = row.try_get(1).ok();
-        let canonical: Option<u32> = row.try_get(2).ok();
-        if let (Some(r), Some(c)) = (resolved, canonical) {
-            if r == c {
-                out.insert(name, c);
-            }
+        let canonical: Option<u32> = row.try_get(1).ok();
+        if let Some(oid) = canonical {
+            out.insert(name, oid);
         }
     }
     Ok(out)
