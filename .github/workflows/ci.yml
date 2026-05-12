@@ -5,13 +5,14 @@ on:
     branches: [main]
   pull_request:
 
-env:
-  CARGO_TERM_COLOR: always
-  RUSTFLAGS: -Dwarnings
+# CI runs entirely inside `nix develop` — same toolchain as local dev (rustc,
+# postgres, node, bun, libclang for pg_query's bindgen, etc.). Nothing is
+# installed via apt or rustup; the only outside-of-nix step is checkout +
+# the nix installer itself.
 
 jobs:
   rust:
-    name: cargo build + test
+    name: cargo build + test (nix)
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -31,36 +32,40 @@ jobs:
       DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: cachix/install-nix-action@v27
         with:
-          toolchain: 1.90.0
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - name: Install libclang (bindgen)
-        run: sudo apt-get update && sudo apt-get install -y libclang-dev
+          nix_path: nixpkgs=channel:nixos-unstable
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      - uses: DeterminateSystems/magic-nix-cache-action@v8
       - name: cargo fmt
-        run: cargo fmt --all -- --check
+        run: nix develop -c cargo fmt --all -- --check
       - name: cargo clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: nix develop -c cargo clippy --workspace --all-targets -- -D warnings
+        env:
+          RUSTFLAGS: -Dwarnings
       - name: cargo build
-        run: cargo build --workspace --all-targets
+        run: nix develop -c cargo build --workspace --all-targets
       - name: cargo test
-        run: cargo test --workspace
+        run: nix develop -c cargo test --workspace
 
   ts:
-    name: bun typecheck
+    name: bun typecheck (nix)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v1
+      - uses: cachix/install-nix-action@v27
         with:
-          bun-version: latest
+          nix_path: nixpkgs=channel:nixos-unstable
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      - uses: DeterminateSystems/magic-nix-cache-action@v8
       - name: bun install
-        run: bun install --frozen-lockfile
+        run: nix develop -c bun install --frozen-lockfile
         continue-on-error: true
       - name: typecheck runtime
-        run: bun run --cwd packages/runtime typecheck
+        run: nix develop -c bun run --cwd packages/runtime typecheck
         if: hashFiles('packages/runtime/package.json') != ''
       - name: typecheck example
-        run: bun run --cwd examples/basic typecheck
+        run: nix develop -c bun run --cwd examples/basic typecheck
         if: hashFiles('examples/basic/package.json') != ''
