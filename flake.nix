@@ -36,21 +36,22 @@
           postgresql
           openssl
         ];
+
+        # Header search path for pg_query's bindgen. Reused by every check
+        # that touches the analyzer (which depends on pg_query).
+        bindgenExtraClangArgs = builtins.toString [
+          "-I${pkgs.glibc.dev}/include"
+          "-I${pkgs.llvmPackages.libclang.lib}/lib/clang/${pkgs.lib.versions.major pkgs.llvmPackages.libclang.version}/include"
+        ];
+
+        commonEnv = {
+          LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+          BINDGEN_EXTRA_CLANG_ARGS = bindgenExtraClangArgs;
+        };
       in
       {
-        devShells.default = pkgs.mkShell {
+        devShells.default = pkgs.mkShell ({
           inherit buildInputs nativeBuildInputs;
-
-          # bindgen looks at LIBCLANG_PATH; without this, pg_query's build fails.
-          LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
-
-          # bindgen also needs to find system headers (sys/types.h, stddef.h etc.).
-          # On Nix we have to point it at glibc-dev and clang's builtin headers
-          # explicitly — there's no system /usr/include.
-          BINDGEN_EXTRA_CLANG_ARGS = builtins.toString ([
-            "-I${pkgs.glibc.dev}/include"
-            "-I${pkgs.llvmPackages.libclang.lib}/lib/clang/${pkgs.lib.versions.major pkgs.llvmPackages.libclang.version}/include"
-          ]);
 
           shellHook = ''
             export PGDATA="$PWD/.postgres-data"
@@ -61,9 +62,19 @@
             echo "  bun:   $(bun --version)"
             echo "  pg:    $(postgres --version)"
           '';
-        };
+        } // commonEnv);
 
-        # packages.default = pkgs.rustPlatform.buildRustPackage { ... }
-        # Re-enable once Cargo.lock is committed — see flake.nix history.
+        # Per-branch checks live here. They're picked up by `nix flake check`
+        # and `nix-fast-build .#checks` — CI just runs the latter. Adding a
+        # new build/test step means adding a derivation here; nix's
+        # content-addressed cache means each one only re-runs when its
+        # actual inputs change.
+        #
+        # Branch evolution:
+        #   - main:        no checks (scaffolding only)
+        #   - feat/runtime: adds `runtime-typecheck`
+        #   - feat/analyzer: adds `cargo-build` + `cargo-test`
+        #   - feat/codegen: inherits both; same checks scale to more crates
+        checks = { };
       });
 }

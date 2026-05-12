@@ -5,67 +5,18 @@ on:
     branches: [main]
   pull_request:
 
-# CI runs entirely inside `nix develop` — same toolchain as local dev (rustc,
-# postgres, node, bun, libclang for pg_query's bindgen, etc.). Nothing is
-# installed via apt or rustup; the only outside-of-nix step is checkout +
-# the nix installer itself.
-
+# CI does one thing: build every derivation under the flake's
+# `checks.<system>` output in parallel via nix-fast-build. The Nix store
+# is content-addressed, so derivations whose inputs are unchanged are
+# served from cache (no rebuild). Adding a new check means adding a
+# derivation in flake.nix — no workflow edits required.
 jobs:
-  rust:
-    name: cargo build + test (nix)
-    runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:17
-        env:
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_USER: postgres
-          POSTGRES_DB: postgres
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 5
-    env:
-      DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
-    steps:
-      - uses: actions/checkout@v4
-      - uses: cachix/install-nix-action@v27
-        with:
-          nix_path: nixpkgs=channel:nixos-unstable
-          extra_nix_config: |
-            experimental-features = nix-command flakes
-      - uses: DeterminateSystems/magic-nix-cache-action@v8
-      - name: cargo fmt
-        run: nix develop -c cargo fmt --all -- --check
-      - name: cargo clippy
-        run: nix develop -c cargo clippy --workspace --all-targets -- -D warnings
-        env:
-          RUSTFLAGS: -Dwarnings
-      - name: cargo build
-        run: nix develop -c cargo build --workspace --all-targets
-      - name: cargo test
-        run: nix develop -c cargo test --workspace
-
-  ts:
-    name: bun typecheck (nix)
+  check:
+    name: nix-fast-build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: cachix/install-nix-action@v27
-        with:
-          nix_path: nixpkgs=channel:nixos-unstable
-          extra_nix_config: |
-            experimental-features = nix-command flakes
-      - uses: DeterminateSystems/magic-nix-cache-action@v8
-      - name: bun install
-        run: nix develop -c bun install --frozen-lockfile
-        continue-on-error: true
-      - name: typecheck runtime
-        run: nix develop -c bun run --cwd packages/runtime typecheck
-        if: hashFiles('packages/runtime/package.json') != ''
-      - name: typecheck example
-        run: nix develop -c bun run --cwd examples/basic typecheck
-        if: hashFiles('examples/basic/package.json') != ''
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - name: nix-fast-build
+        run: nix run nixpkgs#nix-fast-build -- --skip-cached --no-nom --flake .#checks
