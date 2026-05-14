@@ -14,6 +14,10 @@
     "./testing": {
       "types": "./packages/runtime/dist/testing.d.ts",
       "import": "./packages/runtime/dist/testing.js"
+    },
+    "./pg": {
+      "types": "./packages/runtime/dist/pg.d.ts",
+      "import": "./packages/runtime/dist/pg.js"
     }
   },
   "files": ["packages/runtime/dist", "packages/runtime/package.json"],
