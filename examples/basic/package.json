@@ -7,10 +7,12 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "pg": "^8.0.0",
     "swell": "*"
   },
   "devDependencies": {
     "typescript": "^5.4.0",
-    "@types/node": "^20.0.0"
+    "@types/node": "^20.0.0",
+    "@types/pg": "^8.0.0"
   }
 }

@@ -61,7 +61,7 @@
           pname = "swell-runtime-typecheck";
           version = "0.1.0";
           src = ./.;
-          npmDepsHash = "sha256-AkkX7GmKX/KdeDkGkky92OC4NogYnlRMn4VdQeQ6NDM=";
+          npmDepsHash = "sha256-U6wTTLbKnI89vrMUBolSLGwnQZIn133jpI3dYhzNWMk=";
           dontNpmBuild = true;
           # Run tsc directly against the runtime sources. No `dist/` is
           # emitted (`--noEmit`); a marker file is the derivation output.
@@ -69,6 +69,28 @@
             runHook preInstall
             cd packages/runtime
             npx tsc -p tsconfig.json --noEmit
+            mkdir -p $out
+            touch $out/ok
+            runHook postInstall
+          '';
+        };
+
+        # `tsc --noEmit` over examples/basic. Exercises the q() overload
+        # + pg module augmentation end-to-end against the example's
+        # `swell.generated.ts`, so a regression in either lands here
+        # before it lands in user code.
+        exampleTypecheck = pkgs.buildNpmPackage {
+          pname = "swell-example-basic-typecheck";
+          version = "0.0.0";
+          src = ./.;
+          npmDepsHash = "sha256-U6wTTLbKnI89vrMUBolSLGwnQZIn133jpI3dYhzNWMk=";
+          dontNpmBuild = true;
+          installPhase = ''
+            runHook preInstall
+            # Build the runtime first so the workspace symlink resolves
+            # to compiled `.d.ts` / `.js`, not bare source.
+            (cd packages/runtime && npx tsc -p tsconfig.json)
+            (cd examples/basic && npx tsc -p tsconfig.json --noEmit)
             mkdir -p $out
             touch $out/ok
             runHook postInstall
@@ -117,6 +139,7 @@
 
         checks = {
           runtime-typecheck = runtimeTypecheck;
+          example-typecheck = exampleTypecheck;
           cargo-build = cargoBuild;
         };
       });

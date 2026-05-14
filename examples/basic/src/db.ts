@@ -1,4 +1,5 @@
-import postgres from "postgres";
-import { createSql } from "./swell.generated";
+import { Pool } from "pg";
+import "swell";
 
-export const sql = createSql(postgres());
+export { q } from "./swell.generated";
+export const pool = new Pool();
