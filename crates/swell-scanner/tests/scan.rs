@@ -154,3 +154,48 @@ fn picks_up_extra_module_local_re_export() {
     assert_eq!(qs.len(), 1);
     assert_eq!(qs[0].static_parts[0], "SELECT id FROM users WHERE id = $1");
 }
+
+#[test]
+fn picks_up_q_marker_from_swell() {
+    // `q("…")` is the SQL marker imported directly from the runtime package.
+    // Useful when the call site can't reach a typed `sql` handle (function
+    // parameter, destructured field) — the marker brands the string at the
+    // type level and the scanner indexes it for codegen.
+    let src = r#"
+        import { q } from "swell";
+        const stmt = q("SELECT id FROM users WHERE id = $1");
+    "#;
+    let qs = scan(src);
+    assert_eq!(qs.len(), 1);
+    assert_eq!(qs[0].static_parts[0], "SELECT id FROM users WHERE id = $1");
+    assert_eq!(qs[0].tag_local_name, "q");
+}
+
+#[test]
+fn picks_up_q_marker_aliased() {
+    let src = r#"
+        import { q as marker } from "swell";
+        const stmt = marker("SELECT 1");
+    "#;
+    let qs = scan(src);
+    assert_eq!(qs.len(), 1);
+    assert_eq!(qs[0].static_parts[0], "SELECT 1");
+    assert_eq!(qs[0].tag_local_name, "marker");
+}
+
+#[test]
+fn picks_up_q_marker_via_db_reexport() {
+    // Per-package `db.ts` re-exports `q` alongside its bound `sql`. The
+    // scanner should pick it up from the same module as the sql handle.
+    let src = r#"
+        import { sql, q } from "./db";
+        const stmt = q("SELECT 1");
+        sql.many(stmt);
+    "#;
+    let qs = scan(src);
+    assert!(
+        qs.iter().any(|x| x.static_parts[0] == "SELECT 1" && x.tag_local_name == "q"),
+        "expected q-marker call, got {:?}",
+        qs
+    );
+}

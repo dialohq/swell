@@ -71,8 +71,13 @@ impl<'a> ImportBinders<'a> {
 impl<'a> Visit for ImportBinders<'a> {
     fn visit_import_decl(&mut self, n: &ImportDecl) {
         let raw = String::from_utf8_lossy(n.src.value.as_bytes());
-        let matches = self.opts.db_modules.iter().any(|m| *m == raw.as_ref());
-        if !matches {
+        let matches_db_module = self.opts.db_modules.iter().any(|m| *m == raw.as_ref());
+        // The `q` SQL-marker function lives in the swell runtime package and
+        // may also be re-exported from per-package db.ts modules. Recognise
+        // it from either source so call sites like `q("SELECT 1")` get picked
+        // up no matter how the package wires its imports.
+        let matches_runtime = raw == "swell";
+        if !matches_db_module && !matches_runtime {
             return;
         }
         for spec in &n.specifiers {
@@ -83,16 +88,26 @@ impl<'a> Visit for ImportBinders<'a> {
                         Some(ModuleExportName::Str(s)) => String::from_utf8_lossy(s.value.as_bytes()).into_owned(),
                         None => named.local.sym.to_string(),
                     };
-                    // Pre-bound typed-sql handles arrive under one of the
-                    // configured export names (default `["sql"]`).
-                    if self.opts.db_exports.iter().any(|e| *e == imported_name.as_str()) {
-                        self.locals.insert(named.local.sym.to_string());
+                    if matches_db_module {
+                        // Pre-bound typed-sql handles arrive under one of the
+                        // configured export names (default `["sql"]`).
+                        if self.opts.db_exports.iter().any(|e| *e == imported_name.as_str()) {
+                            self.locals.insert(named.local.sym.to_string());
+                        }
+                        // `import { createSql } from "./swell.generated"` — track
+                        // the local alias so we can recognise
+                        // `const X = createSql(...)` bindings in the same file.
+                        if imported_name == "createSql" {
+                            self.factory_locals.insert(named.local.sym.to_string());
+                        }
                     }
-                    // `import { createSql } from "./swell.generated"` — track
-                    // the local alias so we can recognise
-                    // `const X = createSql(...)` bindings in the same file.
-                    if imported_name == "createSql" {
-                        self.factory_locals.insert(named.local.sym.to_string());
+                    // `import { q } from "swell"` (or via a re-exporting
+                    // db_module). `q` is a no-op SQL marker — the call form is
+                    // always `q("…")`, which CallCollector treats identically
+                    // to a bare-call typed handle: a bare-ident callee in the
+                    // locals set yields a ScannedQuery from the first arg.
+                    if imported_name == "q" {
+                        self.locals.insert(named.local.sym.to_string());
                     }
                 }
                 ImportSpecifier::Default(_) => {
