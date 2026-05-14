@@ -1,25 +1,17 @@
 //! Codegen: InferredQuery[] → .ts string.
 //!
-//! Emits a small per-package `swell.generated.ts` that:
-//!   1. imports `createTypedSql`, `AnyDriver`, `TypedSql` from the `swell`
-//!      runtime package;
-//!   2. declares the per-package `QueryRegistry` interface (one entry per
-//!      registered query);
-//!   3. exports a `createSql(driver: AnyDriver): TypedSql<QueryRegistry>`
-//!      factory bound to the registry.
+//! Emits a per-package `swell.generated.ts` with a local `Registry` of
+//! analysed queries and a typed `q(...)` overload that pins the
+//! `SqlText<P, R>` brand to the live-DB-inferred `{ params; row }` shape.
 //!
-//! The codegen output is intentionally tiny — the whole runtime stays in
-//! the `swell` package. Each project's per-package `db.ts` then does:
+//! Consumers import `q` from the generated file:
 //!
-//!   import postgres from "postgres";
-//!   import { createSql } from "./swell.generated";
-//!   export const sql = createSql(postgres(...));
+//!   import { q } from "./swell.generated";
+//!   import pg from "pg";
 //!
-//! or with node-pg:
-//!
-//!   import { Pool } from "pg";
-//!   import { createSql } from "./swell.generated";
-//!   export const sql = createSql(new Pool());
+//!   const stmt = q("SELECT id, email FROM users WHERE id = $1");
+//!   const { rows } = await pool.query(stmt, [userId]);
+//!   //      ^? { id: string; email: string }[]
 
 use swell_analyzer::InferredQuery;
 
@@ -43,7 +35,7 @@ pub fn render(queries: &[InferredQuery], opts: CodegenOptions<'_>) -> String {
     let mut out = String::new();
     out.push_str(HEADER);
     out.push_str(&format!(
-        "import {{ createTypedSql, type AnyDriver, type Json, type TypedSql }} from \"{}\";\n",
+        "import {{ q as qBase, type Json, type SqlText }} from \"{}\";\n",
         opts.runtime_module,
     ));
     for (from, names) in opts.extra_imports {
@@ -54,39 +46,43 @@ pub fn render(queries: &[InferredQuery], opts: CodegenOptions<'_>) -> String {
         out.push_str(&format!("import {{ {} }} from \"{}\";\n", typed.join(", "), from));
     }
     out.push('\n');
-    out.push_str(
-        "// Per-package query registry — one entry per analysed `sql.<method>` call site.\n",
-    );
     // Single-line SQL renders as a bare string-literal property key
     // (`"SELECT 1": { ... }`). Multi-line SQL uses a computed key with
     // a template literal (`[`SELECT...\nFROM...`]: { ... }`) so the SQL
     // keeps its original layout. Bare template literals aren't legal as
     // property keys in any TS parser, but the computed form is.
     if queries.is_empty() {
-        out.push_str("export type QueryRegistry = Record<string, never>;\n\n");
+        out.push_str("type Registry = Record<string, never>;\n\n");
     } else {
-        out.push_str("export type QueryRegistry = {\n");
+        out.push_str("type Registry = {\n");
         for q in queries {
-            out.push_str(&render_entry(q));
+            out.push_str(&render_entry(q, "  "));
         }
         out.push_str("};\n\n");
     }
-    out.push_str("export type Sql = TypedSql<QueryRegistry>;\n\n");
     out.push_str(
-        "/** Bind the registry to a driver. Accepts a postgres.js `Sql`\n\
-         *  or a node-pg `Pool`/`Client`/`PoolClient`. */\n",
+        "/** Brands the SQL string so `pg.Pool.query(q(…), …)` (via swell's\n\
+         *  `declare module \"pg\"` augmentation) narrows rows + params to the\n\
+         *  registry-inferred shape. Falls through to a permissive `SqlText`\n\
+         *  for SQL strings that haven't been indexed yet. */\n",
     );
-    out.push_str("export function createSql(driver: AnyDriver): Sql {\n");
-    out.push_str("  return createTypedSql<QueryRegistry>(driver);\n");
+    out.push_str(
+        "export function q<S extends keyof Registry & string>(\n\
+         \x20 text: S,\n\
+         ): SqlText<Registry[S][\"params\"] & unknown[], Registry[S][\"row\"]>;\n",
+    );
+    out.push_str("export function q<S extends string>(text: S): SqlText<unknown[], unknown>;\n");
+    out.push_str("export function q(text: string): SqlText<unknown[], unknown> {\n");
+    out.push_str("  return qBase(text);\n");
     out.push_str("}\n");
     out
 }
 
-fn render_entry(q: &InferredQuery) -> String {
+fn render_entry(q: &InferredQuery, indent: &str) -> String {
     let key = render_key(&q.sql);
     let params = render_params_tuple(q);
     let row = render_row_type(&q.columns);
-    format!("  {key}: {{ params: {params}; row: {row} }};\n")
+    format!("{indent}{key}: {{ params: {params}; row: {row} }};\n")
 }
 
 /// Render the SQL string as a property key. Single-line SQL becomes a
@@ -214,13 +210,12 @@ mod tests {
     }
 
     #[test]
-    fn empty_module_has_imports_and_factory() {
+    fn empty_module_has_imports_and_q() {
         let out = render(&[], CodegenOptions::default());
-        assert!(out.contains("import { createTypedSql, type AnyDriver, type Json, type TypedSql } from \"swell\""), "got: {}", out);
-        assert!(out.contains("export type QueryRegistry = Record<string, never>;"), "got: {}", out);
-        assert!(out.contains("export type Sql = TypedSql<QueryRegistry>"), "got: {}", out);
-        assert!(out.contains("export function createSql(driver: AnyDriver): Sql"), "got: {}", out);
-        assert!(out.contains("return createTypedSql<QueryRegistry>(driver)"), "got: {}", out);
+        assert!(out.contains("import { q as qBase, type Json, type SqlText } from \"swell\""), "got: {}", out);
+        assert!(out.contains("type Registry = Record<string, never>;"), "got: {}", out);
+        assert!(out.contains("export function q<S extends keyof Registry & string>"), "got: {}", out);
+        assert!(out.contains("export function q<S extends string>(text: S): SqlText<unknown[], unknown>"), "got: {}", out);
     }
 
     #[test]
@@ -310,7 +305,7 @@ mod tests {
             q("SELECT 2", vec![], vec![InferredColumn { name: "n".into(), oid: 0, nullable: false, ts_type: "number".into() }]),
         ];
         let out = render(&queries, CodegenOptions::default());
-        assert!(out.contains("export type QueryRegistry = {\n"), "missing object open: {}", out);
+        assert!(out.contains("type Registry = {\n"), "missing object open: {}", out);
         assert!(out.contains("  \"SELECT 1\": { params: []; row: { n: number } };\n"), "missing entry 1: {}", out);
         assert!(out.contains("  \"SELECT 2\": { params: []; row: { n: number } };\n"), "missing entry 2: {}", out);
         assert!(out.contains("};\n"), "missing object close: {}", out);

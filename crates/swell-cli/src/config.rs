@@ -37,17 +37,11 @@ pub struct Scan {
     pub include: Vec<String>,
     #[serde(default = "default_exclude")]
     pub exclude: Vec<String>,
-    /// Module specifiers from which `sql` (or `createSql`) is imported. The
-    /// default covers the codegen output (`./swell.generated`) plus the
-    /// usual per-package `db.ts` depths. Override only if your project's
-    /// layout doesn't fit — most don't need to.
-    #[serde(default = "default_db_modules")]
-    pub db_modules: Vec<String>,
-    /// Named exports from `db_modules` that bind a TypedSql instance. Default
-    /// `["sql"]` — extend if a package keeps multiple typed handles (e.g.
-    /// `sql` + `sqlRead` for a read replica).
-    #[serde(default = "default_db_exports")]
-    pub db_exports: Vec<String>,
+    /// Modules (in addition to `"swell"`) that re-export `q`. The default
+    /// covers the per-package codegen output at the usual import depths.
+    /// Override only if your project's layout doesn't fit.
+    #[serde(default = "default_q_modules")]
+    pub q_modules: Vec<String>,
 }
 
 impl Default for Scan {
@@ -55,28 +49,21 @@ impl Default for Scan {
         Self {
             include: default_include(),
             exclude: default_exclude(),
-            db_modules: default_db_modules(),
-            db_exports: default_db_exports(),
+            q_modules: default_q_modules(),
         }
     }
 }
 
 fn default_include() -> Vec<String> { vec!["src/**/*.ts".into(), "src/**/*.tsx".into()] }
 fn default_exclude() -> Vec<String> { vec!["**/*.test.ts".into(), "node_modules/**".into()] }
-fn default_db_modules() -> Vec<String> {
+fn default_q_modules() -> Vec<String> {
     vec![
         "./swell.generated".into(),
         "../swell.generated".into(),
         "../../swell.generated".into(),
         "../../../swell.generated".into(),
-        "./db".into(),
-        "../db".into(),
-        "../../db".into(),
-        "../../../db".into(),
     ]
 }
-
-fn default_db_exports() -> Vec<String> { vec!["sql".into()] }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Output {
