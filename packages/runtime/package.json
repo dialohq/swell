@@ -14,6 +14,10 @@
     "./testing": {
       "types": "./dist/testing.d.ts",
       "import": "./dist/testing.js"
+    },
+    "./pg": {
+      "types": "./dist/pg.d.ts",
+      "import": "./dist/pg.js"
     }
   },
   "files": ["dist"],
@@ -35,6 +39,8 @@
   "devDependencies": {
     "typescript": "^5.4.0",
     "@types/node": "^20.0.0",
+    "@types/pg": "^8.0.0",
+    "pg": "^8.0.0",
     "postgres": "^3.4.0"
   }
 }
