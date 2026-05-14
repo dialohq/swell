@@ -25,6 +25,19 @@
  * Call sites look the same on either driver:
  *   await sql.many("SELECT id, email FROM users WHERE id = $1", userId);
  */
+/**
+ * `q("SELECT id FROM users WHERE id = $1")` — no-op SQL marker. The
+ * runtime cost is one cast (no allocation); the type-level work is the
+ * conditional `Registry` lookup that pins the `SqlText` brand to the
+ * exact params + row shape for this literal.
+ *
+ *   const stmt = q("SELECT id FROM users WHERE id = $1");
+ *   const rows = await sql.many(stmt, userId);
+ *   //    ^? { id: string }[]
+ */
+export function q(text) {
+    return text;
+}
 function isPostgresJs(d) {
     return (typeof d === "function" &&
         typeof d.unsafe === "function" &&

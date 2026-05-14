@@ -33,6 +33,60 @@
 export type QueryShape = { params: readonly unknown[]; row: unknown };
 
 /**
+ * Per-project registry of `q("…")`-marked SQL strings. Codegen augments
+ * this interface via `declare module "swell" { interface Registry {…} }`
+ * so the literal SQL string maps to its typed `{ params; row }` shape.
+ *
+ * Empty in the runtime; populated only after the project's
+ * `swell.generated.ts` is included in the tsconfig.
+ */
+// eslint-disable-next-line @typescript-eslint/no-empty-interface
+export interface Registry {}
+
+/**
+ * Branded SQL string carried by `q("…")`. The intersection with the
+ * non-optional `__sqlBrand` makes plain strings *not* assignable —
+ * `TypedSql.many(...)` picks the SqlText-typed overload when (and only
+ * when) the argument went through `q`. Plain strings keep falling
+ * through to the legacy literal-narrowing overload, which preserves
+ * backward compatibility for the existing `sql.many("SELECT …", arg)`
+ * form.
+ */
+export type SqlText<P extends unknown[], Row> = string & {
+  readonly __sqlBrand: { params: P; row: Row };
+};
+
+// Internal lookup against `Registry`. `Lookup<S>` resolves to the
+// registered `{ params; row }` shape, or a permissive fallback for
+// SQL strings that haven't been analysed (yet).
+type RegistryLookup<S extends string> = S extends keyof Registry
+  ? Registry[S]
+  : { params: unknown[]; row: unknown };
+
+/**
+ * `q("SELECT id FROM users WHERE id = $1")` — no-op SQL marker. The
+ * runtime cost is one cast (no allocation); the type-level work is the
+ * conditional `Registry` lookup that pins the `SqlText` brand to the
+ * exact params + row shape for this literal.
+ *
+ *   const stmt = q("SELECT id FROM users WHERE id = $1");
+ *   const rows = await sql.many(stmt, userId);
+ *   //    ^? { id: string }[]
+ */
+export function q<S extends string>(
+  text: S,
+): SqlText<
+  RegistryLookup<S>["params"] extends infer P
+    ? P extends readonly unknown[]
+      ? P & unknown[]
+      : unknown[]
+    : unknown[],
+  RegistryLookup<S>["row"]
+> {
+  return text as never;
+}
+
+/**
  * The empty default — `createTypedSql()` without an explicit registry yields
  * a TypedSql with no registered queries. Every call falls through to the
  * permissive `string` overload (params: `unknown[]`, row: `unknown`).
@@ -66,25 +120,52 @@ type Row<R extends EmptyRegistry, S extends string> = S extends keyof R
   : unknown;
 
 /**
+ * Type guard used in the legacy-literal overload signatures: collapses a
+ * `SqlText`-branded string to `never` so the q-marker overload is the
+ * only one that matches `q("…")` results. Plain string literals stay as
+ * themselves and still get the registry lookup.
+ */
+type PlainSql<S extends string> = S extends { readonly __sqlBrand: unknown }
+  ? never
+  : S;
+
+/**
  * Statically-typed `sql` handle. `R` is the per-package query registry —
  * each `createSql()` call has its own, so identical SQL text in two
  * databases doesn't share a row shape.
+ *
+ * Each method has two overloads:
+ *
+ *   1. **q-marker form** (preferred): `sql.many(q("SELECT …"), …vs)`. The
+ *      `SqlText<P, Row>` brand pins params + row at the call site via the
+ *      global `Registry` interface (augmented by codegen).
+ *   2. **literal-string form** (legacy): `sql.many("SELECT …", …vs)`. The
+ *      literal SQL string narrows against the per-package `R` registry.
+ *
+ * The legacy overload's parameter is `PlainSql<S>` — for `q(...)`-branded
+ * strings that collapses to `never`, so TS routes branded args to the
+ * q-form and plain literals to the legacy form without ambiguity.
  */
 export interface TypedSql<R extends EmptyRegistry = EmptyRegistry> {
   /** Default form — returns all rows. */
-  <S extends string>(sql: S, ...values: Params<R, S>): Promise<Row<R, S>[]>;
+  <P extends unknown[], Row>(sql: SqlText<P, Row>, ...values: P): Promise<Row[]>;
+  <S extends string>(sql: PlainSql<S>, ...values: Params<R, S>): Promise<Row<R, S>[]>;
 
   /** Exactly one row. Throws if rowCount !== 1. */
-  one<S extends string>(sql: S, ...values: Params<R, S>): Promise<Row<R, S>>;
+  one<P extends unknown[], Row>(sql: SqlText<P, Row>, ...values: P): Promise<Row>;
+  one<S extends string>(sql: PlainSql<S>, ...values: Params<R, S>): Promise<Row<R, S>>;
 
   /** Zero or one row. Returns null if no rows; throws if >1. */
-  maybe<S extends string>(sql: S, ...values: Params<R, S>): Promise<Row<R, S> | null>;
+  maybe<P extends unknown[], Row>(sql: SqlText<P, Row>, ...values: P): Promise<Row | null>;
+  maybe<S extends string>(sql: PlainSql<S>, ...values: Params<R, S>): Promise<Row<R, S> | null>;
 
   /** All rows — explicit equivalent of the call form. */
-  many<S extends string>(sql: S, ...values: Params<R, S>): Promise<Row<R, S>[]>;
+  many<P extends unknown[], Row>(sql: SqlText<P, Row>, ...values: P): Promise<Row[]>;
+  many<S extends string>(sql: PlainSql<S>, ...values: Params<R, S>): Promise<Row<R, S>[]>;
 
   /** Side-effecting statement. Returns affected-row count. */
-  exec<S extends string>(sql: S, ...values: Params<R, S>): Promise<{ rowCount: number }>;
+  exec<P extends unknown[], Row>(sql: SqlText<P, Row>, ...values: P): Promise<{ rowCount: number }>;
+  exec<S extends string>(sql: PlainSql<S>, ...values: Params<R, S>): Promise<{ rowCount: number }>;
 
   /** Transaction. Commits on resolve, rolls back on throw. */
   begin<T>(fn: (tx: TypedSql<R>) => Promise<T>): Promise<T>;
@@ -99,7 +180,8 @@ export interface TypedSql<R extends EmptyRegistry = EmptyRegistry> {
   unsafe<T = unknown>(query: string, params?: unknown[]): Promise<T[]>;
 
   /** Server-side cursor — yields rows one at a time without buffering. */
-  cursor<S extends string>(sql: S, ...values: Params<R, S>): AsyncIterable<Row<R, S>>;
+  cursor<P extends unknown[], Row>(sql: SqlText<P, Row>, ...values: P): AsyncIterable<Row>;
+  cursor<S extends string>(sql: PlainSql<S>, ...values: Params<R, S>): AsyncIterable<Row<R, S>>;
   cursor(sql: string, ...values: unknown[]): AsyncIterable<unknown>;
 
   /** Close the underlying connection / pool. */
