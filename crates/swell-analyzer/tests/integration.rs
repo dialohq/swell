@@ -319,3 +319,70 @@ async fn enum_inside_jsonb_build_object() {
     let ts = &q.columns[0].ts_type;
     assert!(ts.contains("\"admin\""), "enum should expand inside JSON shape, got {ts}");
 }
+
+// ----- Param nullability inference -----
+
+#[tokio::test(flavor = "current_thread")]
+async fn insert_values_param_to_not_null_column_is_not_nullable() {
+    let an = fresh_db().await;
+    // `orgs.id` and `orgs.name` are both NOT NULL.
+    let q = an.analyze("INSERT INTO orgs (id, name) VALUES ($1, $2)")
+        .await.expect("analyze");
+    assert_eq!(q.params.len(), 2);
+    assert!(!q.params[0].nullable, "$1 → orgs.id (NOT NULL); got nullable");
+    assert!(!q.params[1].nullable, "$2 → orgs.name (NOT NULL); got nullable");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn insert_values_param_to_nullable_column_stays_nullable() {
+    let an = fresh_db().await;
+    // `users.display_name` is nullable.
+    let q = an.analyze(
+        "INSERT INTO users (id, org_id, email, role, display_name, settings) \
+         VALUES ($1, $2, $3, $4, $5, $6)",
+    ).await.expect("analyze");
+    assert_eq!(q.params.len(), 6);
+    assert!(!q.params[0].nullable, "$1 → users.id (NOT NULL)");
+    assert!(!q.params[1].nullable, "$2 → users.org_id (NOT NULL)");
+    assert!(!q.params[2].nullable, "$3 → users.email (NOT NULL)");
+    assert!(!q.params[3].nullable, "$4 → users.role (NOT NULL)");
+    assert!(q.params[4].nullable, "$5 → users.display_name (nullable)");
+    assert!(!q.params[5].nullable, "$6 → users.settings (NOT NULL)");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn update_set_param_to_not_null_column_is_not_nullable() {
+    let an = fresh_db().await;
+    // `posts.body` is NOT NULL; the WHERE param stays nullable.
+    let q = an.analyze("UPDATE posts SET body = $1 WHERE id = $2")
+        .await.expect("analyze");
+    assert_eq!(q.params.len(), 2);
+    assert!(!q.params[0].nullable, "$1 → posts.body (NOT NULL)");
+    assert!(q.params[1].nullable, "$2 in WHERE — stays nullable");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn select_where_param_stays_nullable() {
+    let an = fresh_db().await;
+    // Reading via WHERE never tightens — null is a valid value to test against.
+    let q = an.analyze("SELECT id FROM users WHERE id = $1").await.expect("analyze");
+    assert_eq!(q.params.len(), 1);
+    assert!(q.params[0].nullable, "WHERE-only param should stay nullable");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn insert_values_wrapped_in_coalesce_stays_nullable() {
+    let an = fresh_db().await;
+    // Even though users.role is NOT NULL, $4 is wrapped — caller may pass null
+    // and coalesce will substitute the literal.
+    let q = an.analyze(
+        "INSERT INTO users (id, org_id, email, role, settings) \
+         VALUES ($1, $2, $3, coalesce($4, 'member'::user_role), $5)",
+    ).await.expect("analyze");
+    assert_eq!(q.params.len(), 5);
+    assert!(!q.params[0].nullable);
+    assert!(!q.params[1].nullable);
+    assert!(!q.params[2].nullable);
+    assert!(q.params[3].nullable, "$4 inside coalesce(...) stays nullable");
+    assert!(!q.params[4].nullable);
+}

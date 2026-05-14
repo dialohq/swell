@@ -8,6 +8,7 @@
 pub mod describe;
 pub mod catalog;
 pub mod nullability;
+pub mod param_nullability;
 pub mod json_shape;
 pub mod overrides;
 pub mod ts_types;
@@ -86,10 +87,15 @@ impl Analyzer {
             &self.client, &self.catalog, sql, described.columns.len(),
         ).await;
 
-        let params = described.params.iter()
-            .map(|t| InferredParam {
+        let param_nullable = param_nullability::infer(
+            &self.client, sql, described.params.len(),
+        ).await;
+
+        let params = described.params.iter().enumerate()
+            .map(|(i, t)| InferredParam {
                 oid: t.oid(),
                 ts_type: catalog::render_for_oid(&self.catalog, t.oid(), t),
+                nullable: param_nullable.get(i).copied().unwrap_or(true),
             })
             .collect();
 

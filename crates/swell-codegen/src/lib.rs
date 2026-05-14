@@ -89,26 +89,26 @@ fn render_key(sql: &str) -> String {
 
 fn render_params_tuple(q: &InferredQuery) -> String {
     if q.params.is_empty() {
-        "[]".to_string()
-    } else {
-        // Postgres's PARSE/DESCRIBE returns only the type OID for each
-        // prepared-statement parameter, no nullability. Defaulting params to
-        // `T | null` accepts both null and non-null at call sites — strictly
-        // safer than the previous non-null default which forced callers to
-        // either non-null assertion or change types up the chain.
-        let elems: Vec<String> = q
-            .params
-            .iter()
-            .map(|p| {
-                if p.ts_type == "unknown" {
-                    p.ts_type.clone()
-                } else {
-                    format!("{} | null", p.ts_type)
-                }
-            })
-            .collect();
-        format!("[{}]", elems.join(", "))
+        return "[]".to_string();
     }
+    // Postgres's PARSE/DESCRIBE doesn't report param nullability — we
+    // infer it in `param_nullability.rs` by walking the SQL AST and
+    // checking whether `$N` binds directly to a NOT NULL column in
+    // INSERT VALUES or UPDATE SET. Anything else stays nullable so
+    // callers can pass null where Postgres tolerates it (WHERE,
+    // coalesce, etc.). `unknown` is already wide enough to admit null.
+    let elems: Vec<String> = q
+        .params
+        .iter()
+        .map(|p| {
+            if p.ts_type == "unknown" || !p.nullable {
+                p.ts_type.clone()
+            } else {
+                format!("{} | null", p.ts_type)
+            }
+        })
+        .collect();
+    format!("[{}]", elems.join(", "))
 }
 
 fn render_row_type(cols: &[swell_analyzer::InferredColumn]) -> String {
@@ -226,7 +226,7 @@ mod tests {
     fn entry_with_params() {
         let queries = vec![q(
             "SELECT id FROM users WHERE id = $1",
-            vec![InferredParam { oid: 0, ts_type: "string".into() }],
+            vec![InferredParam { oid: 0, ts_type: "string".into(), nullable: true }],
             vec![InferredColumn { name: "id".into(), oid: 0, nullable: false, ts_type: "string".into() }],
         )];
         let out = render(&queries, CodegenOptions::default());
@@ -243,7 +243,7 @@ mod tests {
     fn entry_write_only_query() {
         let queries = vec![q(
             "DELETE FROM users WHERE id = $1",
-            vec![InferredParam { oid: 0, ts_type: "string".into() }],
+            vec![InferredParam { oid: 0, ts_type: "string".into(), nullable: true }],
             vec![],
         )];
         let out = render(&queries, CodegenOptions::default());
@@ -264,7 +264,7 @@ mod tests {
         // the computed form is.
         let queries = vec![q(
             "SELECT id, email\nFROM users\nWHERE id = $1",
-            vec![InferredParam { oid: 0, ts_type: "string".into() }],
+            vec![InferredParam { oid: 0, ts_type: "string".into(), nullable: true }],
             vec![InferredColumn { name: "id".into(), oid: 0, nullable: false, ts_type: "string".into() }],
         )];
         let out = render(&queries, CodegenOptions::default());
@@ -306,10 +306,23 @@ mod tests {
         // adding the union, it just looks noisy in the generated file.
         let queries = vec![q(
             "SELECT 1 WHERE $1::int = 1",
-            vec![InferredParam { oid: 0, ts_type: "unknown".into() }],
+            vec![InferredParam { oid: 0, ts_type: "unknown".into(), nullable: true }],
             vec![],
         )];
         let out = render(&queries, CodegenOptions::default());
         assert!(out.contains("params: [unknown];"), "got: {}", out);
+    }
+
+    #[test]
+    fn non_null_params_render_without_union() {
+        // `nullable: false` means the AST analyzer saw `$N` bind to a
+        // NOT NULL column — codegen drops the `| null` widening.
+        let queries = vec![q(
+            "INSERT INTO t (a) VALUES ($1)",
+            vec![InferredParam { oid: 0, ts_type: "string".into(), nullable: false }],
+            vec![],
+        )];
+        let out = render(&queries, CodegenOptions::default());
+        assert!(out.contains("params: [string];"), "got: {}", out);
     }
 }
