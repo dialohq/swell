@@ -23,21 +23,34 @@
 //! the strictest binding wins.
 
 use crate::catalog::fetch_attnotnull;
+use crate::query::TableColRef;
 use pg_query::protobuf::{node, InsertStmt, UpdateStmt};
 use std::collections::{HashMap, HashSet};
 use tokio_postgres::Client;
 
-pub async fn infer(client: &Client, sql: &str, n_params: usize) -> Vec<bool> {
-    let mut nullable = vec![true; n_params];
+/// One inferred fact per `$N`: whether it's nullable, and the base
+/// column it directly binds to (if any).
+#[derive(Debug, Clone, Default)]
+pub struct ParamInfo {
+    pub nullable: bool,
+    pub table_ref: Option<TableColRef>,
+}
+
+impl ParamInfo {
+    fn nullable_default() -> Self { Self { nullable: true, table_ref: None } }
+}
+
+pub async fn infer(client: &Client, sql: &str, n_params: usize) -> Vec<ParamInfo> {
+    let mut out: Vec<ParamInfo> = (0..n_params).map(|_| ParamInfo::nullable_default()).collect();
     if n_params == 0 {
-        return nullable;
+        return out;
     }
 
     let parsed = match pg_query::parse(sql) {
         Ok(p) => p,
         Err(e) => {
             tracing::debug!("pg_query::parse failed for param nullability: {e}");
-            return nullable;
+            return out;
         }
     };
 
@@ -52,19 +65,15 @@ pub async fn infer(client: &Client, sql: &str, n_params: usize) -> Vec<bool> {
         }
     }
     if bindings.is_empty() {
-        return nullable;
+        return out;
     }
 
     let table_oids = resolve_table_oids(client, &bindings).await;
     if table_oids.is_empty() {
-        return nullable;
+        return out;
     }
 
     let attnums = resolve_attnums(client, &bindings, &table_oids).await;
-    if attnums.is_empty() {
-        return nullable;
-    }
-
     let pair_vec: Vec<(u32, i16)> = attnums
         .iter()
         .map(|((tbl, _col), attnum)| (*tbl, *attnum))
@@ -74,22 +83,43 @@ pub async fn infer(client: &Client, sql: &str, n_params: usize) -> Vec<bool> {
         .ok()
         .unwrap_or_default();
 
+    // Resolve each binding's actual schema name (since unqualified
+    // references default to `public`, but the real namespace may
+    // differ for tables in `search_path`-mounted schemas — we want
+    // codegen's table-type reference to match the resolved namespace).
+    let mut resolved_schema: HashMap<(String, String), String> = HashMap::new();
+    for ((s, t), _) in &table_oids {
+        resolved_schema.insert((s.clone(), t.clone()), s.clone());
+    }
+
     for b in &bindings {
         if b.param_index == 0 || b.param_index > n_params {
             continue;
         }
         let key = (normalize_schema(&b.schema), b.table.clone());
         let Some(&table_oid) = table_oids.get(&key) else { continue };
-        let Some(&attnum) = attnums.get(&(table_oid, b.column.clone())) else { continue };
-        if attnotnull
-            .get(&(table_oid, attnum))
-            .copied()
-            .unwrap_or(false)
-        {
-            nullable[b.param_index - 1] = false;
+        let attnum = attnums.get(&(table_oid, b.column.clone())).copied();
+        let schema = resolved_schema.get(&key).cloned().unwrap_or_else(|| key.0.clone());
+
+        // Set table_ref for any binding to a known base column —
+        // whether or not NOT NULL. Codegen uses this to emit
+        // `Table["col"]` in the param tuple regardless of nullability.
+        let entry = &mut out[b.param_index - 1];
+        if entry.table_ref.is_none() {
+            entry.table_ref = Some(TableColRef {
+                schema,
+                table: b.table.clone(),
+                column: b.column.clone(),
+            });
+        }
+
+        if let Some(attnum) = attnum {
+            if attnotnull.get(&(table_oid, attnum)).copied().unwrap_or(false) {
+                entry.nullable = false;
+            }
         }
     }
-    nullable
+    out
 }
 
 struct Binding {

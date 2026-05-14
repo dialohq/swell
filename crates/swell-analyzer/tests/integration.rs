@@ -386,3 +386,81 @@ async fn insert_values_wrapped_in_coalesce_stays_nullable() {
     assert!(q.params[3].nullable, "$4 inside coalesce(...) stays nullable");
     assert!(!q.params[4].nullable);
 }
+
+// ----- Table-typed column + param references -----
+
+#[tokio::test(flavor = "current_thread")]
+async fn select_column_carries_table_ref() {
+    let an = fresh_db().await;
+    let q = an.analyze("SELECT id, email FROM users WHERE id = $1").await.expect("analyze");
+    let id_ref = q.columns[0].table_ref.as_ref().expect("id column should carry table_ref");
+    assert_eq!(id_ref.schema, "public");
+    assert_eq!(id_ref.table, "users");
+    assert_eq!(id_ref.column, "id");
+    let email_ref = q.columns[1].table_ref.as_ref().expect("email column should carry table_ref");
+    assert_eq!(email_ref.column, "email");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn count_star_has_no_table_ref() {
+    let an = fresh_db().await;
+    let q = an.analyze("SELECT count(*) AS n FROM users").await.expect("analyze");
+    assert!(q.columns[0].table_ref.is_none(),
+        "count(*) has no underlying base column; should not carry a table_ref");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cast_column_has_no_table_ref() {
+    let an = fresh_db().await;
+    // Casting an existing column to a different type drops the column-ref
+    // metadata in Postgres's RowDescription — `table_oid`/`attnum` are 0
+    // and our resolver can't link back to the base table.
+    let q = an.analyze("SELECT id::text AS id_text FROM users").await.expect("analyze");
+    assert!(q.columns[0].table_ref.is_none(),
+        "casted column shouldn't carry a table_ref");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn insert_values_param_carries_table_ref() {
+    let an = fresh_db().await;
+    let q = an.analyze("INSERT INTO orgs (id, name) VALUES ($1, $2)")
+        .await.expect("analyze");
+    let r0 = q.params[0].table_ref.as_ref().expect("$1 → orgs.id");
+    assert_eq!(r0.schema, "public");
+    assert_eq!(r0.table, "orgs");
+    assert_eq!(r0.column, "id");
+    let r1 = q.params[1].table_ref.as_ref().expect("$2 → orgs.name");
+    assert_eq!(r1.column, "name");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn where_param_has_no_table_ref() {
+    let an = fresh_db().await;
+    let q = an.analyze("SELECT id FROM users WHERE id = $1").await.expect("analyze");
+    assert!(q.params[0].table_ref.is_none(),
+        "WHERE-clause params don't bind to a target column; no table_ref");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn table_schema_returns_full_column_list() {
+    let an = fresh_db().await;
+    let t = an.table_schema("public", "users").await
+        .expect("query ok")
+        .expect("users table exists");
+    assert_eq!(t.schema, "public");
+    assert_eq!(t.table, "users");
+    let names: Vec<&str> = t.columns.iter().map(|c| c.name.as_str()).collect();
+    assert!(names.contains(&"id"));
+    assert!(names.contains(&"display_name"));
+    let id_col = t.columns.iter().find(|c| c.name == "id").unwrap();
+    assert!(id_col.not_null, "users.id is NOT NULL");
+    let dn_col = t.columns.iter().find(|c| c.name == "display_name").unwrap();
+    assert!(!dn_col.not_null, "users.display_name is nullable");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn table_schema_returns_none_for_missing_table() {
+    let an = fresh_db().await;
+    let t = an.table_schema("public", "no_such_table").await.expect("query ok");
+    assert!(t.is_none());
+}

@@ -4,10 +4,10 @@ use crate::cache;
 use crate::config::{Config, OnError};
 use anyhow::{anyhow, bail, Context, Result};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use swell_analyzer::{Analyzer, AnalyzerOptions, InferredQuery};
+use swell_analyzer::{Analyzer, AnalyzerOptions, InferredQuery, TableSchema};
 use swell_codegen::{render, CodegenOptions};
 use swell_scanner::{scan_file, ScanOptions, ScannedQuery};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -210,9 +210,23 @@ async fn run_pipeline(cfg: &Config, opts: RunOpts) -> Result<RunSummary> {
         .iter()
         .map(|i| (i.from.clone(), i.names.clone()))
         .collect();
+
+    // Collect distinct base tables referenced by any column or param,
+    // then fetch the full schema of each so codegen can emit
+    // `interface SchemaTable { … }`. Skipped offline — table types
+    // require the live catalog.
+    let tables = match analyzer.as_ref() {
+        Some(an) => fetch_referenced_tables(an, &inferred).await,
+        None => Vec::new(),
+    };
+
     let dts = render(
         &inferred,
-        CodegenOptions { runtime_module: "swell", extra_imports: &extra_imports },
+        CodegenOptions {
+            runtime_module: "swell",
+            extra_imports: &extra_imports,
+            tables: &tables,
+        },
     );
     let out_path = cfg.root.join(&cfg.output.file);
     if let Some(parent) = out_path.parent() {
@@ -227,6 +241,41 @@ async fn run_pipeline(cfg: &Config, opts: RunOpts) -> Result<RunSummary> {
         return Err(anyhow!("one or more queries failed analysis (diagnostics.on_error = fail)"));
     }
     Ok(RunSummary { hits, errors })
+}
+
+/// Walk every column + param of every analysed query, collect the
+/// distinct `(schema, table)` pairs they reference, and fetch each
+/// table's full schema via `Analyzer::table_schema`. Codegen uses
+/// these to emit `interface SchemaTable` and rewrite column references
+/// as `Table["col"]`. Failures are logged at debug level — a single
+/// missing table just falls back to inline types for its columns.
+async fn fetch_referenced_tables(an: &Analyzer, queries: &[InferredQuery]) -> Vec<TableSchema> {
+    let mut pairs: BTreeSet<(String, String)> = BTreeSet::new();
+    for q in queries {
+        for c in &q.columns {
+            if let Some(r) = &c.table_ref {
+                pairs.insert((r.schema.clone(), r.table.clone()));
+            }
+        }
+        for p in &q.params {
+            if let Some(r) = &p.table_ref {
+                pairs.insert((r.schema.clone(), r.table.clone()));
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(pairs.len());
+    for (schema, table) in pairs {
+        match an.table_schema(&schema, &table).await {
+            Ok(Some(t)) => out.push(t),
+            Ok(None) => {
+                tracing::debug!("no schema rows for {schema}.{table}; skipping table type");
+            }
+            Err(e) => {
+                tracing::debug!("table_schema({schema}.{table}) failed: {e:#}");
+            }
+        }
+    }
+    out
 }
 
 fn scan_project(cfg: &Config) -> Result<Vec<ScannedQuery>> {
