@@ -8,5 +8,4 @@ declare module "pg" {
         query<P extends unknown[], R extends QueryResultRow>(queryText: SqlText<P, R>, values?: P): Promise<QueryResult<R>>;
     }
 }
-export {};
 //# sourceMappingURL=pg.d.ts.map

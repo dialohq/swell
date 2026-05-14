@@ -75,14 +75,7 @@ type RegistryLookup<S extends string> = S extends keyof Registry
  */
 export function q<S extends string>(
   text: S,
-): SqlText<
-  RegistryLookup<S>["params"] extends infer P
-    ? P extends readonly unknown[]
-      ? P & unknown[]
-      : unknown[]
-    : unknown[],
-  RegistryLookup<S>["row"]
-> {
+): SqlText<RegistryLookup<S>["params"] & unknown[], RegistryLookup<S>["row"]> {
   return text as never;
 }
 
@@ -557,3 +550,12 @@ export function createTypedSql<R extends EmptyRegistry = EmptyRegistry>(
 ): TypedSql<R> {
   return makeTypedSql<R>(adapt(driver));
 }
+
+// Auto-loaded module augmentations. Importing swell anywhere in the
+// program activates these for the whole compilation — consumers don't
+// need a triple-slash reference or `"types"` entry. `./pg` augments
+// `pg.Pool/Client/PoolClient.query` with the `SqlText<P, R>` overload;
+// projects that don't install `pg` (postgres.js-only) hit a "Cannot
+// find module" error which is the correct signal to remove `pg` from
+// their deps or install it.
+import "./pg";

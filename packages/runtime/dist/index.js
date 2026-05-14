@@ -254,4 +254,12 @@ function makeTypedSql(d) {
 export function createTypedSql(driver) {
     return makeTypedSql(adapt(driver));
 }
+// Auto-loaded module augmentations. Importing swell anywhere in the
+// program activates these for the whole compilation — consumers don't
+// need a triple-slash reference or `"types"` entry. `./pg` augments
+// `pg.Pool/Client/PoolClient.query` with the `SqlText<P, R>` overload;
+// projects that don't install `pg` (postgres.js-only) hit a "Cannot
+// find module" error which is the correct signal to remove `pg` from
+// their deps or install it.
+import "./pg";
 //# sourceMappingURL=index.js.map

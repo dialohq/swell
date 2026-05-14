@@ -1,9 +1,7 @@
-// Compile-time check for the `swell/pg` augmentation. Run via
-// `tsc --noEmit` to confirm pg's query() narrows when fed a q-branded
-// SQL string. This file imports the augmentation for side effects and
-// asserts the resulting overload picks the right shape at the call site.
-
-import "../src/pg";
+// Compile-time check for the pg augmentation. Run via `tsc --noEmit`
+// to confirm pg's query() narrows when fed a q-branded SQL string.
+// The augmentation auto-loads from `../src/index` (no explicit
+// `import "../src/pg"`); pulling in `q` is enough.
 
 import type { Pool, Client, PoolClient } from "pg";
 import { q } from "../src/index";

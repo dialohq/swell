@@ -67,7 +67,7 @@ pub fn render(queries: &[InferredQuery], opts: CodegenOptions<'_>) -> String {
     } else {
         out.push_str("export type QueryRegistry = {\n");
         for q in queries {
-            out.push_str(&render_entry(q));
+            out.push_str(&render_entry(q, "  "));
         }
         out.push_str("};\n\n");
     }
@@ -90,7 +90,7 @@ pub fn render(queries: &[InferredQuery], opts: CodegenOptions<'_>) -> String {
         out.push_str("  // conditional type against this interface.\n");
         out.push_str("  interface Registry {\n");
         for q in queries {
-            out.push_str(&render_module_entry(q));
+            out.push_str(&render_entry(q, "    "));
         }
         out.push_str("  }\n");
         out.push_str("}\n");
@@ -98,18 +98,11 @@ pub fn render(queries: &[InferredQuery], opts: CodegenOptions<'_>) -> String {
     out
 }
 
-fn render_entry(q: &InferredQuery) -> String {
+fn render_entry(q: &InferredQuery, indent: &str) -> String {
     let key = render_key(&q.sql);
     let params = render_params_tuple(q);
     let row = render_row_type(&q.columns);
-    format!("  {key}: {{ params: {params}; row: {row} }};\n")
-}
-
-fn render_module_entry(q: &InferredQuery) -> String {
-    let key = render_key(&q.sql);
-    let params = render_params_tuple(q);
-    let row = render_row_type(&q.columns);
-    format!("    {key}: {{ params: {params}; row: {row} }};\n")
+    format!("{indent}{key}: {{ params: {params}; row: {row} }};\n")
 }
 
 /// Render the SQL string as a property key. Single-line SQL becomes a

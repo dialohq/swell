@@ -72,7 +72,7 @@ type RegistryLookup<S extends string> = S extends keyof Registry ? Registry[S] :
  *   const rows = await sql.many(stmt, userId);
  *   //    ^? { id: string }[]
  */
-export declare function q<S extends string>(text: S): SqlText<RegistryLookup<S>["params"] extends infer P ? P extends readonly unknown[] ? P & unknown[] : unknown[] : unknown[], RegistryLookup<S>["row"]>;
+export declare function q<S extends string>(text: S): SqlText<RegistryLookup<S>["params"] & unknown[], RegistryLookup<S>["row"]>;
 /**
  * The empty default — `createTypedSql()` without an explicit registry yields
  * a TypedSql with no registered queries. Every call falls through to the
@@ -238,5 +238,6 @@ export interface NodePgPoolClientLike extends NodePgLike {
  * wrapper around this that binds the registry type parameter.
  */
 export declare function createTypedSql<R extends EmptyRegistry = EmptyRegistry>(driver: AnyDriver): TypedSql<R>;
+import "./pg";
 export {};
 //# sourceMappingURL=index.d.ts.map
