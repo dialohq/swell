@@ -353,3 +353,77 @@ sqlc_case!(sqlc_update_join, "update_join");
 sqlc_case!(sqlc_update_set, "update_set");
 sqlc_case!(sqlc_update_set_multiple, "update_set_multiple");
 sqlc_case!(sqlc_valid_group_by_reference, "valid_group_by_reference");
+
+// ----- Spot-check assertions on selected sqlc cases -----
+//
+// The smoke tests above prove swell *handles* every sqlc fixture; the
+// blocks below pick a handful and assert the exact inferred shape
+// matches sqlc's expected row type. Goal: catch regressions where the
+// analyzer keeps describing the query but the inferred ts_type drifts.
+
+async fn analyze_named(name: &str, schema: &str, queries: &str, qname: &str)
+    -> swell_analyzer::InferredQuery
+{
+    let db = TestDb::new(&format!("{name}_assert")).await;
+    let url = db.url();
+    let (client, conn) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    tokio::spawn(async move { let _ = conn.await; });
+    client.simple_query(schema).await.unwrap();
+    drop(client);
+    let an = Analyzer::connect(AnalyzerOptions {
+        database_url: url, schemas: vec!["public".into()], type_overrides: BTreeMap::new(),
+    }).await.unwrap();
+    let qs = split_named_queries(queries);
+    let (_, sql) = qs.into_iter().find(|(n, _)| n == qname)
+        .unwrap_or_else(|| panic!("query `{qname}` not found in {name}"));
+    an.analyze(&sql).await.unwrap_or_else(|e| panic!("[{name}/{qname}] {e:#}"))
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn assert_coalesce_alias_propagates() {
+    // `coalesce(bar, '') as login` — assert the alias survives, the
+    // ts_type is `string`, and table_ref is unset (coalesce is a
+    // computed expression, not a base-column ref). Nullability under
+    // a FROM-only (no WHERE) plan is left to swell's EXPLAIN heuristic;
+    // see integration.rs::coalesce_with_literal_is_not_nullable for the
+    // tighter case with a WHERE clause.
+    let q = analyze_named(
+        "coalesce",
+        include_str!("sqlc/coalesce/schema.sql"),
+        include_str!("sqlc/coalesce/query.sql"),
+        "CoalesceString",
+    ).await;
+    assert_eq!(q.columns.len(), 1);
+    assert_eq!(q.columns[0].name, "login");
+    assert_eq!(q.columns[0].ts_type, "string");
+    assert!(q.columns[0].table_ref.is_none(),
+        "coalesce(...) is a computed expression, not a base-column ref");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn assert_count_star_is_bigint_not_null() {
+    let q = analyze_named(
+        "count_star",
+        include_str!("sqlc/count_star/schema.sql"),
+        include_str!("sqlc/count_star/query.sql"),
+        "CountStarLower",
+    ).await;
+    assert!(q.columns[0].ts_type.contains("string"),
+        "count(*) is bigint → string in node-pg, got {}", q.columns[0].ts_type);
+    assert!(!q.columns[0].nullable, "count(*) is never null");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn assert_returning_id_carries_table_ref() {
+    let q = analyze_named(
+        "returning",
+        include_str!("sqlc/returning/schema.sql"),
+        include_str!("sqlc/returning/query.sql"),
+        "InsertUserAndReturnID",
+    ).await;
+    assert_eq!(q.columns.len(), 1);
+    let r = q.columns[0].table_ref.as_ref()
+        .expect("RETURNING id should carry table_ref back to users");
+    assert_eq!(r.table, "users");
+    assert_eq!(r.column, "id");
+}
