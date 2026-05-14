@@ -4,21 +4,19 @@
  * Wrap a static SQL string with `q(...)` and pass it to the augmented
  * pg `Pool` / `Client` / `PoolClient` `.query(...)`:
  *
- *   import { q } from "swell";  // or from "./swell.generated" for typed q
- *   const stmt = q("SELECT id, email FROM users WHERE id = $1");
- *   const { rows } = await pool.query(stmt, [userId]);
+ *   import "./swell.generated";   // loads the Registry augmentation
+ *   import { q } from "swell";
+ *   const { rows } = await pool.query(
+ *     q("SELECT id, email FROM users WHERE id = $1"),
+ *     [userId],
+ *   );
  *   //      ^? typed by swell's analyzer from the live DB
  *
- * Codegen output (`swell.generated.ts`) emits a typed `q` overload per
- * registered query — that's where row + param narrowing comes from. The
- * runtime `q` exported below is the permissive fallback for SQL that
- * hasn't been indexed yet.
- */
-/**
- * No-op SQL marker. Runtime cost is zero (the cast carries the brand at
- * the type level only). The codegen output's typed `q` overloads pin
- * the brand to the live-DB-inferred `{ params; row }` shape for known
- * literals; this fallback covers anything that hasn't been indexed.
+ * Each package's codegen output (`swell.generated.ts`) is pure
+ * `declare module "swell"` augmentation of the `Registry` interface
+ * below — `keyof Registry` becomes the union of analysed SQL strings,
+ * and `q`'s strict overload narrows on that. Non-literal queries fall
+ * through to the permissive overload.
  */
 export function q(text) {
     return text;

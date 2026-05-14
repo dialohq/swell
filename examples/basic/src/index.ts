@@ -1,4 +1,5 @@
-import { pool, q } from "./db";
+import { q } from "swell";
+import { pool } from "./db";
 
 async function main() {
   const userId = "00000000-0000-0000-0000-000000000000";

@@ -1,13 +1,15 @@
 //! Codegen: InferredQuery[] → .ts string.
 //!
-//! Emits a per-package `swell.generated.ts` with a local `Registry` of
-//! analysed queries and a typed `q(...)` overload that pins the
-//! `SqlText<P, R>` brand to the live-DB-inferred `{ params; row }` shape.
+//! Emits a per-package `swell.generated.ts` that augments swell's
+//! `Registry` interface via `declare module "swell"`. No runtime code:
+//! the file is pure type-level merging. `q` itself comes from
+//! `"swell"`; its strict overload reads `keyof Registry`, which the
+//! augmentation populates.
 //!
-//! Consumers import `q` from the generated file:
+//! Usage:
 //!
-//!   import { q } from "./swell.generated";
-//!   import pg from "pg";
+//!   import "./swell.generated";   // loads the augmentation
+//!   import { q } from "swell";
 //!
 //!   const stmt = q("SELECT id, email FROM users WHERE id = $1");
 //!   const { rows } = await pool.query(stmt, [userId]);
@@ -34,10 +36,10 @@ impl Default for CodegenOptions<'_> {
 pub fn render(queries: &[InferredQuery], opts: CodegenOptions<'_>) -> String {
     let mut out = String::new();
     out.push_str(HEADER);
-    out.push_str(&format!(
-        "import {{ q as qBase, type Json, type SqlText }} from \"{}\";\n",
-        opts.runtime_module,
-    ));
+    // Side-effect import keeps swell in the import graph so the
+    // `declare module` below resolves; the type imports keep `Json` /
+    // `SqlText` aliases available to column-override emitters.
+    out.push_str(&format!("import {{ type Json, type SqlText }} from \"{}\";\n", opts.runtime_module));
     for (from, names) in opts.extra_imports {
         if names.is_empty() {
             continue;
@@ -51,29 +53,16 @@ pub fn render(queries: &[InferredQuery], opts: CodegenOptions<'_>) -> String {
     // a template literal (`[`SELECT...\nFROM...`]: { ... }`) so the SQL
     // keeps its original layout. Bare template literals aren't legal as
     // property keys in any TS parser, but the computed form is.
+    out.push_str(&format!("declare module \"{}\" {{\n", opts.runtime_module));
     if queries.is_empty() {
-        out.push_str("type Registry = Record<string, never>;\n\n");
+        out.push_str("  interface Registry {}\n");
     } else {
-        out.push_str("type Registry = {\n");
+        out.push_str("  interface Registry {\n");
         for q in queries {
-            out.push_str(&render_entry(q, "  "));
+            out.push_str(&render_entry(q, "    "));
         }
-        out.push_str("};\n\n");
+        out.push_str("  }\n");
     }
-    out.push_str(
-        "/** Brands the SQL string so `pg.Pool.query(q(…), …)` (via swell's\n\
-         *  `declare module \"pg\"` augmentation) narrows rows + params to the\n\
-         *  registry-inferred shape. Falls through to a permissive `SqlText`\n\
-         *  for SQL strings that haven't been indexed yet. */\n",
-    );
-    out.push_str(
-        "export function q<S extends keyof Registry & string>(\n\
-         \x20 text: S,\n\
-         ): SqlText<Registry[S][\"params\"] & unknown[], Registry[S][\"row\"]>;\n",
-    );
-    out.push_str("export function q<S extends string>(text: S): SqlText<unknown[], unknown>;\n");
-    out.push_str("export function q(text: string): SqlText<unknown[], unknown> {\n");
-    out.push_str("  return qBase(text);\n");
     out.push_str("}\n");
     out
 }
@@ -210,12 +199,12 @@ mod tests {
     }
 
     #[test]
-    fn empty_module_has_imports_and_q() {
+    fn empty_module_emits_empty_registry_augmentation() {
         let out = render(&[], CodegenOptions::default());
-        assert!(out.contains("import { q as qBase, type Json, type SqlText } from \"swell\""), "got: {}", out);
-        assert!(out.contains("type Registry = Record<string, never>;"), "got: {}", out);
-        assert!(out.contains("export function q<S extends keyof Registry & string>"), "got: {}", out);
-        assert!(out.contains("export function q<S extends string>(text: S): SqlText<unknown[], unknown>"), "got: {}", out);
+        assert!(out.contains("import { type Json, type SqlText } from \"swell\""), "got: {}", out);
+        assert!(out.contains("declare module \"swell\" {"), "got: {}", out);
+        assert!(out.contains("  interface Registry {}\n"), "got: {}", out);
+        assert!(!out.contains("export function q"), "should not emit q; q lives in swell now: {}", out);
     }
 
     #[test]
@@ -227,7 +216,7 @@ mod tests {
         )];
         let out = render(&queries, CodegenOptions::default());
         assert!(
-            out.contains("  \"SELECT 1\": { params: []; row: { \"?column?\": number } };"),
+            out.contains("    \"SELECT 1\": { params: []; row: { \"?column?\": number } };"),
             "got: {}",
             out
         );
@@ -243,7 +232,7 @@ mod tests {
         let out = render(&queries, CodegenOptions::default());
         assert!(
             out.contains(
-                "  \"SELECT id FROM users WHERE id = $1\": { params: [string | null]; row: { id: string } };"
+                "    \"SELECT id FROM users WHERE id = $1\": { params: [string | null]; row: { id: string } };"
             ),
             "got: {}",
             out
@@ -260,7 +249,7 @@ mod tests {
         let out = render(&queries, CodegenOptions::default());
         assert!(
             out.contains(
-                "  \"DELETE FROM users WHERE id = $1\": { params: [string | null]; row: never };"
+                "    \"DELETE FROM users WHERE id = $1\": { params: [string | null]; row: never };"
             ),
             "got: {}",
             out
@@ -280,7 +269,7 @@ mod tests {
         )];
         let out = render(&queries, CodegenOptions::default());
         assert!(
-            out.contains("  [`SELECT id, email\nFROM users\nWHERE id = $1`]: { params:"),
+            out.contains("    [`SELECT id, email\nFROM users\nWHERE id = $1`]: { params:"),
             "expected computed template-literal key, got: {}",
             out
         );
@@ -299,16 +288,16 @@ mod tests {
     }
 
     #[test]
-    fn multiple_entries_render_in_one_object() {
+    fn multiple_entries_render_in_one_interface() {
         let queries = vec![
             q("SELECT 1", vec![], vec![InferredColumn { name: "n".into(), oid: 0, nullable: false, ts_type: "number".into() }]),
             q("SELECT 2", vec![], vec![InferredColumn { name: "n".into(), oid: 0, nullable: false, ts_type: "number".into() }]),
         ];
         let out = render(&queries, CodegenOptions::default());
-        assert!(out.contains("type Registry = {\n"), "missing object open: {}", out);
-        assert!(out.contains("  \"SELECT 1\": { params: []; row: { n: number } };\n"), "missing entry 1: {}", out);
-        assert!(out.contains("  \"SELECT 2\": { params: []; row: { n: number } };\n"), "missing entry 2: {}", out);
-        assert!(out.contains("};\n"), "missing object close: {}", out);
+        assert!(out.contains("declare module \"swell\" {\n  interface Registry {\n"), "missing block open: {}", out);
+        assert!(out.contains("    \"SELECT 1\": { params: []; row: { n: number } };\n"), "missing entry 1: {}", out);
+        assert!(out.contains("    \"SELECT 2\": { params: []; row: { n: number } };\n"), "missing entry 2: {}", out);
+        assert!(out.contains("  }\n}\n"), "missing block close: {}", out);
     }
 
     #[test]

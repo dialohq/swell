@@ -3,7 +3,8 @@
 // file passes iff the generated `q` overload brands `SqlText<P, R>`
 // correctly for every registered SQL string.
 
-import { pool, q } from "./db";
+import { q } from "swell";
+import { pool } from "./db";
 
 declare const userId: string;
 declare const orgId: string;
