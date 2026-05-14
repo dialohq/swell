@@ -52,48 +52,43 @@
           BINDGEN_EXTRA_CLANG_ARGS = bindgenExtraClangArgs;
         };
 
-        # `tsc --noEmit` over packages/runtime, wrapped as a derivation so
-        # it lands in `checks.<system>` and runs under nix-fast-build. Deps
-        # come from the workspace's npm lockfile committed at the repo
-        # root; buildNpmPackage materialises them in a sandboxed
-        # node_modules (no live npm-registry access).
-        runtimeTypecheck = pkgs.buildNpmPackage {
-          pname = "swell-runtime-typecheck";
+        # Workspace lockfile hash. Both tsc-driven checks below pull
+        # node_modules from the same root lockfile, so this lives once.
+        # buildNpmPackage materialises a sandboxed node_modules (no live
+        # npm-registry access) — a hash drift will fail-fast at evaluation.
+        npmDepsHash = "sha256-U6wTTLbKnI89vrMUBolSLGwnQZIn133jpI3dYhzNWMk=";
+
+        # tsc-only check, wrapped as a derivation so it lands in
+        # `checks.<system>` and runs under nix-fast-build. The marker file
+        # in $out is the derivation output.
+        mkTscCheck = { pname, tsc }: pkgs.buildNpmPackage {
+          inherit pname npmDepsHash;
           version = "0.1.0";
           src = ./.;
-          npmDepsHash = "sha256-U6wTTLbKnI89vrMUBolSLGwnQZIn133jpI3dYhzNWMk=";
           dontNpmBuild = true;
-          # Run tsc directly against the runtime sources. No `dist/` is
-          # emitted (`--noEmit`); a marker file is the derivation output.
           installPhase = ''
             runHook preInstall
-            cd packages/runtime
-            npx tsc -p tsconfig.json --noEmit
+            ${tsc}
             mkdir -p $out
             touch $out/ok
             runHook postInstall
           '';
         };
 
-        # `tsc --noEmit` over examples/basic. Exercises the q() overload
-        # + pg module augmentation end-to-end against the example's
-        # `swell.generated.ts`, so a regression in either lands here
-        # before it lands in user code.
-        exampleTypecheck = pkgs.buildNpmPackage {
+        runtimeTypecheck = mkTscCheck {
+          pname = "swell-runtime-typecheck";
+          tsc = "(cd packages/runtime && npx tsc -p tsconfig.json --noEmit)";
+        };
+
+        # Exercises the q() overload + pg module augmentation end-to-end
+        # against the example's `swell.generated.ts`. Builds the runtime
+        # first so the workspace symlink resolves to compiled `.d.ts` /
+        # `.js`, not bare source.
+        exampleTypecheck = mkTscCheck {
           pname = "swell-example-basic-typecheck";
-          version = "0.0.0";
-          src = ./.;
-          npmDepsHash = "sha256-U6wTTLbKnI89vrMUBolSLGwnQZIn133jpI3dYhzNWMk=";
-          dontNpmBuild = true;
-          installPhase = ''
-            runHook preInstall
-            # Build the runtime first so the workspace symlink resolves
-            # to compiled `.d.ts` / `.js`, not bare source.
+          tsc = ''
             (cd packages/runtime && npx tsc -p tsconfig.json)
             (cd examples/basic && npx tsc -p tsconfig.json --noEmit)
-            mkdir -p $out
-            touch $out/ok
-            runHook postInstall
           '';
         };
 
