@@ -11,10 +11,6 @@
       "types": "./packages/runtime/dist/index.d.ts",
       "import": "./packages/runtime/dist/index.js"
     },
-    "./testing": {
-      "types": "./packages/runtime/dist/testing.d.ts",
-      "import": "./packages/runtime/dist/testing.js"
-    },
     "./pg": {
       "types": "./packages/runtime/dist/pg.d.ts",
       "import": "./packages/runtime/dist/pg.js"
@@ -22,14 +18,10 @@
   },
   "files": ["packages/runtime/dist", "packages/runtime/package.json"],
   "peerDependencies": {
-    "postgres": "^3.4.0",
-    "pg": "^8.0.0",
-    "pg-query-stream": "^4.0.0"
+    "pg": "^8.0.0"
   },
   "peerDependenciesMeta": {
-    "postgres": { "optional": true },
-    "pg": { "optional": true },
-    "pg-query-stream": { "optional": true }
+    "pg": { "optional": true }
   },
   "workspaces": [
     "packages/*",

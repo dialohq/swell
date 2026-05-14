@@ -1,17 +1,10 @@
 //! TS/TSX source scanning.
 //!
-//! Walks files with `swc_ecma_parser`, locates `sql\`...\`` tagged-template
-//! call sites whose tag identifier was imported from the configured runtime
-//! module, and extracts:
-//!   - the static template parts (the registry key)
-//!   - the source location for diagnostics
-//!
-//! What "imported from the configured runtime module" means in practice:
-//! we scan the file's `ImportDeclaration` nodes for any specifier whose
-//! source matches `runtime_module` and whose imported name matches
-//! `runtime_export` (or whose default-import name is `runtime_export`). The
-//! local binding name is whatever alias the user chose. Tagged templates
-//! whose tag identifier matches that local binding are emitted.
+//! Walks files with `swc_ecma_parser` and finds `q("…")` call sites
+//! whose `q` was imported from the swell runtime or any configured
+//! re-export module (per-package `swell.generated.ts`, custom `./db`,
+//! etc). The first argument must be a static string — anything dynamic
+//! is silently skipped.
 
 mod visit;
 
@@ -26,24 +19,20 @@ pub struct ScannedQuery {
     pub file: String,
     pub line: u32,
     pub col: u32,
-    /// Static template parts. Number of params = parts.len() - 1.
-    /// For a non-parameterised query like `sql\`SELECT 1\``, this has one
-    /// element.
+    /// The static SQL text. Stored as a single-element `Vec` for
+    /// forward compatibility with future template-literal parts.
     pub static_parts: Vec<String>,
-    /// The local-binding name of the sql tag at this call site (always
-    /// equal to `runtime_export` unless the user aliased the import).
+    /// The local-binding name `q` is imported under (always equal to
+    /// `"q"` unless aliased via `import { q as foo }`).
     pub tag_local_name: String,
 }
 
 #[derive(Debug, Clone)]
 pub struct ScanOptions<'a> {
-    /// Module specifiers from which `sql` (or `createSql`) is imported. Covers
-    /// both the codegen output (`./swell.generated`) and any per-package
-    /// re-export modules like `./db`, `../db`, etc.
-    pub db_modules: &'a [&'a str],
-    /// Named exports from `db_modules` that bind a TypedSql instance. Default
-    /// `["sql"]` — extend if a package keeps multiple typed handles.
-    pub db_exports: &'a [&'a str],
+    /// Modules (in addition to `"swell"`) that re-export `q`. Defaults
+    /// cover the per-package codegen output (`./swell.generated`,
+    /// `../swell.generated`, etc).
+    pub q_modules: &'a [&'a str],
 }
 
 /// Scan a single TS/TSX file. Returns one `ScannedQuery` per call site.

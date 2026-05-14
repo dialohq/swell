@@ -232,9 +232,8 @@ async fn run_pipeline(cfg: &Config, opts: RunOpts) -> Result<RunSummary> {
 fn scan_project(cfg: &Config) -> Result<Vec<ScannedQuery>> {
     let include = build_globset(&cfg.scan.include)?;
     let exclude = build_globset(&cfg.scan.exclude)?;
-    let db_refs: Vec<&str> = cfg.scan.db_modules.iter().map(String::as_str).collect();
-    let exp_refs: Vec<&str> = cfg.scan.db_exports.iter().map(String::as_str).collect();
-    let opts = ScanOptions { db_modules: &db_refs, db_exports: &exp_refs };
+    let q_refs: Vec<&str> = cfg.scan.q_modules.iter().map(String::as_str).collect();
+    let opts = ScanOptions { q_modules: &q_refs };
 
     let mut out = Vec::new();
     for entry in walkdir::WalkDir::new(&cfg.root)
