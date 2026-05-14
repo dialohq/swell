@@ -79,6 +79,22 @@ pub fn render(queries: &[InferredQuery], opts: CodegenOptions<'_>) -> String {
     out.push_str("export function createSql(driver: AnyDriver): Sql {\n");
     out.push_str("  return createTypedSql<QueryRegistry>(driver);\n");
     out.push_str("}\n");
+    // Module-augmentation: pipe every entry into swell's global `Registry`
+    // interface so `q("…")` resolves to the same `{ params; row }` shape.
+    // This unlocks the q-marker overloads on `TypedSql` without dropping
+    // the legacy literal-narrowing form generated above.
+    if !queries.is_empty() {
+        out.push('\n');
+        out.push_str(&format!("declare module \"{}\" {{\n", opts.runtime_module));
+        out.push_str("  // One entry per analysed query — looked up by `q(...)` via a\n");
+        out.push_str("  // conditional type against this interface.\n");
+        out.push_str("  interface Registry {\n");
+        for q in queries {
+            out.push_str(&render_module_entry(q));
+        }
+        out.push_str("  }\n");
+        out.push_str("}\n");
+    }
     out
 }
 
@@ -87,6 +103,13 @@ fn render_entry(q: &InferredQuery) -> String {
     let params = render_params_tuple(q);
     let row = render_row_type(&q.columns);
     format!("  {key}: {{ params: {params}; row: {row} }};\n")
+}
+
+fn render_module_entry(q: &InferredQuery) -> String {
+    let key = render_key(&q.sql);
+    let params = render_params_tuple(q);
+    let row = render_row_type(&q.columns);
+    format!("    {key}: {{ params: {params}; row: {row} }};\n")
 }
 
 /// Render the SQL string as a property key. Single-line SQL becomes a
