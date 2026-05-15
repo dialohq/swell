@@ -370,6 +370,8 @@ async fn check_all(schema: &GenSchema) {
         check_select_star(schema, table).await;
         check_select_subset(schema, table).await;
         check_insert_returning(schema, table).await;
+        check_insert_multi_row(schema, table).await;
+        check_insert_coalesce_keeps_param_nullable(schema, table).await;
         check_update_with_where(schema, table).await;
     }
     if schema.tables.len() >= 2 {
@@ -445,6 +447,78 @@ async fn check_insert_returning(schema: &GenSchema, table: &GenTable) {
             &schema.namespace, &table.name,
         );
     }
+}
+
+/// Multi-row INSERT: each row contributes one param per column, and
+/// every `$N` should still bind to its target column.
+///
+///   INSERT INTO t (a, b) VALUES ($1, $2), ($3, $4)
+///   -- $1, $3 → a;  $2, $4 → b
+async fn check_insert_multi_row(schema: &GenSchema, table: &GenTable) {
+    let cols = &table.columns;
+    let col_list = cols.iter().map(|c| c.name.as_str())
+        .collect::<Vec<_>>().join(", ");
+    // Build two rows.
+    let row1 = (1..=cols.len()).map(|i| format!("${i}"))
+        .collect::<Vec<_>>().join(", ");
+    let row2 = ((cols.len() + 1)..=(2 * cols.len())).map(|i| format!("${i}"))
+        .collect::<Vec<_>>().join(", ");
+    let an = analyzer().await;
+    let sql = format!(
+        "INSERT INTO {}.{} ({col_list}) VALUES ({row1}), ({row2})",
+        schema.namespace, table.name,
+    );
+    let q = an.analyze(&sql).await
+        .unwrap_or_else(|e| panic!("multi-row INSERT: {e}\nSQL: {sql}"));
+    assert_eq!(q.params.len(), 2 * cols.len(),
+        "multi-row INSERT param count mismatch");
+    // Both rows bind to the same column list, so $i and $(i+ncols) both
+    // mirror column[i].
+    for i in 0..cols.len() {
+        assert_param_matches_target(
+            "multi-row INSERT row1", i, &q.params[i], &cols[i], &schema.enums,
+            &schema.namespace, &table.name,
+        );
+        assert_param_matches_target(
+            "multi-row INSERT row2", i, &q.params[i + cols.len()], &cols[i], &schema.enums,
+            &schema.namespace, &table.name,
+        );
+    }
+}
+
+/// `INSERT INTO t (col) VALUES (coalesce($1, 'lit'))` — even though
+/// `col` may be NOT NULL, `$1` should stay NULLABLE because the
+/// coalesce wraps it. swell's `param_nullability` documents this
+/// exception explicitly; this property pins it.
+///
+/// Only runs for tables that have a NOT NULL text/int column we can
+/// supply a literal default for — the property is moot when the
+/// target column already accepts null.
+async fn check_insert_coalesce_keeps_param_nullable(schema: &GenSchema, table: &GenTable) {
+    // Find a NOT NULL column whose type we can produce a literal for.
+    let Some(target) = table.columns.iter().find(|c| c.not_null && matches!(
+        c.ty, PgType::Int | PgType::BigInt | PgType::Text | PgType::Bool,
+    )) else { return };
+    let literal: &str = match target.ty {
+        PgType::Int | PgType::BigInt => "0",
+        PgType::Text => "''",
+        PgType::Bool => "false",
+        _ => unreachable!(),
+    };
+    let an = analyzer().await;
+    let sql = format!(
+        "INSERT INTO {}.{} ({}) VALUES (coalesce($1, {literal}))",
+        schema.namespace, table.name, target.name,
+    );
+    let q = an.analyze(&sql).await
+        .unwrap_or_else(|e| panic!("coalesce INSERT: {e}\nSQL: {sql}"));
+    assert_eq!(q.params.len(), 1);
+    assert!(q.params[0].nullable,
+        "coalesce($1, lit): $1 should stay nullable even when target ({}.{}) is NOT NULL — \
+         coalesce substitutes the literal at runtime",
+        table.name, target.name);
+    assert!(q.params[0].table_ref.is_none(),
+        "coalesce($1, lit): $1 is not a direct column binding — should have no table_ref");
 }
 
 async fn check_update_with_where(schema: &GenSchema, table: &GenTable) {
@@ -528,7 +602,7 @@ async fn check_function_call(schema: &GenSchema, f: &GenFunction) {
 // ---------- proptest driver ----------
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(32))]
+    #![proptest_config(ProptestConfig::with_cases(64))]
 
     /// The big one: random schema → canonical queries → property
     /// assertions all the way through. 32 cases keeps the suite under
