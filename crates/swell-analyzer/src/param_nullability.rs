@@ -22,10 +22,9 @@
 //! nullable — `$1` going into `a` forbids null at the call site, so
 //! the strictest binding wins.
 
-use crate::catalog::fetch_attnotnull;
 use crate::query::TableColRef;
 use pg_query::protobuf::{node, InsertStmt, UpdateStmt};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use tokio_postgres::Client;
 
 /// One inferred fact per `$N`: whether it's nullable, and the base
@@ -68,56 +67,91 @@ pub async fn infer(client: &Client, sql: &str, n_params: usize) -> Vec<ParamInfo
         return out;
     }
 
-    let table_oids = resolve_table_oids(client, &bindings).await;
-    if table_oids.is_empty() {
-        return out;
-    }
-
-    let attnums = resolve_attnums(client, &bindings, &table_oids).await;
-    let pair_vec: Vec<(u32, i16)> = attnums
-        .iter()
-        .map(|((tbl, _col), attnum)| (*tbl, *attnum))
-        .collect();
-    let attnotnull = fetch_attnotnull(client, &pair_vec)
-        .await
-        .ok()
-        .unwrap_or_default();
-
-    // Resolve each binding's actual schema name (since unqualified
-    // references default to `public`, but the real namespace may
-    // differ for tables in `search_path`-mounted schemas — we want
-    // codegen's table-type reference to match the resolved namespace).
-    let mut resolved_schema: HashMap<(String, String), String> = HashMap::new();
-    for ((s, t), _) in &table_oids {
-        resolved_schema.insert((s.clone(), t.clone()), s.clone());
-    }
+    // One round-trip resolves every binding's (schema, table, column)
+    // to `attnotnull`. The previous version made three separate
+    // queries (table_oids, attnums, attnotnull); this CTE joins
+    // everything against the catalog at once.
+    let resolved = resolve_bindings(client, &bindings).await;
 
     for b in &bindings {
         if b.param_index == 0 || b.param_index > n_params {
             continue;
         }
-        let key = (normalize_schema(&b.schema), b.table.clone());
-        let Some(&table_oid) = table_oids.get(&key) else { continue };
-        let attnum = attnums.get(&(table_oid, b.column.clone())).copied();
-        let schema = resolved_schema.get(&key).cloned().unwrap_or_else(|| key.0.clone());
-
-        // Set table_ref for any binding to a known base column —
-        // whether or not NOT NULL. Codegen uses this to emit
-        // `Table["col"]` in the param tuple regardless of nullability.
+        let key = (normalize_schema(&b.schema), b.table.clone(), b.column.clone());
         let entry = &mut out[b.param_index - 1];
+        let Some(info) = resolved.get(&key) else { continue };
+
+        // Set table_ref for any binding to a known base column,
+        // regardless of nullability — codegen needs the link to
+        // render `Table["col"]` in the param tuple.
         if entry.table_ref.is_none() {
             entry.table_ref = Some(TableColRef {
-                schema,
+                schema: key.0.clone(),
                 table: b.table.clone(),
                 column: b.column.clone(),
             });
         }
-
-        if let Some(attnum) = attnum {
-            if attnotnull.get(&(table_oid, attnum)).copied().unwrap_or(false) {
-                entry.nullable = false;
-            }
+        if info.not_null {
+            entry.nullable = false;
         }
+    }
+    out
+}
+
+struct ResolvedBinding {
+    not_null: bool,
+}
+
+/// Resolve every binding's `(schema, table, column)` to a per-column
+/// `attnotnull` bit in one round trip. Bindings whose table or column
+/// can't be resolved (typo, dropped schema, etc.) are absent — caller
+/// falls through to the conservative "nullable" default.
+async fn resolve_bindings(
+    client: &Client, bindings: &[Binding],
+) -> HashMap<(String, String, String), ResolvedBinding> {
+    let mut unique: std::collections::HashSet<(String, String, String)> =
+        std::collections::HashSet::new();
+    for b in bindings {
+        unique.insert((normalize_schema(&b.schema), b.table.clone(), b.column.clone()));
+    }
+    let mut out = HashMap::new();
+    if unique.is_empty() {
+        return out;
+    }
+    let mut schemas = Vec::with_capacity(unique.len());
+    let mut tables  = Vec::with_capacity(unique.len());
+    let mut columns = Vec::with_capacity(unique.len());
+    for (s, t, c) in &unique {
+        schemas.push(s.clone());
+        tables.push(t.clone());
+        columns.push(c.clone());
+    }
+    let rows = match client.query(
+        r#"
+        WITH ask(schema, tbl, col) AS (
+            SELECT * FROM unnest($1::text[], $2::text[], $3::text[])
+        )
+        SELECT ask.schema, ask.tbl, ask.col, a.attnotnull
+        FROM ask
+        JOIN pg_namespace n ON n.nspname = ask.schema
+        JOIN pg_class c     ON c.relnamespace = n.oid AND c.relname = ask.tbl
+        JOIN pg_attribute a ON a.attrelid = c.oid AND a.attname = ask.col
+        WHERE a.attnum > 0 AND NOT a.attisdropped
+        "#,
+        &[&schemas, &tables, &columns],
+    ).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::debug!("resolve_bindings: {e}");
+            return out;
+        }
+    };
+    for row in &rows {
+        let s: String = row.get(0);
+        let t: String = row.get(1);
+        let c: String = row.get(2);
+        let nn: bool = row.get(3);
+        out.insert((s, t, c), ResolvedBinding { not_null: nn });
     }
     out
 }
@@ -190,91 +224,3 @@ fn normalize_schema(s: &str) -> String {
     }
 }
 
-async fn resolve_table_oids(
-    client: &Client,
-    bindings: &[Binding],
-) -> HashMap<(String, String), u32> {
-    let mut unique: HashSet<(String, String)> = HashSet::new();
-    for b in bindings {
-        unique.insert((normalize_schema(&b.schema), b.table.clone()));
-    }
-    let mut out = HashMap::new();
-    if unique.is_empty() {
-        return out;
-    }
-    let schemas: Vec<String> = unique.iter().map(|(s, _)| s.clone()).collect();
-    let names: Vec<String> = unique.iter().map(|(_, n)| n.clone()).collect();
-    let rows = match client
-        .query(
-            r#"
-        WITH ask(schema, name) AS (SELECT * FROM unnest($1::text[], $2::text[]))
-        SELECT n.nspname, c.relname, c.oid::bigint
-        FROM ask
-        JOIN pg_namespace n ON n.nspname = ask.schema
-        JOIN pg_class c ON c.relnamespace = n.oid AND c.relname = ask.name
-        "#,
-            &[&schemas, &names],
-        )
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::debug!("resolve_table_oids: {e}");
-            return out;
-        }
-    };
-    for row in &rows {
-        let s: String = row.get(0);
-        let n: String = row.get(1);
-        let oid: i64 = row.get(2);
-        out.insert((s, n), oid as u32);
-    }
-    out
-}
-
-async fn resolve_attnums(
-    client: &Client,
-    bindings: &[Binding],
-    table_oids: &HashMap<(String, String), u32>,
-) -> HashMap<(u32, String), i16> {
-    let mut tables: HashSet<u32> = HashSet::new();
-    let mut columns: HashSet<String> = HashSet::new();
-    for b in bindings {
-        if let Some(&oid) = table_oids.get(&(normalize_schema(&b.schema), b.table.clone())) {
-            tables.insert(oid);
-            columns.insert(b.column.clone());
-        }
-    }
-    let mut out = HashMap::new();
-    if tables.is_empty() || columns.is_empty() {
-        return out;
-    }
-    let tables_i64: Vec<i64> = tables.iter().map(|x| *x as i64).collect();
-    let columns_vec: Vec<String> = columns.into_iter().collect();
-    let rows = match client
-        .query(
-            r#"
-        SELECT a.attrelid::bigint, a.attname, a.attnum
-        FROM pg_attribute a
-        WHERE a.attrelid::bigint = ANY($1::bigint[])
-          AND a.attname = ANY($2::text[])
-          AND a.attnum > 0 AND NOT a.attisdropped
-        "#,
-            &[&tables_i64, &columns_vec],
-        )
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::debug!("resolve_attnums: {e}");
-            return out;
-        }
-    };
-    for row in &rows {
-        let t: i64 = row.get(0);
-        let n: String = row.get(1);
-        let a: i16 = row.get(2);
-        out.insert((t as u32, n), a);
-    }
-    out
-}
