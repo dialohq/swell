@@ -74,7 +74,12 @@ impl Analyzer {
             .filter(|c| c.table_oid != 0 && c.attnum > 0)
             .map(|c| (c.table_oid, c.attnum))
             .collect();
-        let attnotnull = catalog::fetch_attnotnull(&self.client, &pairs).await?;
+        // One round trip resolves both `attnotnull` and the
+        // `(schema, table, column)` triple for every referenced base
+        // column — the two used to be separate queries.
+        let column_meta = resolve_column_meta(&self.client, &pairs).await;
+        let attnotnull: std::collections::HashMap<(u32, i16), bool> = column_meta
+            .iter().map(|(k, v)| (*k, v.not_null)).collect();
 
         let null_hints = nullability::explain_nullability(
             &self.client, sql, &described.params, described.columns.len(),
@@ -93,11 +98,6 @@ impl Analyzer {
             &self.client, sql, described.params.len(),
         ).await;
 
-        // Resolve column (table_oid, attnum) → (schema, table, column).
-        // One round-trip for every referenced base-table column. Empty
-        // when the query has no direct base-table refs (pure expressions).
-        let col_table_refs = resolve_column_refs(&self.client, &pairs).await;
-
         let params = described.params.iter().enumerate()
             .map(|(i, t)| {
                 let info = param_info.get(i).cloned().unwrap_or_default();
@@ -112,8 +112,6 @@ impl Analyzer {
 
         let columns = described.columns.iter().enumerate()
             .map(|(i, c)| {
-                let base_not_null = c.table_oid != 0 && c.attnum > 0 &&
-                    attnotnull.get(&(c.table_oid, c.attnum)).copied().unwrap_or(false);
                 let inferred_nullable = decide_nullability(
                     c, &attnotnull, null_hints.by_column.get(i).copied()
                         .unwrap_or(nullability::NullVerdict::Unknown),
@@ -123,14 +121,14 @@ impl Analyzer {
                 let inferred_ts = json_ts.unwrap_or(oid_ts);
 
                 let ov = overrides::parse(&c.name);
-                let table_ref = col_table_refs.get(&(c.table_oid, c.attnum)).cloned();
+                let table_ref = column_meta.get(&(c.table_oid, c.attnum))
+                    .map(|m| m.table_ref.clone());
                 InferredColumn {
                     name: ov.clean_name,
                     oid: c.type_.oid(),
                     nullable: ov.force_nullable.unwrap_or(inferred_nullable),
                     ts_type: ov.force_ts_type.unwrap_or(inferred_ts),
                     table_ref,
-                    base_not_null,
                 }
             })
             .collect();
@@ -138,55 +136,73 @@ impl Analyzer {
         Ok(InferredQuery { sql: sql.to_string(), params, columns })
     }
 
-    /// Fetch the full column list of a single base table, used by
-    /// codegen to emit a reusable `interface SchemaTable { … }`. Returns
-    /// `None` if the table can't be resolved (dropped, schema lookup
-    /// failed, etc.) — the caller falls back to inlining types.
-    pub async fn table_schema(
-        &self, schema: &str, table: &str,
-    ) -> Result<Option<TableSchema>> {
+    /// Fetch the full column list for every requested `(schema, table)`
+    /// in one round trip. Codegen passes the distinct base tables every
+    /// analysed query referenced; we return one `TableSchema` per pair
+    /// that actually resolves (dropped / missing tables are skipped
+    /// silently — caller falls back to inlining types).
+    pub async fn table_schemas(
+        &self, pairs: &[(String, String)],
+    ) -> Result<Vec<TableSchema>> {
+        if pairs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let schemas: Vec<&str> = pairs.iter().map(|(s, _)| s.as_str()).collect();
+        let tables:  Vec<&str> = pairs.iter().map(|(_, t)| t.as_str()).collect();
         let rows = self.client.query(
             r#"
-            SELECT a.attname, a.atttypid::bigint, t.typname, a.attnotnull
-            FROM pg_class c
-            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WITH ask(schema, name) AS (SELECT * FROM unnest($1::text[], $2::text[]))
+            SELECT n.nspname, c.relname, a.attname, a.atttypid::bigint, t.typname,
+                   a.attnotnull, a.attnum
+            FROM ask
+            JOIN pg_namespace n ON n.nspname = ask.schema
+            JOIN pg_class c     ON c.relnamespace = n.oid AND c.relname = ask.name
             JOIN pg_attribute a ON a.attrelid = c.oid
-            JOIN pg_type t ON t.oid = a.atttypid
-            WHERE n.nspname = $1 AND c.relname = $2
-              AND a.attnum > 0 AND NOT a.attisdropped
-            ORDER BY a.attnum
+            JOIN pg_type t      ON t.oid = a.atttypid
+            WHERE a.attnum > 0 AND NOT a.attisdropped
+            ORDER BY n.nspname, c.relname, a.attnum
             "#,
-            &[&schema, &table],
+            &[&schemas, &tables],
         ).await?;
-        if rows.is_empty() {
-            return Ok(None);
-        }
-        let columns: Vec<TableSchemaColumn> = rows.iter().map(|row| {
-            let name: String = row.get(0);
-            let oid: i64 = row.get(1);
-            let typname: String = row.get(2);
-            let not_null: bool = row.get(3);
-            TableSchemaColumn {
+        let mut grouped: std::collections::BTreeMap<(String, String), Vec<TableSchemaColumn>> =
+            std::collections::BTreeMap::new();
+        for row in &rows {
+            let schema: String = row.get(0);
+            let table:  String = row.get(1);
+            let name:   String = row.get(2);
+            let oid:    i64    = row.get(3);
+            let typname: String = row.get(4);
+            let not_null: bool = row.get(5);
+            grouped.entry((schema, table)).or_default().push(TableSchemaColumn {
                 name,
                 oid: oid as u32,
                 ts_type: self.catalog.render_oid(oid as u32, &typname),
                 not_null,
-            }
-        }).collect();
-        Ok(Some(TableSchema {
-            schema: schema.into(),
-            table: table.into(),
-            columns,
-        }))
+            });
+        }
+        Ok(grouped.into_iter()
+            .map(|((schema, table), columns)| TableSchema { schema, table, columns })
+            .collect())
     }
 }
 
-/// Resolve `(table_oid, attnum)` → `TableColRef { schema, table, column }`
-/// for every base-table-backed column in one round trip.
-async fn resolve_column_refs(
+/// Per-(table_oid, attnum) result of the one-shot column-metadata
+/// lookup: the originating `(schema, table, column)` triple plus the
+/// base column's `attnotnull` bit. Used by `analyze` to fill both
+/// `InferredColumn.table_ref` and the join-nullability verdict from
+/// `decide_nullability`.
+struct ColumnMeta {
+    table_ref: TableColRef,
+    not_null: bool,
+}
+
+/// Resolve `(table_oid, attnum)` → `ColumnMeta` in one round trip,
+/// fusing what used to be separate `fetch_attnotnull` and
+/// `resolve_column_refs` queries.
+async fn resolve_column_meta(
     client: &Client,
     pairs: &[(u32, i16)],
-) -> HashMap<(u32, i16), TableColRef> {
+) -> HashMap<(u32, i16), ColumnMeta> {
     if pairs.is_empty() {
         return HashMap::new();
     }
@@ -201,7 +217,7 @@ async fn resolve_column_refs(
     let rows = match client.query(
         r#"
         WITH ask(t, a) AS (SELECT * FROM unnest($1::bigint[], $2::int[]))
-        SELECT n.nspname, c.relname, att.attname, ask.t, ask.a
+        SELECT n.nspname, c.relname, att.attname, ask.t, ask.a, att.attnotnull
         FROM ask
         JOIN pg_attribute att ON att.attrelid::bigint = ask.t AND att.attnum = ask.a::smallint
         JOIN pg_class c       ON c.oid = att.attrelid
@@ -212,7 +228,7 @@ async fn resolve_column_refs(
     ).await {
         Ok(r) => r,
         Err(e) => {
-            tracing::debug!("resolve_column_refs: {e}");
+            tracing::debug!("resolve_column_meta: {e}");
             return HashMap::new();
         }
     };
@@ -223,8 +239,10 @@ async fn resolve_column_refs(
         let column: String = row.get(2);
         let t: i64 = row.get(3);
         let a: i32 = row.get(4);
-        out.insert((t as u32, a as i16), TableColRef {
-            schema, table, column,
+        let not_null: bool = row.get(5);
+        out.insert((t as u32, a as i16), ColumnMeta {
+            table_ref: TableColRef { schema, table, column },
+            not_null,
         });
     }
     out

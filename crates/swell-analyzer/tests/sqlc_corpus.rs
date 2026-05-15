@@ -96,11 +96,9 @@ fn skip_query(sql: &str) -> bool {
     false
 }
 
-/// Connect once, create a per-test database, return an analyzer wired
-/// to that DB. Drops the DB on completion via `TestDb::Drop`.
 struct TestDb {
     db_name: String,
-    root_url: String,
+    url: String,
 }
 
 impl TestDb {
@@ -110,84 +108,43 @@ impl TestDb {
         let (client, conn) = tokio_postgres::connect(&root, NoTls)
             .await.expect("connect to root db");
         tokio::spawn(async move { let _ = conn.await; });
-        // Reset any leftover DB from a previous run.
+        // DROP IF EXISTS so a previous aborted run can't block this one.
         let _ = client.execute(&format!("DROP DATABASE IF EXISTS \"{db_name}\" WITH (FORCE)"), &[]).await;
         client.execute(&format!("CREATE DATABASE \"{db_name}\""), &[])
             .await.expect("create test db");
         drop(client);
-        Self { db_name, root_url: root }
+        // Swap the dbname segment in the URL. The query string (`?host=…`)
+        // sits after the path so we preserve it verbatim.
+        let (path, query) = match root.split_once('?') {
+            Some((p, q)) => (p, format!("?{q}")),
+            None => (root.as_str(), String::new()),
+        };
+        let base = path.rsplit_once('/').map(|(b, _)| b).unwrap_or(path);
+        let url = format!("{base}/{db_name}{query}");
+        Self { db_name, url }
     }
 
-    fn url(&self) -> String {
-        // Replace the dbname in the URL. Naive but enough for our shape
-        // (`postgres://…/swell_test?host=…`).
-        let url = &self.root_url;
-        if let Some((before, _)) = url.split_once('/').and_then(|(scheme, rest)| {
-            // Skip "postgres://" — locate the path component.
-            let after_scheme = rest.strip_prefix('/').unwrap_or(rest);
-            let host_and_db = after_scheme;
-            let (host, after_db) = host_and_db.split_once('/')?;
-            let (_db, query) = after_db.split_once('?').unwrap_or((after_db, ""));
-            let new_path = format!("{scheme}//{host}/{}", self.db_name);
-            let q = if query.is_empty() { String::new() } else { format!("?{query}") };
-            Some((new_path, q))
-        }) {
-            let q = url.split('?').nth(1).unwrap_or("");
-            let qs = if q.is_empty() { String::new() } else { format!("?{q}") };
-            return format!("{before}{qs}");
-        }
-        // Fallback — rewrite manually.
-        let q = url.split('?').nth(1).unwrap_or("");
-        let qs = if q.is_empty() { String::new() } else { format!("?{q}") };
-        // Strip everything after the host's `/dbname` segment.
-        let head: String = url.chars()
-            .scan(0u8, |slashes, c| {
-                if c == '/' { *slashes += 1; }
-                if *slashes >= 3 && c == '/' { return None; }
-                Some(c)
-            })
-            .collect();
-        format!("{head}/{}{qs}", self.db_name)
-    }
+    fn url(&self) -> &str { &self.url }
 }
-
-impl Drop for TestDb {
-    fn drop(&mut self) {
-        // Best-effort cleanup. tokio-postgres connections are async;
-        // spawn a synchronous fire-and-forget on a thread-local runtime.
-        let url = self.root_url.clone();
-        let name = self.db_name.clone();
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all().build().unwrap();
-            rt.block_on(async move {
-                if let Ok((client, conn)) = tokio_postgres::connect(&url, NoTls).await {
-                    tokio::spawn(async move { let _ = conn.await; });
-                    let _ = client.execute(
-                        &format!("DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"),
-                        &[],
-                    ).await;
-                }
-            });
-        });
-    }
-}
+// No Drop impl: leaving the DB behind is cheap (file-system reused on the
+// next run's DROP IF EXISTS), and the alternative — spawning a fresh
+// tokio runtime per test for one `DROP DATABASE` — was the largest
+// fixed cost in the suite.
 
 async fn run_case(name: &str, schema: &str, queries: &str) {
     let db = TestDb::new(name).await;
-    let url = db.url();
 
     // Apply schema in a single round-trip (uses simple_query for
     // multi-statement support).
-    let (client, conn) = tokio_postgres::connect(&url, NoTls)
-        .await.unwrap_or_else(|e| panic!("[{name}] connect to test db ({url}): {e}"));
+    let (client, conn) = tokio_postgres::connect(db.url(), NoTls)
+        .await.unwrap_or_else(|e| panic!("[{name}] connect to test db ({}): {e}", db.url()));
     tokio::spawn(async move { let _ = conn.await; });
     client.simple_query(schema)
         .await.unwrap_or_else(|e| panic!("[{name}] apply schema: {e}"));
     drop(client);
 
     let an = Analyzer::connect(AnalyzerOptions {
-        database_url: url,
+        database_url: db.url().to_string(),
         schemas: vec!["public".into()],
         type_overrides: BTreeMap::new(),
     }).await.unwrap_or_else(|e| panic!("[{name}] analyzer connect: {e}"));
@@ -365,13 +322,14 @@ async fn analyze_named(name: &str, schema: &str, queries: &str, qname: &str)
     -> swell_analyzer::InferredQuery
 {
     let db = TestDb::new(&format!("{name}_assert")).await;
-    let url = db.url();
-    let (client, conn) = tokio_postgres::connect(&url, NoTls).await.unwrap();
+    let (client, conn) = tokio_postgres::connect(db.url(), NoTls).await.unwrap();
     tokio::spawn(async move { let _ = conn.await; });
     client.simple_query(schema).await.unwrap();
     drop(client);
     let an = Analyzer::connect(AnalyzerOptions {
-        database_url: url, schemas: vec!["public".into()], type_overrides: BTreeMap::new(),
+        database_url: db.url().to_string(),
+        schemas: vec!["public".into()],
+        type_overrides: BTreeMap::new(),
     }).await.unwrap();
     let qs = split_named_queries(queries);
     let (_, sql) = qs.into_iter().find(|(n, _)| n == qname)

@@ -42,12 +42,6 @@ pub struct InferredColumn {
     /// instead of duplicating the type literal.
     #[serde(default)]
     pub table_ref: Option<TableColRef>,
-    /// True iff the base table's `attnotnull` is set. When `nullable`
-    /// here is `true` (e.g. via LEFT JOIN) but `base_not_null` is also
-    /// `true`, codegen emits `Table["col"] | null` — we widen the
-    /// base type rather than discarding the table reference.
-    #[serde(default)]
-    pub base_not_null: bool,
 }
 
 /// Reference back to a base-table column. Schema is the namespace

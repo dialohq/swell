@@ -211,37 +211,34 @@ fn render_params_tuple(q: &InferredQuery, names: &TableNameMap) -> String {
 }
 
 fn render_param_type(p: &InferredParam, names: &TableNameMap) -> String {
-    let base = match &p.table_ref {
-        Some(r) => indexed_table_ref(r, names).unwrap_or_else(|| p.ts_type.clone()),
-        None => p.ts_type.clone(),
-    };
-    if base == "unknown" || !p.nullable {
-        base
-    } else {
-        format!("{} | null", base)
-    }
+    render_typed(&p.ts_type, p.nullable, p.table_ref.as_ref(), names)
 }
 
 fn render_row_type(cols: &[InferredColumn], names: &TableNameMap) -> String {
     if cols.is_empty() {
-        // Write-only statement (no RETURNING / no SELECT) — only `exec` is
-        // meaningful. Setting `row: never` causes `one`/`maybe`/`many`/call
-        // to type as `never` which makes accidental use visible.
+        // `row: never` makes accidental use of a write-only statement's row
+        // shape visible — `one`/`maybe`/`many`/call all type as `never`.
         return "never".to_string();
     }
     let fields: Vec<String> = cols
         .iter()
-        .map(|c| format!("{}: {}", quote_ident(&c.name), render_column_type(c, names)))
+        .map(|c| format!("{}: {}", quote_ident(&c.name),
+            render_typed(&c.ts_type, c.nullable, c.table_ref.as_ref(), names)))
         .collect();
     format!("{{ {} }}", fields.join("; "))
 }
 
-fn render_column_type(c: &InferredColumn, names: &TableNameMap) -> String {
-    let base = match &c.table_ref {
-        Some(r) => indexed_table_ref(r, names).unwrap_or_else(|| c.ts_type.clone()),
-        None => c.ts_type.clone(),
-    };
-    if c.nullable {
+/// Shared rendering for query columns and INSERT/UPDATE params: prefer
+/// `Table["col"]` whenever a base column is known, fall back to the
+/// inferred ts_type otherwise. `unknown` already admits null at the
+/// type level so we don't decorate it further.
+fn render_typed(
+    ts_type: &str, nullable: bool, table_ref: Option<&TableColRef>, names: &TableNameMap,
+) -> String {
+    let base = table_ref
+        .and_then(|r| indexed_table_ref(r, names))
+        .unwrap_or_else(|| ts_type.to_string());
+    if nullable && base != "unknown" {
         format!("{} | null", base)
     } else {
         base
@@ -250,7 +247,7 @@ fn render_column_type(c: &InferredColumn, names: &TableNameMap) -> String {
 
 fn indexed_table_ref(r: &TableColRef, names: &TableNameMap) -> Option<String> {
     let name = names.lookup(&r.schema, &r.table)?;
-    Some(format!("{}[\"{}\"]", name, r.column.replace('"', "\\\"")))
+    Some(format!("{}[\"{}\"]", name, escape_ts_string(&r.column)))
 }
 
 fn escape_ts_string(s: &str) -> String {
@@ -309,7 +306,7 @@ mod tests {
     fn col(name: &str, ts: &str, nullable: bool) -> InferredColumn {
         InferredColumn {
             name: name.into(), oid: 0, nullable, ts_type: ts.into(),
-            table_ref: None, base_not_null: !nullable,
+            table_ref: None,
         }
     }
 
@@ -319,7 +316,6 @@ mod tests {
             table_ref: Some(TableColRef {
                 schema: schema.into(), table: table.into(), column: name.into(),
             }),
-            base_not_null: !nullable,
         }
     }
 

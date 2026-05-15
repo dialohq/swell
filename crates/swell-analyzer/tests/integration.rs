@@ -442,11 +442,12 @@ async fn where_param_has_no_table_ref() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn table_schema_returns_full_column_list() {
+async fn table_schemas_returns_full_column_list() {
     let an = fresh_db().await;
-    let t = an.table_schema("public", "users").await
-        .expect("query ok")
-        .expect("users table exists");
+    let result = an.table_schemas(&[("public".into(), "users".into())]).await
+        .expect("query ok");
+    assert_eq!(result.len(), 1);
+    let t = &result[0];
     assert_eq!(t.schema, "public");
     assert_eq!(t.table, "users");
     let names: Vec<&str> = t.columns.iter().map(|c| c.name.as_str()).collect();
@@ -459,8 +460,13 @@ async fn table_schema_returns_full_column_list() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn table_schema_returns_none_for_missing_table() {
+async fn table_schemas_skips_missing_tables() {
     let an = fresh_db().await;
-    let t = an.table_schema("public", "no_such_table").await.expect("query ok");
-    assert!(t.is_none());
+    let result = an.table_schemas(&[
+        ("public".into(), "users".into()),
+        ("public".into(), "no_such_table".into()),
+    ]).await.expect("query ok");
+    // Missing table silently dropped; existing one comes through.
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].table, "users");
 }

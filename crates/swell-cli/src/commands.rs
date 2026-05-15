@@ -244,11 +244,11 @@ async fn run_pipeline(cfg: &Config, opts: RunOpts) -> Result<RunSummary> {
 }
 
 /// Walk every column + param of every analysed query, collect the
-/// distinct `(schema, table)` pairs they reference, and fetch each
-/// table's full schema via `Analyzer::table_schema`. Codegen uses
-/// these to emit `interface SchemaTable` and rewrite column references
-/// as `Table["col"]`. Failures are logged at debug level — a single
-/// missing table just falls back to inline types for its columns.
+/// distinct `(schema, table)` pairs they reference, and fetch their
+/// full schemas in one round trip via `Analyzer::table_schemas`.
+/// Codegen emits one `interface SchemaTable` per result and rewrites
+/// column references as `Table["col"]`. Missing tables are skipped
+/// silently — caller falls back to inline types for their columns.
 async fn fetch_referenced_tables(an: &Analyzer, queries: &[InferredQuery]) -> Vec<TableSchema> {
     let mut pairs: BTreeSet<(String, String)> = BTreeSet::new();
     for q in queries {
@@ -263,19 +263,14 @@ async fn fetch_referenced_tables(an: &Analyzer, queries: &[InferredQuery]) -> Ve
             }
         }
     }
-    let mut out = Vec::with_capacity(pairs.len());
-    for (schema, table) in pairs {
-        match an.table_schema(&schema, &table).await {
-            Ok(Some(t)) => out.push(t),
-            Ok(None) => {
-                tracing::debug!("no schema rows for {schema}.{table}; skipping table type");
-            }
-            Err(e) => {
-                tracing::debug!("table_schema({schema}.{table}) failed: {e:#}");
-            }
+    let pairs_vec: Vec<(String, String)> = pairs.into_iter().collect();
+    match an.table_schemas(&pairs_vec).await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::debug!("table_schemas failed: {e:#}");
+            Vec::new()
         }
     }
-    out
 }
 
 fn scan_project(cfg: &Config) -> Result<Vec<ScannedQuery>> {
