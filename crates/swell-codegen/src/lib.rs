@@ -156,7 +156,11 @@ impl TableNameMap {
 }
 
 fn render_table_interface(t: &TableSchema, names: &TableNameMap) -> String {
-    let name = names.lookup(&t.schema, &t.table).unwrap_or_default();
+    // `names` was built from the same `&[TableSchema]` slice — every
+    // (schema, table) here MUST be present. Panic rather than emit a
+    // nameless `export interface {}` if that invariant ever breaks.
+    let name = names.lookup(&t.schema, &t.table)
+        .unwrap_or_else(|| panic!("TableNameMap missing entry for {}.{}", t.schema, t.table));
     let mut out = String::new();
     out.push_str(&format!("export interface {name} {{\n"));
     for col in &t.columns {

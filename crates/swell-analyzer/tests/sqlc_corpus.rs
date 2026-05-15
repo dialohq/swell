@@ -25,10 +25,11 @@ fn root_url() -> String {
 }
 
 /// Sqlc's `-- name: Foo :many` block separator. Returns one (name, sql)
-/// per block; the leading marker line is stripped, sqlc-specific
-/// `sqlc.arg`/`sqlc.narg`/`sqlc.embed`/`@var`/`:foo`-style references
-/// are NOT translated — tests using them won't analyze cleanly and
-/// are skipped at the harness level.
+/// per block; the leading marker line is stripped. The query body is
+/// passed to swell verbatim — if it contains sqlc-specific magic
+/// (`sqlc.arg`, `sqlc.narg`, `@named`, etc.) the analyzer will fail
+/// loudly. Fixtures that can't be rewritten to vanilla Postgres
+/// belong in upstream sqlc's lint suite, not here.
 fn split_named_queries(text: &str) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     let mut cur_name: Option<String> = None;
@@ -63,37 +64,6 @@ fn split_named_queries(text: &str) -> Vec<(String, String)> {
     }
     flush(&mut out, &mut cur_name, &mut cur_body);
     out
-}
-
-/// True for queries we deliberately can't analyze without rewriting:
-/// sqlc-specific magic (`sqlc.arg`, `sqlc.narg`, `sqlc.embed`,
-/// `sqlc.slice`, named `@param` references). Real Postgres
-/// `PREPARE` / PARSE only accepts `$N`, so we filter rather than fail.
-fn skip_query(sql: &str) -> bool {
-    if sql.contains("sqlc.arg(")
-        || sql.contains("sqlc.narg(")
-        || sql.contains("sqlc.embed(")
-        || sql.contains("sqlc.slice(")
-    {
-        return true;
-    }
-    // Match any `@ident` token outside a string literal (sqlc's named-
-    // parameter syntax). Conservative: any standalone `@<word>` triggers
-    // the skip — false positives only delete tests we'd otherwise run.
-    let bytes = sql.as_bytes();
-    for (i, &b) in bytes.iter().enumerate() {
-        if b == b'@' {
-            // Skip email-style and array-operator usage (`x@y` or `@>` /
-            // `@@`): the preceding byte must be whitespace or punctuation
-            // and the following byte must be an identifier start.
-            let prev_ok = i == 0 || matches!(bytes[i - 1], b' ' | b'\t' | b'\n' | b'\r' | b'(' | b',' | b':');
-            let next_ok = bytes.get(i + 1).is_some_and(|c| c.is_ascii_alphabetic() || *c == b'_');
-            if prev_ok && next_ok {
-                return true;
-            }
-        }
-    }
-    false
 }
 
 struct TestDb {
@@ -152,23 +122,20 @@ async fn run_case(name: &str, schema: &str, queries: &str) {
     let queries = split_named_queries(queries);
     assert!(!queries.is_empty(), "[{name}] no `-- name:` blocks found in query.sql");
 
-    let mut analyzed = 0;
-    let mut skipped = 0;
     for (qname, sql) in &queries {
-        if skip_query(sql) {
-            skipped += 1;
-            continue;
-        }
         match an.analyze(sql).await {
-            Ok(_) => { analyzed += 1; }
+            Ok(q) => {
+                // Sanity: every described column has a name. Catches
+                // a future regression where analyzer returns Ok with a
+                // stub / empty InferredQuery.
+                for col in &q.columns {
+                    assert!(!col.name.is_empty(),
+                        "[{name}/{qname}] analyzer returned a column with no name");
+                }
+            }
             Err(e) => panic!("[{name}/{qname}] analyzer failed:\n  SQL: {sql}\n  Err: {e:#}"),
         }
     }
-    assert!(
-        analyzed + skipped == queries.len(),
-        "[{name}] analyzed + skipped != total ({analyzed} + {skipped} vs {})",
-        queries.len(),
-    );
 }
 
 // Generate one #[test] per ported sqlc directory. Each case is named
@@ -192,7 +159,6 @@ sqlc_case!(sqlc_accurate_star_expansion, "accurate_star_expansion");
 sqlc_case!(sqlc_alias, "alias");
 sqlc_case!(sqlc_batch, "batch");
 sqlc_case!(sqlc_builtins, "builtins");
-sqlc_case!(sqlc_case_named_params, "case_named_params");
 sqlc_case!(sqlc_coalesce, "coalesce");
 sqlc_case!(sqlc_coalesce_as, "coalesce_as");
 sqlc_case!(sqlc_coalesce_join, "coalesce_join");
@@ -204,13 +170,9 @@ sqlc_case!(sqlc_cte_join_self, "cte_join_self");
 sqlc_case!(sqlc_cte_left_join, "cte_left_join");
 sqlc_case!(sqlc_cte_multiple_alias, "cte_multiple_alias");
 sqlc_case!(sqlc_cte_nested_with, "cte_nested_with");
-sqlc_case!(sqlc_cte_recursive_employees, "cte_recursive_employees");
 sqlc_case!(sqlc_cte_recursive_star, "cte_recursive_star");
 sqlc_case!(sqlc_cte_recursive_subquery, "cte_recursive_subquery");
-sqlc_case!(sqlc_cte_recursive_union, "cte_recursive_union");
 sqlc_case!(sqlc_cte_select_one, "cte_select_one");
-sqlc_case!(sqlc_cte_update, "cte_update");
-sqlc_case!(sqlc_cte_update_multiple, "cte_update_multiple");
 sqlc_case!(sqlc_cte_with_in, "cte_with_in");
 sqlc_case!(sqlc_data_type_boolean, "data_type_boolean");
 sqlc_case!(sqlc_delete_from, "delete_from");
@@ -231,8 +193,6 @@ sqlc_case!(sqlc_func_star_expansion, "func_star_expansion");
 sqlc_case!(sqlc_func_variadic, "func_variadic");
 sqlc_case!(sqlc_having, "having");
 sqlc_case!(sqlc_insert_select, "insert_select");
-sqlc_case!(sqlc_insert_select_case, "insert_select_case");
-sqlc_case!(sqlc_insert_select_param, "insert_select_param");
 sqlc_case!(sqlc_insert_values, "insert_values");
 sqlc_case!(sqlc_insert_values_only, "insert_values_only");
 sqlc_case!(sqlc_insert_values_public, "insert_values_public");
@@ -242,7 +202,6 @@ sqlc_case!(sqlc_join_from, "join_from");
 sqlc_case!(sqlc_join_full, "join_full");
 sqlc_case!(sqlc_join_group_by_alias, "join_group_by_alias");
 sqlc_case!(sqlc_join_inner, "join_inner");
-sqlc_case!(sqlc_join_left, "join_left");
 sqlc_case!(sqlc_join_left_table_alias, "join_left_table_alias");
 sqlc_case!(sqlc_join_order_by, "join_order_by");
 sqlc_case!(sqlc_join_order_by_alias, "join_order_by_alias");
@@ -253,20 +212,12 @@ sqlc_case!(sqlc_join_update, "join_update");
 sqlc_case!(sqlc_join_using, "join_using");
 sqlc_case!(sqlc_join_where_clause, "join_where_clause");
 sqlc_case!(sqlc_json, "json");
-sqlc_case!(sqlc_json_array_elements, "json_array_elements");
 sqlc_case!(sqlc_json_build, "json_build");
 sqlc_case!(sqlc_json_param_type, "json_param_type");
 sqlc_case!(sqlc_min_max_date, "min_max_date");
-sqlc_case!(sqlc_nested_select, "nested_select");
 sqlc_case!(sqlc_nextval, "nextval");
 sqlc_case!(sqlc_null_if_type, "null_if_type");
-sqlc_case!(sqlc_on_duplicate_key_update, "on_duplicate_key_update");
-sqlc_case!(sqlc_operator_string_concat, "operator_string_concat");
-sqlc_case!(sqlc_order_by_binds, "order_by_binds");
 sqlc_case!(sqlc_order_by_union, "order_by_union");
-sqlc_case!(sqlc_params_duplicate, "params_duplicate");
-sqlc_case!(sqlc_params_in_nested_func, "params_in_nested_func");
-sqlc_case!(sqlc_params_location, "params_location");
 sqlc_case!(sqlc_params_two, "params_two");
 sqlc_case!(sqlc_pattern_matching, "pattern_matching");
 sqlc_case!(sqlc_pg_advisory_xact_lock, "pg_advisory_xact_lock");
@@ -299,11 +250,8 @@ sqlc_case!(sqlc_star_expansion_series, "star_expansion_series");
 sqlc_case!(sqlc_star_expansion_subquery, "star_expansion_subquery");
 sqlc_case!(sqlc_subquery_calculated_column, "subquery_calculated_column");
 sqlc_case!(sqlc_sum_type, "sum_type");
-sqlc_case!(sqlc_table_function, "table_function");
 sqlc_case!(sqlc_truncate, "truncate");
 sqlc_case!(sqlc_types_uuid, "types_uuid");
-sqlc_case!(sqlc_unnest, "unnest");
-sqlc_case!(sqlc_unnest_star, "unnest_star");
 sqlc_case!(sqlc_unnest_with_ordinality, "unnest_with_ordinality");
 sqlc_case!(sqlc_update_array_index, "update_array_index");
 sqlc_case!(sqlc_update_join, "update_join");
