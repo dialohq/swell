@@ -23,6 +23,12 @@
  * Recursive structural type for `json` / `jsonb` columns. Postgres's
  * DESCRIBE only tells us "this is a json blob" — the value-level shape is
  * left to runtime narrowing (zod, decoders, etc.) at the boundary.
+ *
+ * Object values admit `undefined` so callers can pass `{ a, b: maybeB }`
+ * to a jsonb param without round-tripping through JSON.stringify just to
+ * drop optional fields. `JSON.stringify` (which pg uses on the wire) and
+ * `jsonb_build_object` both treat `undefined` and an absent key the same
+ * way, so this widening matches the runtime contract.
  */
 export type Json =
   | null
@@ -30,7 +36,7 @@ export type Json =
   | number
   | string
   | Json[]
-  | { [key: string]: Json };
+  | { [key: string]: Json | undefined };
 
 /**
  * Branded SQL string carried by `q("…")`. The non-optional `__sqlBrand`
