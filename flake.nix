@@ -258,6 +258,14 @@
 
             echo "publishing @dialo/swell-cli (wrapper) + @dialo/swell (runtime), v$VERSION --tag $DIST_TAG — npm $(npm --version)"
 
+            # Install workspace deps + build runtime BEFORE any version
+            # mutation — `--frozen-lockfile` only matches if package.json
+            # files still reflect the lockfile's resolved state. Once we
+            # rewrite versions below, the lockfile would no longer match
+            # and the install would refuse.
+            bun install --frozen-lockfile
+            bun run build:runtime
+
             # Pin wrapper version + every platform optionalDependency.
             bun --print '
               const fs = require("node:fs");
@@ -271,7 +279,7 @@
             '
             (cd packages/swell-cli && npm publish --access public --provenance --tag "$DIST_TAG")
 
-            # Pin runtime version, build dist/, publish.
+            # Pin runtime version + publish (dist/ already built above).
             bun --print '
               const fs = require("node:fs");
               const path = "packages/runtime/package.json";
@@ -279,8 +287,6 @@
               p.version = process.env.VERSION;
               fs.writeFileSync(path, JSON.stringify(p, null, 2) + "\n");
             '
-            bun install --frozen-lockfile
-            bun run build:runtime
             (cd packages/runtime && npm publish --access public --provenance --tag "$DIST_TAG")
           ''}";
         };
