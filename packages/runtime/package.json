@@ -35,5 +35,10 @@
     "@types/node": "^20.0.0",
     "@types/pg": "^8.0.0",
     "pg": "^8.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dialohq/swell.git",
+    "directory": "packages/runtime"
   }
 }
