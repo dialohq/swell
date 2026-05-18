@@ -93,6 +93,18 @@
           tsc = "(cd packages/runtime && bun x tsc -p tsconfig.json --noEmit)";
         };
 
+        # Exercises the q() overload + pg module augmentation end-to-end
+        # against the example's `swell.generated.ts`. Builds the runtime
+        # first so the workspace symlink resolves to compiled `.d.ts` /
+        # `.js`, not bare source.
+        exampleTypecheck = mkTscCheck {
+          pname = "swell-example-basic-typecheck";
+          tsc = ''
+            (cd packages/runtime && bun x tsc -p tsconfig.json)
+            (cd examples/basic && bun x tsc -p tsconfig.json --noEmit)
+          '';
+        };
+
         # Cargo build over the workspace, wrapped as a derivation. Deps
         # are vendored from Cargo.lock; the build is hermetic. Tests that
         # need a live Postgres run via `nix develop -c cargo test` (see
@@ -299,12 +311,11 @@
         packages.swell-cli = cargoBuild;
         packages.default = cargoBuild;
 
-        # nix-fast-build target. `q0-setup` wires the check infra over
-        # the scaffold; subsequent PRs (q1 runtime, q2 pipeline, q3
-        # tests/example) swap stubs for real code without touching the
-        # check set itself.
+        # nix-fast-build target. q3 layers the example-typecheck check
+        # on top of the runtime + cargo checks the scaffold (q0) wired.
         checks = {
           runtime-typecheck = runtimeTypecheck;
+          example-typecheck = exampleTypecheck;
           cargo-build = cargoBuild;
         };
       });

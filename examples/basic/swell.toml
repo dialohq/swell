@@ -1,0 +1,4 @@
+[database]
+# url left blank — swell reads $DATABASE_URL from the env. The dev shell's
+# scripts/dev-pg.sh exports one pointing at the local unix socket.
+schemas = ["public"]
