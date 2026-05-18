@@ -1,0 +1,12 @@
+[package]
+name = "swell-codegen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+swell-analyzer = { workspace = true }
+serde = { workspace = true }
+anyhow = { workspace = true }
