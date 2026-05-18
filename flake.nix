@@ -190,36 +190,37 @@
         };
 
         # `nix run .#publish-platform-binary -- <platform>`
-        # Native-build the CLI on the host, generate the per-platform
-        # `package.json`, publish via npm trusted publishing. Called
-        # once per matrix runner in `.github/workflows/release.yml`.
-        # Reads `VERSION` from env (set by the workflow from the tag).
+        # Packages a pre-built `target/release/swell` into the
+        # per-platform npm tarball and publishes via OIDC trusted
+        # publishing. The cargo build itself runs *outside* nix — see
+        # CLAUDE.md's "Dependency management" exception: nix-built
+        # Linux binaries link against the nix store's glibc and won't
+        # run on consumer machines, so release builds use the GitHub
+        # runner's native rust + libclang. Reads `VERSION` from env
+        # (set by the workflow from the tag).
         apps.publish-platform-binary = {
           type = "app";
           program = "${pkgs.writeShellScript "swell-publish-platform-binary" ''
             set -euo pipefail
-            export PATH="${publishEnv}/bin:$PATH"
-            ${pkgs.lib.concatStringsSep "\n            " (
-              pkgs.lib.mapAttrsToList (k: v: ''export ${k}="${v}"'') commonEnv
-            )}
+            export PATH="${pkgs.nodejs_24}/bin:$PATH"
 
             PLATFORM="''${1:?usage: nix run .#publish-platform-binary -- <linux-x64|linux-arm64|darwin-arm64>}"
             VERSION="''${VERSION:?VERSION env var required (no v prefix)}"
+            BINARY="''${BINARY:-target/release/swell}"
             # `linux-x64` → OS=linux, CPU=x64
             OS="''${PLATFORM%-*}"
             CPU="''${PLATFORM##*-}"
             # Prerelease versions (`0.0.0-foo`) must publish under a
-            # non-`latest` dist-tag — npm 11+ refuses otherwise. Stable
-            # releases get the default `latest`.
+            # non-`latest` dist-tag — npm 11+ refuses otherwise.
             DIST_TAG="latest"
             case "$VERSION" in *-*) DIST_TAG="next" ;; esac
 
-            echo "building swell-cli for $PLATFORM (v$VERSION, --tag $DIST_TAG) — npm $(npm --version)"
-            cargo build --release -p swell-cli
+            echo "packaging swell-cli for $PLATFORM (v$VERSION, --tag $DIST_TAG) — npm $(npm --version)"
+            [ -x "$BINARY" ] || { echo "missing binary at $BINARY — did the workflow's cargo step run?" >&2; exit 1; }
 
             DIR="dist-platform/$PLATFORM"
             mkdir -p "$DIR/bin"
-            cp target/release/swell "$DIR/bin/swell"
+            cp "$BINARY" "$DIR/bin/swell"
             cat > "$DIR/package.json" <<EOF
             {
               "name": "@dialo/swell-cli-$PLATFORM",

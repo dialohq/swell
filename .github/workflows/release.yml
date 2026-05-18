@@ -35,10 +35,21 @@ jobs:
           - { platform: darwin-arm64, runner: macos-14 }
     steps:
       - uses: actions/checkout@v4
+
+      # Native rust + libclang for the cargo build — *not* nix.
+      # See CLAUDE.md → Dependency management → Exceptions: nix-built
+      # binaries pin the nix-store dynamic linker and won't run on
+      # consumer machines off-nix. The runner's native Ubuntu/Xcode
+      # toolchain gives a broadly-portable binary that's npm-distributable.
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install libclang (linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev
+      - name: Cargo build (release)
+        run: cargo build --release -p swell-cli
+
+      # nix only for the npm-side packaging + OIDC publish.
       - uses: DeterminateSystems/nix-installer-action@main
-        with:
-          extra-conf: |
-            sandbox = relaxed
       - name: Publish @dialo/swell-cli-${{ matrix.platform }}
         env:
           VERSION: ${{ github.ref_name }}
