@@ -2,31 +2,33 @@
 
 Statically-typed inline Postgres queries for TypeScript.
 
-swell scans your source for `sql.many("SELECT …")` / `sql.one(…)` / `sql.exec(…)`
-call sites, sends each unique SQL string to a dev Postgres for PARSE/DESCRIBE +
-EXPLAIN, and emits a per-package `swell.generated.ts` that wraps your driver
-(postgres.js or node-pg) in a typed `sql` handle. Call sites narrow to the
-exact registered row + parameter shape; non-literal queries fall through to a
-permissive overload.
+swell scans your source for `q("SELECT …")` call sites, sends each unique SQL
+string to a dev Postgres for PARSE/DESCRIBE + EXPLAIN, and emits a per-package
+`swell.generated.ts` that pins a typed `SqlText<Params, Row>` brand on every
+known query. A module augmentation over node-postgres makes
+`pool.query(q(…), […])` narrow rows + params to the inferred shape; non-literal
+queries fall through to the permissive `string`-typed overload.
 
 What you write:
 
 ```ts
 // db.ts
-import postgres from "postgres";
-import { createSql } from "./swell.generated";
-export const sql = createSql(postgres());
+import { Pool } from "pg";
+import "swell";
+
+export { q } from "./swell.generated";
+export const pool = new Pool();
 ```
 
 ```ts
 // elsewhere
-import { sql } from "./db";
+import { pool, q } from "./db";
 
-const user = await sql.one(
-  "SELECT id, email FROM users WHERE id = $1",
-  userId,
+const { rows } = await pool.query(
+  q("SELECT id, email FROM users WHERE id = $1"),
+  [userId],
 );
-// user is typed { id: string; email: string }
+// rows is typed { id: string; email: string }[]
 ```
 
 What swell does:
@@ -38,16 +40,16 @@ src/**/*.ts → scanner → unique SQL strings
                           ↓
                    analyzer (nullability, JSON shape, enums)
                           ↓
-                   src/swell.generated.ts (QueryRegistry + createSql factory)
+             src/swell.generated.ts (Registry + typed q overload)
 ```
 
 ## Layout
 
-- `crates/swell-analyzer` — SQL → TS type inference (Rust, lands in the analyzer PR).
-- `crates/swell-scanner` — TS source scanning (Rust, lands in the codegen PR).
-- `crates/swell-codegen` — `QueryRegistry` + `createSql` factory emitter.
+- `crates/swell-analyzer` — SQL → TS type inference (Rust).
+- `crates/swell-scanner` — TS source scanning for `q("...")` calls (Rust).
+- `crates/swell-codegen` — per-package `Registry` + typed `q` overload emitter.
 - `crates/swell-cli` — `swell gen`, `swell watch`, `swell check`, `swell prepare`.
-- `packages/runtime` — npm package `swell`: `createTypedSql`, `TypedSql<R>`, adapters.
+- `packages/runtime` — npm package `swell`: the `q()` marker + pg module augmentation.
 - `examples/basic` — end-to-end sample app.
 
 ## Build
@@ -69,13 +71,18 @@ swell check    # CI: cache must match source; fail if stale or invalid
 swell prepare  # populate .swell/ cache for offline builds
 ```
 
-## Test infra
+## CI
 
-Swell ships test helpers for the clone-per-test idiom:
+The same checks run locally as on remote — both via `nix-fast-build`:
 
-```ts
-import { initStandardPostgres, makeTemplate, withTestDb } from "swell/testing";
+```sh
+nix-fast-build --flake .#checks.x86_64-linux   # full check matrix
+nix build .#checks.x86_64-linux.runtime-typecheck  # single check
+nix build .#checks.x86_64-linux.example-typecheck
+nix build .#checks.x86_64-linux.cargo-build
 ```
+
+A green `nix-fast-build` locally guarantees a green CI run.
 
 ## License
 
