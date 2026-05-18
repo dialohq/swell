@@ -17,6 +17,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@main
+        with:
+          # `relaxed` lets specific derivations opt out of the sandbox via
+          # `__noChroot = true` — needed for the tsc-driven checks which
+          # `bun install` from the public npm registry inside the build.
+          # Other derivations still run sandboxed; only the ones that opt
+          # out get network access.
+          extra-conf: |
+            sandbox = relaxed
       - uses: DeterminateSystems/magic-nix-cache-action@main
       - name: nix-fast-build
         run: nix run nixpkgs#nix-fast-build -- --skip-cached --no-nom --flake .#checks

@@ -1,0 +1,24 @@
+{
+  "name": "@dialo/swell-cli",
+  "version": "0.1.0",
+  "publishConfig": {
+    "access": "public"
+  },
+  "description": "Static-type generator for inline Postgres queries — installs the matching native binary via optional platform packages.",
+  "license": "MIT OR Apache-2.0",
+  "bin": {
+    "swell": "bin/swell.js"
+  },
+  "files": ["bin"],
+  "optionalDependencies": {
+    "@dialo/swell-cli-linux-x64": "0.1.0",
+    "@dialo/swell-cli-linux-arm64": "0.1.0",
+    "@dialo/swell-cli-darwin-x64": "0.1.0",
+    "@dialo/swell-cli-darwin-arm64": "0.1.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dialohq/swell.git",
+    "directory": "packages/swell-cli"
+  }
+}
