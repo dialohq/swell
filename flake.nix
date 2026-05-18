@@ -11,15 +11,18 @@
   };
 
   outputs = { self, nixpkgs, flake-utils, rust-overlay }:
-    # Linux only for now — the analyzer's bindgen path bakes in glibc-dev
-    # headers, which doesn't make sense on Darwin. Widen this once
-    # cross-platform is needed.
-    flake-utils.lib.eachSystem [ "x86_64-linux" "aarch64-linux" ] (system:
+    flake-utils.lib.eachSystem [
+      "x86_64-linux"
+      "aarch64-linux"
+      "aarch64-darwin"
+    ] (system:
       let
         pkgs = import nixpkgs {
           inherit system;
           overlays = [ (import rust-overlay) ];
         };
+
+        isDarwin = pkgs.stdenv.isDarwin;
 
         rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
 
@@ -41,11 +44,14 @@
         ];
 
         # Header search path for pg_query's bindgen. Reused by every check
-        # that touches the analyzer (which depends on pg_query).
-        bindgenExtraClangArgs = builtins.toString [
-          "-I${pkgs.glibc.dev}/include"
-          "-I${pkgs.llvmPackages.libclang.lib}/lib/clang/${pkgs.lib.versions.major pkgs.llvmPackages.libclang.version}/include"
-        ];
+        # that touches the analyzer (which depends on pg_query). On Darwin
+        # the SDK provides the system headers — only Linux needs the
+        # glibc-dev path bolted on.
+        bindgenExtraClangArgs = builtins.toString (
+          pkgs.lib.optional (!isDarwin) "-I${pkgs.glibc.dev}/include" ++ [
+            "-I${pkgs.llvmPackages.libclang.lib}/lib/clang/${pkgs.lib.versions.major pkgs.llvmPackages.libclang.version}/include"
+          ]
+        );
 
         commonEnv = {
           LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
