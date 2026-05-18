@@ -202,8 +202,13 @@
             # `linux-x64` → OS=linux, CPU=x64
             OS="''${PLATFORM%-*}"
             CPU="''${PLATFORM##*-}"
+            # Prerelease versions (`0.0.0-foo`) must publish under a
+            # non-`latest` dist-tag — npm 11+ refuses otherwise. Stable
+            # releases get the default `latest`.
+            DIST_TAG="latest"
+            case "$VERSION" in *-*) DIST_TAG="next" ;; esac
 
-            echo "building swell-cli for $PLATFORM (v$VERSION) — npm $(npm --version)"
+            echo "building swell-cli for $PLATFORM (v$VERSION, --tag $DIST_TAG) — npm $(npm --version)"
             cargo build --release -p swell-cli
 
             DIR="dist-platform/$PLATFORM"
@@ -226,7 +231,7 @@
               }
             }
             EOF
-            (cd "$DIR" && npm publish --access public --provenance)
+            (cd "$DIR" && npm publish --access public --provenance --tag "$DIST_TAG")
           ''}";
         };
 
@@ -242,8 +247,10 @@
             export PATH="${publishEnv}/bin:$PATH"
 
             VERSION="''${VERSION:?VERSION env var required (no v prefix)}"
+            DIST_TAG="latest"
+            case "$VERSION" in *-*) DIST_TAG="next" ;; esac
 
-            echo "publishing @dialo/swell-cli (wrapper) + @dialo/swell (runtime) — npm $(npm --version)"
+            echo "publishing @dialo/swell-cli (wrapper) + @dialo/swell (runtime), v$VERSION --tag $DIST_TAG — npm $(npm --version)"
 
             # Pin wrapper version + every platform optionalDependency.
             bun --print '
@@ -256,7 +263,7 @@
               }
               fs.writeFileSync(path, JSON.stringify(p, null, 2) + "\n");
             '
-            (cd packages/swell-cli && npm publish --access public --provenance)
+            (cd packages/swell-cli && npm publish --access public --provenance --tag "$DIST_TAG")
 
             # Pin runtime version, build dist/, publish.
             bun --print '
@@ -268,7 +275,7 @@
             '
             bun install --frozen-lockfile
             bun run build:runtime
-            (cd packages/runtime && npm publish --access public --provenance)
+            (cd packages/runtime && npm publish --access public --provenance --tag "$DIST_TAG")
           ''}";
         };
 
