@@ -193,11 +193,11 @@
           program = "${pkgs.writeShellScript "swell-publish-platform-binary" ''
             set -euo pipefail
             export PATH="${publishEnv}/bin:$PATH"
-            export ${pkgs.lib.concatStringsSep " " (
-              pkgs.lib.mapAttrsToList (k: v: "${k}=${v}") commonEnv
+            ${pkgs.lib.concatStringsSep "\n            " (
+              pkgs.lib.mapAttrsToList (k: v: ''export ${k}="${v}"'') commonEnv
             )}
 
-            PLATFORM="''${1:?usage: nix run .#publish-platform-binary -- <linux-x64|linux-arm64|darwin-x64|darwin-arm64>}"
+            PLATFORM="''${1:?usage: nix run .#publish-platform-binary -- <linux-x64|linux-arm64|darwin-arm64>}"
             VERSION="''${VERSION:?VERSION env var required (no v prefix)}"
             # `linux-x64` → OS=linux, CPU=x64
             OS="''${PLATFORM%-*}"

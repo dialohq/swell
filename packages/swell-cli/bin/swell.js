@@ -16,7 +16,6 @@ const require = createRequire(import.meta.url);
 const PLATFORM_PACKAGES = [
   "@dialo/swell-cli-linux-x64",
   "@dialo/swell-cli-linux-arm64",
-  "@dialo/swell-cli-darwin-x64",
   "@dialo/swell-cli-darwin-arm64",
 ];
 

@@ -30,7 +30,8 @@ jobs:
         include:
           - { platform: linux-x64,    runner: ubuntu-latest }
           - { platform: linux-arm64,  runner: ubuntu-24.04-arm }
-          - { platform: darwin-x64,   runner: macos-13 }
+          # Apple Silicon only — darwin-x86 hasn't been viable for
+          # consumers since macos-14 became GitHub's default runner.
           - { platform: darwin-arm64, runner: macos-14 }
     steps:
       - uses: actions/checkout@v4

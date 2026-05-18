@@ -13,7 +13,6 @@
   "optionalDependencies": {
     "@dialo/swell-cli-linux-x64": "0.1.0",
     "@dialo/swell-cli-linux-arm64": "0.1.0",
-    "@dialo/swell-cli-darwin-x64": "0.1.0",
     "@dialo/swell-cli-darwin-arm64": "0.1.0"
   },
   "repository": {
