@@ -19,16 +19,14 @@ exception down first.
   install --frozen-lockfile` inside `__noChroot = true` so the lockfile
   stays authoritative without bypassing nix for anything else.
 
-- **Release builds of the CLI binary** (`.github/workflows/release.yml`,
-  matrix step) use the GitHub runner's *native* rust toolchain via
-  `dtolnay/rust-toolchain` and the system libclang/SDK — NOT the
-  flake's nix-packaged ones. A nix-built Linux binary's ELF interpreter
-  is `/nix/store/.../glibc/lib/ld-linux-*.so.2` and consumer machines
-  don't have `/nix/store`, so it won't run off-nix. Same idea for
-  macOS: native clang sees the bundled Xcode SDK headers; the
-  nix-packaged one doesn't. Native toolchain → broadly-portable binary
-  → npm-distributable. Local dev (`nix develop`) keeps using nix's
-  toolchain — only the npm-publish path crosses out.
+- **None for the release CLI binary anymore.** Release builds run
+  inside `nix develop .#release` (see `flake.nix`). On Linux the
+  shell targets `*-unknown-linux-musl`, so the binary is fully static
+  — no dynamic loader, runs on NixOS / Alpine / glibc / anything.
+  On darwin the shell uses the native rust toolchain; mach-O against
+  system frameworks is already portable across Macs. The previous
+  "native rust off nix" exception (Ubuntu apt libclang +
+  `dtolnay/rust-toolchain`) is gone.
 
 ## Bun vs npm
 

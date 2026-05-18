@@ -23,8 +23,20 @@
         };
 
         isDarwin = pkgs.stdenv.isDarwin;
+        isAarch64 = pkgs.stdenv.isAarch64;
 
         rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+
+        muslTarget =
+          if isAarch64 then "aarch64-unknown-linux-musl"
+          else "x86_64-unknown-linux-musl";
+
+        rustMuslToolchain = rustToolchain.override {
+          targets = [ muslTarget ];
+        };
+
+        muslCc = "${pkgs.pkgsMusl.stdenv.cc}/bin/cc";
+        muslTargetEnv = builtins.replaceStrings ["-"] ["_"] muslTarget;
 
         nativeBuildInputs = with pkgs; [
           pkg-config
@@ -153,6 +165,21 @@
           '';
         } // commonEnv);
 
+        # `nix develop .#release` — Linux targets musl (static binary,
+        # runs anywhere); darwin uses the native toolchain.
+        devShells.release = pkgs.mkShell (
+          (if isDarwin then {
+            buildInputs = [ rustToolchain ] ++ nativeBuildInputs;
+          } else {
+            buildInputs = [ rustMuslToolchain pkgs.pkgsMusl.stdenv.cc ] ++ nativeBuildInputs;
+            shellHook = ''
+              export CARGO_BUILD_TARGET=${muslTarget}
+              export CARGO_TARGET_${pkgs.lib.toUpper muslTargetEnv}_LINKER=${muslCc}
+              export CC_${pkgs.lib.toLower muslTargetEnv}=${muslCc}
+            '';
+          }) // commonEnv
+        );
+
         # `nix develop .#publish` — release-only shell.
         #
         # `npm` is intentionally absent from the default devshell so
@@ -201,15 +228,10 @@
           ''}";
         };
 
-        # `nix run .#publish-platform-binary -- <platform>`
-        # Packages a pre-built `target/release/swell` into the
+        # `nix run .#publish-platform-binary -- <platform>` packages a
+        # pre-built `swell` binary (see `devShells.release`) into the
         # per-platform npm tarball and publishes via OIDC trusted
-        # publishing. The cargo build itself runs *outside* nix — see
-        # CLAUDE.md's "Dependency management" exception: nix-built
-        # Linux binaries link against the nix store's glibc and won't
-        # run on consumer machines, so release builds use the GitHub
-        # runner's native rust + libclang. Reads `VERSION` from env
-        # (set by the workflow from the tag).
+        # publishing. Reads `VERSION` from env.
         apps.publish-platform-binary = {
           type = "app";
           program = "${pkgs.writeShellScript "swell-publish-platform-binary" ''
@@ -218,7 +240,14 @@
 
             PLATFORM="''${1:?usage: nix run .#publish-platform-binary -- <linux-x64|linux-arm64|darwin-arm64>}"
             VERSION="''${VERSION:?VERSION env var required (no v prefix)}"
-            BINARY="''${BINARY:-target/release/swell}"
+
+            case "$PLATFORM" in
+              linux-x64)    DEFAULT_BIN="target/x86_64-unknown-linux-musl/release/swell" ;;
+              linux-arm64)  DEFAULT_BIN="target/aarch64-unknown-linux-musl/release/swell" ;;
+              darwin-arm64) DEFAULT_BIN="target/release/swell" ;;
+              *) echo "unknown platform $PLATFORM" >&2; exit 1 ;;
+            esac
+            BINARY="''${BINARY:-$DEFAULT_BIN}"
             # `linux-x64` → OS=linux, CPU=x64
             OS="''${PLATFORM%-*}"
             CPU="''${PLATFORM##*-}"
