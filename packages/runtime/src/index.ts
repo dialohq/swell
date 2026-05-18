@@ -78,3 +78,9 @@ export function q(text: string): SqlText<unknown[], unknown> {
 // that don't install pg get the standard "Cannot find module" error
 // from the augmentation file — pg is an optional peer dep for a reason.
 import "./pg";
+
+// Also re-export pg-specific helpers from the main entry. Consumers on
+// `moduleResolution: "node"` (Node10) can't reach `swell/pg` subpath
+// exports — folding the types into the main entry keeps the wiring
+// uniform regardless of resolution mode.
+export type { RawSql, QueryType } from "./pg";

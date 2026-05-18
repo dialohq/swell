@@ -65,4 +65,5 @@ export declare function q<S extends keyof Registry & string>(text: S): SqlText<R
 } ? R : never>;
 export declare function q<S extends string>(text: S): SqlText<unknown[], unknown>;
 import "./pg";
+export type { RawSql, QueryType } from "./pg";
 //# sourceMappingURL=index.d.ts.map
