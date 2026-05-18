@@ -1,0 +1,66 @@
+name: Release
+
+# Tag-driven publishing. The work happens in two `nix run` apps from
+# flake.nix — see `apps.publish-platform-binary` and `apps.publish-meta`
+# there. This workflow only:
+#   1. installs nix on the matching native runner,
+#   2. sets the VERSION env from the tag,
+#   3. invokes the app.
+#
+# Auth: each publish job carries `id-token: write` for npm OIDC trusted
+# publishing — no long-lived NPM_TOKEN. Configure each of the six
+# packages once in the npm UI (per-package, GitHub Actions, repo
+# `dialohq/swell`, workflow file `release.yml`).
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  publish-platform-binaries:
+    name: ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: linux-x64,    runner: ubuntu-latest }
+          - { platform: linux-arm64,  runner: ubuntu-24.04-arm }
+          - { platform: darwin-x64,   runner: macos-13 }
+          - { platform: darwin-arm64, runner: macos-14 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+        with:
+          extra-conf: |
+            sandbox = relaxed
+      - name: Publish @dialo/swell-cli-${{ matrix.platform }}
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          export VERSION="${VERSION#v}"
+          nix run .#publish-platform-binary -- ${{ matrix.platform }}
+
+  publish-meta:
+    name: wrapper + runtime
+    needs: publish-platform-binaries
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+        with:
+          extra-conf: |
+            sandbox = relaxed
+      - name: Publish @dialo/swell-cli + @dialo/swell
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          export VERSION="${VERSION#v}"
+          nix run .#publish-meta

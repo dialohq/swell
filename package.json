@@ -1,12 +1,18 @@
 {
   "name": "swell-monorepo",
   "private": true,
+  "type": "module",
   "workspaces": [
     "packages/*",
     "examples/*"
   ],
   "scripts": {
-    "build:runtime": "npm run -w packages/runtime build",
-    "typecheck": "npm run -ws --if-present typecheck"
+    "build:runtime": "bun run --cwd packages/runtime build",
+    "typecheck": "bun run --cwd packages/runtime typecheck",
+    "prepare": "bun run --cwd packages/runtime build"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dialohq/swell.git"
   }
 }
