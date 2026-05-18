@@ -1,10 +1,12 @@
 [workspace]
 resolver = "2"
-# `swell-cli` is wired in the scaffold PR (q0) with a stub `main`
-# so the release workflow can cross-compile + publish a binary
-# shell. The analyzer / scanner / codegen crates (and the real CLI
-# logic) land in the pipeline PR (q2).
-members = ["crates/swell-cli"]
+# Members are added as each crate lands — see the per-crate PRs.
+members = [
+    "crates/swell-analyzer",
+    "crates/swell-scanner",
+    "crates/swell-codegen",
+    "crates/swell-cli",
+]
 
 [workspace.package]
 version = "0.1.0"
