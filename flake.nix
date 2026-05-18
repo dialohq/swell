@@ -117,7 +117,7 @@
         # but as a runtime PATH rather than an interactive shell.
         publishEnv = pkgs.symlinkJoin {
           name = "swell-publish-env";
-          paths = [ rustToolchain pkgs.nodejs_22 pkgs.bun ] ++ nativeBuildInputs ++ buildInputs;
+          paths = [ rustToolchain pkgs.nodejs_24 pkgs.bun ] ++ nativeBuildInputs ++ buildInputs;
         };
       in
       {
@@ -147,7 +147,7 @@
         # publish step locally (e.g. for dry-runs against a local
         # registry).
         devShells.publish = pkgs.mkShell {
-          buildInputs = [ pkgs.nodejs_22 ];
+          buildInputs = [ pkgs.nodejs_24 ];
           shellHook = ''
             echo "swell publish shell"
             echo "  npm: $(npm --version) (trusted publishing needs >= 11.5)"
