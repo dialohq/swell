@@ -1,0 +1,21 @@
+[package]
+name = "swell-analyzer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+pg_query = { workspace = true }
+tokio-postgres = { workspace = true }
+postgres-types = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+proptest = "1.5"
