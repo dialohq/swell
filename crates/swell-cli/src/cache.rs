@@ -75,9 +75,12 @@ mod tests {
             tool_version: TOOL_VERSION.into(),
             query: InferredQuery {
                 sql: "SELECT 1".into(),
-                params: vec![InferredParam { oid: 23, ts_type: "number".into() }],
+                params: vec![InferredParam {
+                    oid: 23, ts_type: "number".into(), nullable: true, table_ref: None,
+                }],
                 columns: vec![InferredColumn {
                     name: "n".into(), oid: 23, nullable: false, ts_type: "number".into(),
+                    table_ref: None,
                 }],
             },
         }

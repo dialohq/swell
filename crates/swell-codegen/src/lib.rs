@@ -214,8 +214,19 @@ fn render_params_tuple(q: &InferredQuery, names: &TableNameMap) -> String {
     format!("[{}]", elems.join(", "))
 }
 
-fn render_param_type(p: &InferredParam, names: &TableNameMap) -> String {
-    render_typed(&p.ts_type, p.nullable, p.table_ref.as_ref(), names)
+fn render_param_type(p: &InferredParam, _names: &TableNameMap) -> String {
+    // Params skip the `Tables["…"]["col"]` substitution that `render_typed`
+    // applies to columns: the table interfaces are rendered for the read
+    // (parse) direction, but params take the write (serialize) shape — when
+    // `types.by_name` splits the two (e.g. timestamp parses to Spacetime,
+    // serializes from Date) the indexed-access path would otherwise yield
+    // Spacetime in INSERT/UPDATE positions. `p.ts_type` already carries the
+    // correct write-direction shape from the analyzer.
+    if p.nullable && p.ts_type != "unknown" {
+        format!("{} | null", p.ts_type)
+    } else {
+        p.ts_type.clone()
+    }
 }
 
 fn render_row_type(cols: &[InferredColumn], names: &TableNameMap) -> String {
@@ -533,24 +544,46 @@ mod tests {
     }
 
     #[test]
-    fn param_ref_uses_indexed_access() {
-        let tables = vec![ts("public", "orgs", vec![
-            ("id", "string", true),
-            ("name", "string", true),
+    fn param_ref_keeps_inferred_write_direction_ts_type() {
+        // Params skip the `Table["col"]` substitution that columns get:
+        // the `Table` interface is rendered with read-direction (parse)
+        // types, so a `types.by_name` split (e.g. timestamp parses to
+        // Spacetime, serializes from Date) would otherwise leak the read
+        // shape into INSERT/UPDATE positions. Params keep the analyzer's
+        // write-direction `ts_type` verbatim instead.
+        let tables = vec![ts("public", "events", vec![
+            ("at", "Spacetime", true),  // read-side shape (Tables["events"]["at"])
         ])];
         let queries = vec![q(
-            "INSERT INTO orgs (id, name) VALUES ($1, $2)",
-            vec![
-                p_from("string", false, "public", "orgs", "id"),
-                p_from("string", false, "public", "orgs", "name"),
-            ],
+            "INSERT INTO events (at) VALUES ($1)",
+            // Analyzer set ts_type = "Date" (write-side) but kept the
+            // table_ref pointing at the column.
+            vec![p_from("Date", false, "public", "events", "at")],
             vec![],
         )];
         let out = render(&queries, CodegenOptions {
             tables: &tables, ..Default::default()
         });
-        assert!(out.contains("params: [Orgs[\"id\"], Orgs[\"name\"]]"),
-            "got: {}", out);
+        assert!(out.contains("params: [Date]"),
+            "param should keep write-direction ts_type, got: {}", out);
+        assert!(!out.contains("params: [Events["),
+            "param must NOT use indexed table access (that interface is read-direction), got: {}", out);
+    }
+
+    #[test]
+    fn column_ref_still_uses_indexed_access_after_param_fix() {
+        // Sanity: changing param rendering must not regress column
+        // rendering — columns still go through the indexed-access path.
+        let tables = vec![ts("public", "events", vec![("at", "Spacetime", true)])];
+        let queries = vec![q(
+            "SELECT at FROM events",
+            vec![],
+            vec![col_from("at", "Spacetime", false, "public", "events")],
+        )];
+        let out = render(&queries, CodegenOptions {
+            tables: &tables, ..Default::default()
+        });
+        assert!(out.contains("row: { at: Events[\"at\"] }"), "got: {}", out);
     }
 
     #[test]
