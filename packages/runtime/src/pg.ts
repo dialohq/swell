@@ -26,7 +26,7 @@ import type {
   QueryResult,
   QueryResultRow,
 } from "pg";
-import type { SqlText } from "./index";
+import type { SqlText } from "./index.js";
 
 declare module "pg" {
   interface ClientBase {
