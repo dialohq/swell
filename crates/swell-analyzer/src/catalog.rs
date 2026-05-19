@@ -312,15 +312,20 @@ pub async fn schema_fingerprint(client: &Client, schemas: &[String]) -> anyhow::
 /// `Type` provided by `RowDescription` and prefer the catalog's lookup
 /// (because postgres-types' `Kind` may not include enum labels for OIDs the
 /// driver hasn't seen before).
-pub fn render_for_oid(cat: &TypeCatalog, oid: u32, ty: &postgres_types::Type) -> String {
+pub fn render_for_oid(
+    cat: &TypeCatalog,
+    oid: u32,
+    ty: &postgres_types::Type,
+    dir: crate::ts_types::Direction,
+) -> String {
     use postgres_types::Kind;
     // Catalog wins for user-defined enum/domain/composite (struct-driven).
     if matches!(ty.kind(), Kind::Pseudo) || cat.enums.contains_key(&oid)
         || cat.domains.contains_key(&oid) || cat.composites.contains_key(&oid)
     {
-        return cat.render_oid(oid, ty.name());
+        return cat.render_oid(oid, ty.name(), dir);
     }
-    cat.render(ty)
+    cat.render(ty, dir)
 }
 
 // Small helper for tests

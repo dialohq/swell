@@ -128,7 +128,12 @@ async fn run_pipeline(cfg: &Config, opts: RunOpts) -> Result<RunSummary> {
         match Analyzer::connect(AnalyzerOptions {
             database_url: cfg.database.url.clone().unwrap(),
             schemas: cfg.database.schemas.clone(),
-            type_overrides: cfg.types.by_name.clone().into_iter().collect(),
+            type_overrides: cfg.types.by_name.iter().map(|(k, v)| {
+                (k.clone(), swell_analyzer::TypeOverride {
+                    parse: v.parse().to_string(),
+                    serialize: v.serialize().to_string(),
+                })
+            }).collect(),
         }).await {
             Ok(a) => Some(a),
             Err(e) if !opts.require_cache => {

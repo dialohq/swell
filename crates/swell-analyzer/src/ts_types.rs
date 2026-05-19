@@ -20,6 +20,24 @@
 use postgres_types::{Kind, Type};
 use std::collections::BTreeMap;
 
+/// Whether a type is being rendered for a read position (row column, table
+/// interface, json-shape inference) or a write position (query param).
+///
+/// Drivers like node-pg can register parsers but not serializers, so the
+/// read and write shapes for a given PG type can diverge: a `date` column
+/// is read back as `Spacetime` (the parser's output) but accepted on
+/// write as anything node-pg's encoder handles (`Date | string`).
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum Direction { Read, Write }
+
+/// Per-PG-type override. `parse` is used in read positions, `serialize` in
+/// write positions. A bare string in TOML deserializes to both being equal.
+#[derive(Debug, Clone)]
+pub struct TypeOverride {
+    pub parse: String,
+    pub serialize: String,
+}
+
 /// Per-database lookups gathered from `pg_catalog` ahead of type rendering.
 /// Built once per analyzer connection then reused for every query.
 #[derive(Debug, Clone, Default)]
@@ -37,7 +55,7 @@ pub struct TypeCatalog {
     /// arrays we wouldn't otherwise resolve via postgres-types.
     pub arrays: BTreeMap<u32, (u32, String)>,
     /// User-supplied per-PG-type overrides keyed by PG type name (e.g. "jsonb").
-    pub by_name: BTreeMap<String, String>,
+    pub by_name: BTreeMap<String, TypeOverride>,
     /// Unqualified built-in proname → canonical `pg_catalog` proc OID, *only*
     /// populated when the analyzer has verified at connect-time that the
     /// name resolves to the catalog version under the current `search_path`
@@ -47,11 +65,18 @@ pub struct TypeCatalog {
 }
 
 impl TypeCatalog {
+    fn override_for(&self, name: &str, dir: Direction) -> Option<&str> {
+        self.by_name.get(name).map(|o| match dir {
+            Direction::Read => o.parse.as_str(),
+            Direction::Write => o.serialize.as_str(),
+        })
+    }
+
     /// Render a Postgres type as a TypeScript type-string.
-    pub fn render(&self, t: &Type) -> String {
+    pub fn render(&self, t: &Type, dir: Direction) -> String {
         // 1. user override by PG type name wins
-        if let Some(over) = self.by_name.get(t.name()) {
-            return over.clone();
+        if let Some(over) = self.override_for(t.name(), dir) {
+            return over.to_string();
         }
         // 2. structural cases. For user types the postgres-types crate
         //    sees opaque OIDs, so route through render_oid to pick up the
@@ -64,23 +89,23 @@ impl TypeCatalog {
                     || self.composites.contains_key(&t.oid())
                     || self.ranges.contains_key(&t.oid())
                 {
-                    self.render_oid(t.oid(), t.name())
+                    self.render_oid(t.oid(), t.name(), dir)
                 } else {
                     self.render_simple(t)
                 }
             }
             Kind::Array(inner) => {
-                let inner_ts = self.render(inner);
+                let inner_ts = self.render(inner, dir);
                 format!("{}[]", maybe_paren_for_array(&inner_ts))
             }
             Kind::Range(inner) => {
-                let inner_ts = self.render(inner);
+                let inner_ts = self.render(inner, dir);
                 format!("{{ lower: {} | null; upper: {} | null }}", inner_ts, inner_ts)
             }
-            Kind::Domain(base) => self.render(base),
+            Kind::Domain(base) => self.render(base, dir),
             Kind::Composite(fields) => {
                 let inner: Vec<String> = fields.iter()
-                    .map(|f| format!("{}: {}", quote_field(f.name()), self.render(f.type_())))
+                    .map(|f| format!("{}: {}", quote_field(f.name()), self.render(f.type_(), dir)))
                     .collect();
                 format!("{{ {} }}", inner.join("; "))
             }
@@ -95,10 +120,10 @@ impl TypeCatalog {
     /// Lookup by raw OID, going through the catalog for user-defined types
     /// that the postgres-types crate doesn't carry full info on. Falls back to
     /// the bare name if all else fails.
-    pub fn render_oid(&self, oid: u32, name: &str) -> String {
+    pub fn render_oid(&self, oid: u32, name: &str, dir: Direction) -> String {
         // user override
-        if let Some(over) = self.by_name.get(name) {
-            return over.clone();
+        if let Some(over) = self.override_for(name, dir) {
+            return over.to_string();
         }
         if let Some(labels) = self.enums.get(&oid) {
             if labels.is_empty() {
@@ -107,20 +132,20 @@ impl TypeCatalog {
             return enum_union(labels);
         }
         if let Some((base_oid, base_name)) = self.domains.get(&oid) {
-            return self.render_oid(*base_oid, base_name);
+            return self.render_oid(*base_oid, base_name, dir);
         }
         if let Some(fields) = self.composites.get(&oid) {
             let inner: Vec<String> = fields.iter()
-                .map(|(n, t_oid)| format!("{}: {}", quote_field(n), self.render_oid(*t_oid, "")))
+                .map(|(n, t_oid)| format!("{}: {}", quote_field(n), self.render_oid(*t_oid, "", dir)))
                 .collect();
             return format!("{{ {} }}", inner.join("; "));
         }
         if let Some((elem_oid, elem_name)) = self.ranges.get(&oid) {
-            let elem = self.render_oid(*elem_oid, elem_name);
+            let elem = self.render_oid(*elem_oid, elem_name, dir);
             return format!("{{ lower: {} | null; upper: {} | null }}", elem, elem);
         }
         if let Some((elem_oid, elem_name)) = self.arrays.get(&oid) {
-            let elem = self.render_oid(*elem_oid, elem_name);
+            let elem = self.render_oid(*elem_oid, elem_name, dir);
             return format!("{}[]", maybe_paren_for_array(&elem));
         }
         simple_name_to_ts(name).to_string()
@@ -175,31 +200,51 @@ fn quote_field(name: &str) -> String {
 mod tests {
     use super::*;
 
+    fn over(s: &str) -> TypeOverride {
+        TypeOverride { parse: s.into(), serialize: s.into() }
+    }
+
     #[test]
     fn scalars() {
         let c = TypeCatalog::default();
-        assert_eq!(c.render(&Type::INT4), "number");
-        assert_eq!(c.render(&Type::TEXT), "string");
-        assert_eq!(c.render(&Type::BOOL), "boolean");
-        assert_eq!(c.render(&Type::INT8), "string");
-        assert_eq!(c.render(&Type::TIMESTAMPTZ), "Date");
-        assert_eq!(c.render(&Type::JSONB), "Json");
-        assert_eq!(c.render(&Type::UUID), "string");
-        assert_eq!(c.render(&Type::BYTEA), "Uint8Array");
+        let r = Direction::Read;
+        assert_eq!(c.render(&Type::INT4, r), "number");
+        assert_eq!(c.render(&Type::TEXT, r), "string");
+        assert_eq!(c.render(&Type::BOOL, r), "boolean");
+        assert_eq!(c.render(&Type::INT8, r), "string");
+        assert_eq!(c.render(&Type::TIMESTAMPTZ, r), "Date");
+        assert_eq!(c.render(&Type::JSONB, r), "Json");
+        assert_eq!(c.render(&Type::UUID, r), "string");
+        assert_eq!(c.render(&Type::BYTEA, r), "Uint8Array");
     }
 
     #[test]
     fn arrays() {
         let c = TypeCatalog::default();
-        assert_eq!(c.render(&Type::INT4_ARRAY), "number[]");
-        assert_eq!(c.render(&Type::TEXT_ARRAY), "string[]");
+        let r = Direction::Read;
+        assert_eq!(c.render(&Type::INT4_ARRAY, r), "number[]");
+        assert_eq!(c.render(&Type::TEXT_ARRAY, r), "string[]");
     }
 
     #[test]
     fn override_by_name() {
         let mut c = TypeCatalog::default();
-        c.by_name.insert("jsonb".into(), "Json".into());
-        assert_eq!(c.render(&Type::JSONB), "Json");
-        assert_eq!(c.render(&Type::JSON), "Json"); // json/jsonb both default to Json now
+        c.by_name.insert("jsonb".into(), over("Json"));
+        assert_eq!(c.render(&Type::JSONB, Direction::Read), "Json");
+        assert_eq!(c.render(&Type::JSON, Direction::Read), "Json");
+    }
+
+    #[test]
+    fn override_split_parse_vs_serialize() {
+        let mut c = TypeCatalog::default();
+        c.by_name.insert("date".into(), TypeOverride {
+            parse: "Spacetime".into(),
+            serialize: "Spacetime | Date | string".into(),
+        });
+        assert_eq!(c.render(&Type::DATE, Direction::Read), "Spacetime");
+        assert_eq!(c.render(&Type::DATE, Direction::Write), "Spacetime | Date | string");
+        // Arrays carry direction through.
+        assert_eq!(c.render(&Type::DATE_ARRAY, Direction::Read), "Spacetime[]");
+        assert_eq!(c.render(&Type::DATE_ARRAY, Direction::Write), "(Spacetime | Date | string)[]");
     }
 }

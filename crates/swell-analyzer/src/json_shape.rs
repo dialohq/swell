@@ -18,7 +18,7 @@
 //! produced (which for `jsonb` columns is `unknown`, overridable via
 //! config or `as "col: T"`).
 
-use crate::ts_types::TypeCatalog;
+use crate::ts_types::{Direction, TypeCatalog};
 use pg_query::protobuf::{node, FuncCall, JoinExpr, RangeVar, SelectStmt};
 use std::collections::HashMap;
 use tokio_postgres::Client;
@@ -364,7 +364,7 @@ async fn column_type(client: &Client, catalog: &TypeCatalog, table_oid: u32, col
     let oid: i64 = row.get(0);
     let notnull: bool = row.get(1);
     let name: String = row.get(2);
-    let ty_string = catalog.render_oid(oid as u32, &name);
+    let ty_string = catalog.render_oid(oid as u32, &name, Direction::Read);
     Some(if notnull { ty_string } else { format!("{} | null", ty_string) })
 }
 
@@ -404,7 +404,7 @@ async fn enumerate_table(client: &Client, catalog: &TypeCatalog, table_oid: u32)
         let oid: i64 = row.get(1);
         let notnull: bool = row.get(2);
         let typname: String = row.get(3);
-        let ty = catalog.render_oid(oid as u32, &typname);
+        let ty = catalog.render_oid(oid as u32, &typname, Direction::Read);
         let ty = if notnull { ty } else { format!("{} | null", ty) };
         format!("{}: {}", quote_field(&name), ty)
     }).collect();
