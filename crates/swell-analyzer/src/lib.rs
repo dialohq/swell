@@ -17,7 +17,7 @@ pub mod query;
 pub use query::{
     InferredColumn, InferredParam, InferredQuery, TableColRef, TableSchema, TableSchemaColumn,
 };
-pub use ts_types::TypeCatalog;
+pub use ts_types::{Direction, TypeCatalog, TypeOverride};
 
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, HashMap};
@@ -31,7 +31,7 @@ pub struct Analyzer {
 pub struct AnalyzerOptions {
     pub database_url: String,
     pub schemas: Vec<String>,
-    pub type_overrides: BTreeMap<String, String>,
+    pub type_overrides: BTreeMap<String, ts_types::TypeOverride>,
 }
 
 impl Analyzer {
@@ -103,7 +103,7 @@ impl Analyzer {
                 let info = param_info.get(i).cloned().unwrap_or_default();
                 InferredParam {
                     oid: t.oid(),
-                    ts_type: catalog::render_for_oid(&self.catalog, t.oid(), t),
+                    ts_type: catalog::render_for_oid(&self.catalog, t.oid(), t, Direction::Write),
                     nullable: info.nullable,
                     table_ref: info.table_ref,
                 }
@@ -116,7 +116,7 @@ impl Analyzer {
                     c, &attnotnull, null_hints.by_column.get(i).copied()
                         .unwrap_or(nullability::NullVerdict::Unknown),
                 );
-                let oid_ts = catalog::render_for_oid(&self.catalog, c.type_.oid(), &c.type_);
+                let oid_ts = catalog::render_for_oid(&self.catalog, c.type_.oid(), &c.type_, Direction::Read);
                 let json_ts = json_shapes.by_target.get(i).cloned().flatten();
                 let inferred_ts = json_ts.unwrap_or(oid_ts);
 
@@ -176,7 +176,7 @@ impl Analyzer {
             grouped.entry((schema, table)).or_default().push(TableSchemaColumn {
                 name,
                 oid: oid as u32,
-                ts_type: self.catalog.render_oid(oid as u32, &typname),
+                ts_type: self.catalog.render_oid(oid as u32, &typname, Direction::Read),
                 not_null,
             });
         }

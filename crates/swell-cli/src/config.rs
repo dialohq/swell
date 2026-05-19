@@ -130,11 +130,39 @@ pub enum OnError { Skip, Fail }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Types {
     /// Per-OID overrides keyed by Postgres type name (e.g. "jsonb" -> "Json").
+    ///
+    /// Each entry is either a bare string (used for both parse and serialize
+    /// positions) or an inline table `{ parse = "...", serialize = "..." }`.
+    /// The split form is for drivers that only let you register parsers
+    /// (node-pg) — the read shape is what your parser returns, the write
+    /// shape is whatever the driver's default encoder accepts.
     #[serde(default)]
-    pub by_name: std::collections::BTreeMap<String, String>,
+    pub by_name: std::collections::BTreeMap<String, TypeOverride>,
     /// Per-column overrides.
     #[serde(default)]
     pub column: Vec<ColumnOverride>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum TypeOverride {
+    Both(String),
+    Split { parse: String, serialize: String },
+}
+
+impl TypeOverride {
+    pub fn parse(&self) -> &str {
+        match self {
+            Self::Both(s) => s,
+            Self::Split { parse, .. } => parse,
+        }
+    }
+    pub fn serialize(&self) -> &str {
+        match self {
+            Self::Both(s) => s,
+            Self::Split { serialize, .. } => serialize,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
