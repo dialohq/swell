@@ -121,7 +121,7 @@ impl Default for Diagnostics {
     fn default() -> Self { Self { on_error: default_on_error() } }
 }
 
-fn default_on_error() -> OnError { OnError::Skip }
+fn default_on_error() -> OnError { OnError::Fail }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
