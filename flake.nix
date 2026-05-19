@@ -8,9 +8,15 @@
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    # crane gives us `buildDepsOnly` — a separate derivation that compiles
+    # the Cargo.lock dependency set once and caches its `target/` between
+    # subsequent `buildPackage` runs. A one-line swell-source change goes
+    # from ~10 min (rebuild all 300+ deps with rustPlatform.buildRustPackage)
+    # down to ~30s (compile just the workspace crates).
+    crane.url = "github:ipetkov/crane";
   };
 
-  outputs = { self, nixpkgs, flake-utils, rust-overlay }:
+  outputs = { self, nixpkgs, flake-utils, rust-overlay, crane }:
     flake-utils.lib.eachSystem [
       "x86_64-linux"
       "aarch64-linux"
@@ -26,6 +32,7 @@
         isAarch64 = pkgs.stdenv.isAarch64;
 
         rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+        craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
 
         muslTarget =
           if isAarch64 then "aarch64-unknown-linux-musl"
@@ -117,30 +124,42 @@
           '';
         };
 
-        # Cargo build over the workspace, wrapped as a derivation. Deps
-        # are vendored from Cargo.lock; the build is hermetic. Tests that
-        # need a live Postgres run via `nix develop -c cargo test` (see
-        # README) — they're outside the CI check because nix's sandbox
-        # blocks network and the integration tests are intentionally
-        # fail-loud about that.
-        cargoBuild = pkgs.rustPlatform.buildRustPackage ({
+        # Cargo build over the workspace via crane. Two derivations:
+        #   1. `cargoArtifacts` — `buildDepsOnly` compiles every Cargo.lock
+        #      dependency with dummy workspace crates substituted in. Cached
+        #      on the lockfile; survives any source-only change.
+        #   2. `cargoBuild` — `buildPackage` reuses those artifacts and only
+        #      recompiles the swell-* workspace crates when source changes.
+        # Tests that need a live Postgres run via `nix develop -c cargo test`
+        # — they're outside the nix sandbox because it blocks network and
+        # the integration tests are intentionally fail-loud about that.
+        cargoSrc = pkgs.lib.cleanSourceWith {
+          src = ./.;
+          filter = path: _type:
+            let p = baseNameOf (toString path); in
+            !(builtins.elem p [ "target" "node_modules" "result" ".swell" ]);
+          name = "swell-source";
+        };
+
+        cargoCommonArgs = {
+          src = cargoSrc;
+          strictDeps = true;
+          inherit nativeBuildInputs buildInputs;
+          # Don't run cargo tests in this derivation — they need a live
+          # Postgres which the nix sandbox can't provide.
+          doCheck = false;
+        } // commonEnv;
+
+        cargoArtifacts = craneLib.buildDepsOnly (cargoCommonArgs // {
+          pname = "swell-deps";
+          version = "0.1.0";
+        });
+
+        cargoBuild = craneLib.buildPackage (cargoCommonArgs // {
           pname = "swell";
           version = "0.1.0";
-          src = pkgs.lib.cleanSourceWith {
-            src = ./.;
-            filter = path: _type:
-              let p = baseNameOf (toString path); in
-              !(builtins.elem p [ "target" "node_modules" "result" ".swell" ]);
-          };
-          cargoLock.lockFile = ./Cargo.lock;
-          inherit nativeBuildInputs;
-          buildInputs = buildInputs;
-          # Don't run cargo tests in this derivation — they need a live
-          # Postgres which the nix sandbox can't provide. Tests run via
-          # `nix develop -c cargo test --workspace` in dev / a separate
-          # workflow with a postgres service.
-          doCheck = false;
-        } // commonEnv);
+          inherit cargoArtifacts;
+        });
 
         # Common env that the publish apps assume: rust + node + bun +
         # libclang + postgres headers. Same surface as devShells.default
