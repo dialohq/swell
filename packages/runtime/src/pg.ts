@@ -6,16 +6,16 @@
 //      to whatever swell's analyzer inferred for that SQL. Auto-loaded by
 //      `import "./pg"` (the user's tsconfig needs nothing).
 //
+//      Strictness: `SqlText` is *not* a `string` at the type level (see
+//      `types.ts`). pg's stock `query(text: string, …)` overload can
+//      therefore never catch a `q("…")` call site, so wrong-typed
+//      values can't silently fall through to `QueryResult<any>` —
+//      they produce a real overload-mismatch error. No tsconfig
+//      wiring, no @types/pg fork.
+//
 //   2. An explicit `QueryType` export users can reach for when they
 //      wrap pg's client (eg. building their own `dbQueryR`/`dbQueryW`
-//      helpers). Augmentation alone can ADD overloads but not REMOVE
-//      pg's stock `string` overload — so a q-marked call site that
-//      passes wrong-typed values silently falls through to that stock
-//      overload and resolves to `QueryResult<any>` instead of erroring.
-//      `QueryType` is "what pg.Client.query *should* have been": the
-//      `SqlText` overload first, then the rest of pg's overload set with
-//      `string` replaced by `RawSql` so a `SqlText` can't match the
-//      fallback path.
+//      helpers).
 
 import type {
   Submittable,
@@ -32,37 +32,35 @@ declare module "pg" {
   interface ClientBase {
     query<P extends unknown[], R>(
       queryText: SqlText<P, R>,
-      values?: P,
+      values?: NoInfer<P>,
     ): Promise<QueryResult<R extends QueryResultRow ? R : QueryResultRow>>;
   }
 
   interface Pool {
     query<P extends unknown[], R>(
       queryText: SqlText<P, R>,
-      values?: P,
+      values?: NoInfer<P>,
     ): Promise<QueryResult<R extends QueryResultRow ? R : QueryResultRow>>;
   }
 }
 
-/// Plain SQL string that is *not* a `SqlText` — i.e., hasn't been
-/// branded by `q("…")`. The `__sqlBrand?: never` clause makes any
-/// `SqlText<P, R>` (whose `__sqlBrand` is `{ params; row }`)
-/// structurally incompatible, so a `SqlText` can't match an overload
-/// typed against `RawSql`. Used to guard the fallback overloads of
-/// `QueryType` below.
-export type RawSql = string & { readonly __sqlBrand?: never };
+/// Plain SQL string — alias for `string`, kept as a named type so the
+/// `QueryType` fallback overload reads symmetrically against the
+/// `SqlText` overload above it. (`SqlText` is no longer a `string` at
+/// the type level, so no extra "exclude SqlText" guard is needed here.)
+export type RawSql = string;
 
-/// The overload set pg.Client.query *should* have under swell:
-///   - registry-narrowed for `SqlText` arguments (strict first overload)
-///   - identical to pg's own overloads for Submittable / QueryConfig
-///   - `string` replaced by `RawSql` everywhere else, so wrong-typed
-///     `q("…")` args can't silently fall through to `QueryResult<any>`.
-///
-/// Use when you wrap `pg.Client.query` in your own helper:
+/// The overload set pg.Client.query / pg.Pool.query has under swell,
+/// re-exported as a type for users wrapping pg in their own helper:
 ///
 ///   import type { QueryType } from "swell/pg";
 ///   const dbQueryR: QueryType = ((qt: any, v?: any) =>
 ///     pool.query(qt, v)) as QueryType;
+///
+/// Behaviour matches the augmented `Pool.query` / `Client.query`:
+///   - `SqlText<P, R>` argument → row + params narrowed by the registry
+///   - mismatched values for a `SqlText` → overload error (not `any`)
+///   - everything else → pg's stock overloads
 ///
 /// The first overload uses no `R extends QueryResultRow` constraint
 /// (swell's fallback `q()` returns `SqlText<unknown[], unknown>`, and
@@ -72,7 +70,7 @@ export type RawSql = string & { readonly __sqlBrand?: never };
 export type QueryType = {
   <P extends unknown[], R>(
     queryText: SqlText<P, R>,
-    values?: P,
+    values?: NoInfer<P>,
   ): Promise<QueryResult<R extends QueryResultRow ? R : QueryResultRow>>;
   <T extends Submittable>(queryStream: T): Promise<T>;
   <R extends any[] = any[], I = any[]>(

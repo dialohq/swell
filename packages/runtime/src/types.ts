@@ -25,11 +25,16 @@ export type Json =
   | { [key: string]: Json | undefined };
 
 /**
- * Branded SQL string carried by `q("…")`. The non-optional `__sqlBrand`
- * intersection makes plain strings *not* assignable, so the augmented
- * `pg.Pool.query(...)` overload only fires for q-marked text.
+ * Branded SQL marker carried by `q("…")`. At runtime this *is* the SQL
+ * string (`q` is a no-op cast); at the type level we deliberately drop
+ * the `string &` intersection so a `SqlText` is **not** assignable to
+ * `string`. That gap is what makes the pg `.query(...)` augmentation
+ * strict: wrong-typed values can't silently fall through to pg's stock
+ * `query(text: string, …)` overload — there's no `string` to fall
+ * through *to*. Module augmentation can only add overloads, never
+ * remove them, so we make the brand un-string-like instead.
  */
-export type SqlText<P extends unknown[], R> = string & {
+export type SqlText<P extends unknown[], R> = {
   readonly __sqlBrand: { params: P; row: R };
 };
 

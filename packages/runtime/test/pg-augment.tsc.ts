@@ -44,6 +44,28 @@ async function checks() {
   type R3 = (typeof r3.rows)[number];
   type _ok3 = AssertTrue<Equals<R3, { id: string; email: string }>>;
 
+  // Negative cases: SqlText with mismatched values must ERROR, not
+  // silently resolve to `QueryResult<any>` via pg's stock `string`
+  // overload. Strictness rides on two pieces:
+  //   - `SqlText` is *not* `string` at the type level, so pg's stock
+  //     `query(text: string, …)` overload can't catch a q-marked call.
+  //   - `values?: NoInfer<P>` anchors P solely on the SqlText, so
+  //     `["a", "b"]` can't widen P to a supertype that happens to fit.
+  // Each `@ts-expect-error` is itself an assertion: if any of these
+  // start type-checking, tsc errors with "unused @ts-expect-error".
+
+  // Wrong element type (number vs string).
+  // @ts-expect-error pool.query: number doesn't fit P=[string]
+  await pool.query(stmt, [42]);
+  // @ts-expect-error client.query: same
+  await client.query(stmt, [42]);
+  // @ts-expect-error pc.query: same
+  await pc.query(stmt, [42]);
+
+  // Wrong arity (two values for a one-param query).
+  // @ts-expect-error pool.query: ["a","b"] doesn't fit P=[string]
+  await pool.query(stmt, ["a", "b"]);
+
   void [r1, r2, r3];
   void q;
 }
