@@ -16,8 +16,8 @@ pub mod ts_types;
 pub mod query;
 
 pub use query::{
-    InferredColumn, InferredParam, InferredQuery, TableColRef, TableRowVariant, TableSchema,
-    TableSchemaColumn,
+    InferredColumn, InferredParam, InferredQuery, RowCheck, TableColRef, TableRowVariant,
+    TableSchema, TableSchemaColumn,
 };
 pub use ts_types::{Direction, TypeCatalog, TypeOverride};
 
@@ -251,13 +251,15 @@ impl Analyzer {
 
         Ok(grouped.into_iter()
             .map(|((schema, table), columns)| {
-                let row_variants = row_refinements
+                let row_checks = row_refinements
                     .get(&(schema.clone(), table.clone()))
-                    .map(|r| r.variants.iter().map(|v| TableRowVariant {
-                        columns: v.columns.clone(),
+                    .map(|refs| refs.iter().map(|r| RowCheck {
+                        variants: r.variants.iter().map(|v| TableRowVariant {
+                            columns: v.columns.clone(),
+                        }).collect(),
                     }).collect())
                     .unwrap_or_default();
-                TableSchema { schema, table, columns, row_variants }
+                TableSchema { schema, table, columns, row_checks }
             })
             .collect())
     }

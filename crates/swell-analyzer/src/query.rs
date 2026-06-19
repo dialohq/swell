@@ -65,12 +65,21 @@ pub struct TableSchema {
     pub schema: String,
     pub table: String,
     pub columns: Vec<TableSchemaColumn>,
-    /// Cross-column row-level refinement from `CHECK` constraints
-    /// (e.g. `num_nonnulls(a, b) = 1`, CASE-keyed unions). When
-    /// non-empty, codegen renders the table type as
-    /// `Base & (variant | variant | …)` rather than a flat interface.
+    /// Row-level refinements from `CHECK` constraints, one entry per
+    /// CHECK. Each `RowCheck` is itself a union (variants of that one
+    /// constraint). Codegen emits the table type as
+    /// `Base & (u1) & (u2) & …`, chaining one intersection per CHECK
+    /// and letting TS compute the joint constraint — disconnected
+    /// CHECKs collapse cleanly, and contradictory variants collapse
+    /// to `never` automatically.
     #[serde(default)]
-    pub row_variants: Vec<TableRowVariant>,
+    pub row_checks: Vec<RowCheck>,
+}
+
+/// One row-level CHECK reduced to a union of variants.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RowCheck {
+    pub variants: Vec<TableRowVariant>,
 }
 
 /// One variant in a row-level union. Each entry overrides a column's

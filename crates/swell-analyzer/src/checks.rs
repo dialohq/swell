@@ -96,14 +96,14 @@ impl ObjectShape {
             .map(|(k, v)| format!("{}: {}", quote_key(k), v.render()))
             .collect();
         let inner = format!("{{ {} }}", body.join("; "));
-        let mut out = match self.closed_at {
+        // Don't bake `| null` into the rendered shape — the column's
+        // nullability is tracked separately (attnotnull / decide_
+        // nullability) and codegen appends `| null` based on that.
+        // Emitting it here as well would produce `… | null | null`.
+        match self.closed_at {
             Some(_) => inner,
             None => format!("{inner} & Record<string, Json>"),
-        };
-        if self.allow_null {
-            out = format!("({out}) | null");
         }
-        out
     }
 }
 
@@ -121,15 +121,15 @@ pub enum Refinement {
 impl Refinement {
     pub fn render_ts(&self) -> Option<String> {
         Some(match self {
-            Refinement::LiteralUnion { literals, allow_null } => {
+            // `allow_null` is informational only — the column's
+            // nullability is tracked independently (attnotnull) and
+            // codegen appends `| null` based on that. Emitting it here
+            // would produce `… | null | null`.
+            Refinement::LiteralUnion { literals, allow_null: _ } => {
                 if literals.is_empty() {
                     return None;
                 }
-                let mut parts: Vec<String> = literals.iter().map(Literal::render).collect();
-                if *allow_null {
-                    parts.push("null".into());
-                }
-                parts.join(" | ")
+                literals.iter().map(Literal::render).collect::<Vec<_>>().join(" | ")
             }
             Refinement::Object(o) => o.render(),
             Refinement::Union(branches) => {
@@ -163,11 +163,17 @@ impl Refinement {
             }
             (Refinement::Object(mut a), Refinement::Object(b)) => {
                 for (k, v) in b.fields {
-                    a.fields.entry(k).or_insert(v);
+                    match a.fields.get(&k) {
+                        Some(existing) if existing != &v => return None,
+                        Some(_) => {} // identical — keep
+                        None => { a.fields.insert(k, v); }
+                    }
                 }
-                // Closed iff either side was closed.
-                if b.closed_at.is_some() {
-                    a.closed_at = b.closed_at;
+                match (a.closed_at, b.closed_at) {
+                    (Some(x), Some(y)) if x != y => return None,
+                    (Some(_), _) => {}                 // keep a's
+                    (None, Some(_)) => a.closed_at = b.closed_at,
+                    (None, None) => {}
                 }
                 a.allow_null = a.allow_null && b.allow_null;
                 Some(Refinement::Object(a))
@@ -189,6 +195,11 @@ pub struct RowVariant {
     pub columns: BTreeMap<String, String>,
 }
 
+/// One row-level CHECK constraint reduced to a union of variants.
+/// Multiple CHECKs on one table become multiple `RowRefinement`s and
+/// are intersected in codegen as `Base & (u1) & (u2) & …`, letting TS
+/// compute the joint constraint (disconnected CHECKs collapse cleanly;
+/// connected ones produce `never` on incompatible branches).
 #[derive(Debug, Clone)]
 pub struct RowRefinement {
     pub variants: Vec<RowVariant>,
@@ -265,49 +276,80 @@ fn reduce_num_nonnulls_eq(
 /// branch is folded in.
 fn reduce_case(
     c: &protobuf::CaseExpr,
-    _table_columns: &HashMap<String, String>,
+    table_columns: &HashMap<String, String>,
 ) -> Option<RowRefinement> {
     if c.arg.is_some() {
         // We only handle searched CASE (`CASE WHEN <cond> THEN …`), not
         // simple CASE (`CASE <expr> WHEN <val> THEN …`).
         return None;
     }
-    // Default branch — only `ELSE false` is meaningful (it ensures the
-    // disjunction is exhaustive without adding a variant).
-    if let Some(def) = c.defresult.as_deref() {
-        if !is_const_false(def) {
-            return None;
-        }
-    }
-    let mut variants = Vec::with_capacity(c.args.len());
+    // ELSE policy:
+    //   - `ELSE false`         → exhaustive; no catch-all (rows outside
+    //                            the WHEN literals are rejected by PG).
+    //   - `ELSE true` / absent → non-exhaustive; PG accepts rows with
+    //                            any other discriminant value, so emit
+    //                            a catch-all variant whose discriminant
+    //                            is `Exclude<base, "lit"|…>`.
+    //   - any other ELSE       → bail; we can't represent partial
+    //                            constraint over the leftover values.
+    // PG normalizes a missing `ELSE` to `ELSE NULL::boolean` in
+    // `pg_get_constraintdef`. `NULL` makes the CASE non-exhaustive
+    // (CHECK passes for unmatched rows) — same as no-ELSE, same as
+    // `ELSE true`.
+    let need_catchall = match c.defresult.as_deref() {
+        None => true,
+        Some(n) if is_const_false(n) => false,
+        Some(n) if is_const_true(n) || is_const_null(n) => true,
+        Some(_) => return None,
+    };
+
+    let mut variants: Vec<RowVariant> = Vec::with_capacity(c.args.len() + 1);
+    let mut disc_col: Option<String> = None;
+    let mut covered: Vec<String> = Vec::new();
     for branch in &c.args {
         let when = match branch.node.as_ref()? {
             NodeBody::CaseWhen(cw) => cw,
             _ => return None,
         };
         let cond = when.expr.as_deref()?;
-        let (disc_col, disc_lit) = column_eq_string_literal(cond)?;
+        let (col, lit) = column_eq_string_literal(cond)?;
+        // Every WHEN must key on the same discriminant column —
+        // otherwise we can't express the catch-all coherently.
+        match &disc_col {
+            None => disc_col = Some(col.clone()),
+            Some(prev) if prev == &col => {}
+            _ => return None,
+        }
         let mut variant = RowVariant::default();
-        variant.columns.insert(
-            disc_col.clone(),
-            format!("\"{}\"", disc_lit.replace('\\', "\\\\").replace('"', "\\\"")),
-        );
-        // THEN branch — must reduce to a single-column refinement.
+        variant.columns.insert(col.clone(), render_string_literal(&lit));
+        covered.push(lit);
         let then = when.result.as_deref()?;
         if !is_const_true(then) {
-            let (col, refinement) = reduce_predicate(then)?;
-            if col == disc_col {
-                // Branch restricts the discriminant column itself — no
-                // additional info beyond what we already pinned.
-            } else {
+            let (target, refinement) = reduce_predicate(then)?;
+            if target != col {
                 let ts = refinement.render_ts()?;
-                variant.columns.insert(col, ts);
+                variant.columns.insert(target, ts);
             }
         }
         variants.push(variant);
     }
+    if need_catchall {
+        let disc = disc_col?;
+        let base = table_columns.get(&disc)?.clone();
+        let lits = covered.iter()
+            .map(|l| render_string_literal(l))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let mut catchall = RowVariant::default();
+        catchall.columns.insert(disc, format!("Exclude<{}, {}>", base, lits));
+        variants.push(catchall);
+    }
     if variants.len() < 2 { return None; }
     Some(RowRefinement { variants })
+}
+
+fn render_string_literal(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 fn column_eq_string_literal(node: &protobuf::Node) -> Option<(String, String)> {
@@ -333,6 +375,16 @@ fn is_const_true(node: &protobuf::Node) -> bool {
         if !c.isnull && matches!(c.val.as_ref(), Some(a_const::Val::Boolval(b)) if b.boolval))
 }
 
+/// Recognise `NULL` and `NULL::<type>` (the form `pg_get_constraintdef`
+/// emits for a missing `ELSE`). The cast may be wrapped in `TypeCast`.
+fn is_const_null(node: &protobuf::Node) -> bool {
+    match node.node.as_ref() {
+        Some(NodeBody::AConst(c)) => c.isnull,
+        Some(NodeBody::TypeCast(tc)) => tc.arg.as_deref().map(is_const_null).unwrap_or(false),
+        _ => false,
+    }
+}
+
 /// Strip a trailing `| null` so a variant can say "this column is
 /// non-null in this branch" with the base scalar shape.
 fn non_null_form(ts: &str) -> String {
@@ -350,15 +402,18 @@ fn non_null_form(ts: &str) -> String {
 //   Fetch from pg_constraint
 // ----------------------------------------------------------------------
 
-/// Row-level refinements per (schema, table). Returned alongside the
-/// per-column refinements so codegen can stitch the table's row type
-/// as `Base & (variant | variant | …)`.
+/// Row-level refinements per (schema, table) — each entry is the
+/// **list of CHECKs** on that table, with each CHECK reduced to a
+/// `RowRefinement` (union of variants). Codegen emits the table type
+/// as `Base & (u1) & (u2) & …`, chaining one intersection per CHECK.
+/// Only constraints `con.convalidated = true` are included — `NOT
+/// VALID` constraints don't actually hold against existing rows.
 pub async fn fetch_row_refinements(
     client: &Client,
     pairs: &[(String, String)],
     table_columns: &HashMap<(String, String), HashMap<String, String>>,
-) -> HashMap<(String, String), RowRefinement> {
-    let mut out: HashMap<(String, String), RowRefinement> = HashMap::new();
+) -> HashMap<(String, String), Vec<RowRefinement>> {
+    let mut out: HashMap<(String, String), Vec<RowRefinement>> = HashMap::new();
     if pairs.is_empty() {
         return out;
     }
@@ -371,7 +426,9 @@ pub async fn fetch_row_refinements(
         FROM ask
         JOIN pg_namespace n ON n.nspname = ask.schema
         JOIN pg_class c     ON c.relnamespace = n.oid AND c.relname = ask.name
-        JOIN pg_constraint con ON con.conrelid = c.oid AND con.contype = 'c'
+        JOIN pg_constraint con ON con.conrelid = c.oid
+                             AND con.contype = 'c'
+                             AND con.convalidated
         "#,
         &[&schemas, &tables],
     ).await {
@@ -390,10 +447,7 @@ pub async fn fetch_row_refinements(
             None => continue,
         };
         let Some(refinement) = parse_row_check_def(&def, cols) else { continue };
-        let key = (schema, table);
-        out.entry(key)
-            .and_modify(|prev| prev.variants.extend(refinement.variants.clone()))
-            .or_insert(refinement);
+        out.entry((schema, table)).or_default().push(refinement);
     }
     out
 }
@@ -415,7 +469,9 @@ pub async fn fetch_refinements(
         FROM ask
         JOIN pg_namespace n ON n.nspname = ask.schema
         JOIN pg_class c     ON c.relnamespace = n.oid AND c.relname = ask.name
-        JOIN pg_constraint con ON con.conrelid = c.oid AND con.contype = 'c'
+        JOIN pg_constraint con ON con.conrelid = c.oid
+                             AND con.contype = 'c'
+                             AND con.convalidated
         "#,
         &[&schemas, &tables],
     ).await {
@@ -425,19 +481,26 @@ pub async fn fetch_refinements(
             return out;
         }
     };
+    // Tracks columns where two CHECKs disagreed in ways `intersect`
+    // can't reconcile (different scalar shapes, incompatible JSON
+    // field types). Those drop entirely — partial narrowing is worse
+    // than none, and non-deterministic narrowing (HashMap iteration
+    // order) is the worst of all worlds.
+    let mut conflicted: HashSet<(String, String, String)> = HashSet::new();
     for row in &rows {
         let schema: String = row.get(0);
         let table: String = row.get(1);
         let def: String = row.get(2);
         let Some((column, refinement)) = parse_check_def(&def) else { continue };
         let key = (schema, table, column);
-        out.entry(key.clone())
-            .and_modify(|prev| {
-                if let Some(merged) = prev.clone().intersect(refinement.clone()) {
-                    *prev = merged;
-                }
-            })
-            .or_insert(refinement);
+        if conflicted.contains(&key) { continue; }
+        match out.remove(&key) {
+            Some(prev) => match prev.intersect(refinement) {
+                Some(merged) => { out.insert(key, merged); }
+                None => { conflicted.insert(key); }
+            },
+            None => { out.insert(key, refinement); }
+        }
     }
     out
 }
@@ -458,7 +521,19 @@ fn strip_check_wrapper(def: &str) -> Option<&str> {
     let trimmed = def.trim();
     let inside = trimmed.strip_prefix("CHECK")?.trim_start();
     let inside = inside.strip_prefix('(')?;
-    let inside = inside.strip_suffix(')')?;
+    // Strip optional Postgres-emitted suffixes that follow the predicate's
+    // closing paren: `NO INHERIT`, `NOT VALID`. These aren't part of the
+    // expression and would otherwise leave us with no trailing `)` to
+    // strip. (`fetch_*` queries already filter on `convalidated` so `NOT
+    // VALID` constraints don't reach this function, but unvalidated ones
+    // on inherited tables can still arrive.)
+    let mut tail = inside;
+    for suffix in [" NO INHERIT", " NOT VALID"] {
+        while let Some(s) = tail.trim_end().strip_suffix(suffix) {
+            tail = s;
+        }
+    }
+    let inside = tail.trim_end().strip_suffix(')')?;
     Some(inside.trim())
 }
 
@@ -771,7 +846,9 @@ fn aexpr_column(e: &protobuf::AExpr) -> Option<String> {
 }
 
 fn op_name(e: &protobuf::AExpr) -> Option<&str> {
-    e.name.first()
+    // `.last()` so schema-qualified operators like `OPERATOR(pg_catalog.=)`
+    // match against the bare `=`, mirroring `is_named_func` below.
+    e.name.last()
         .and_then(|n| n.node.as_ref())
         .and_then(|n| match n {
             NodeBody::String(s) => Some(s.sval.as_str()),
@@ -1003,11 +1080,15 @@ mod tests {
 
     #[test]
     fn nullable_or_literal_set() {
+        // `IS NULL OR <set>` produces a LiteralUnion with allow_null=true,
+        // but the rendered TS doesn't include `| null` — codegen appends
+        // it based on the column's `attnotnull` independently. Emitting
+        // null here too would produce `… | null | null`.
         let (col, ts) = rendered(
             "CHECK (((priority IS NULL) OR (priority = ANY (ARRAY['low'::text, 'high'::text]))))",
         ).unwrap();
         assert_eq!(col, "priority");
-        assert_eq!(ts, r#""low" | "high" | null"#);
+        assert_eq!(ts, r#""low" | "high""#);
     }
 
     #[test]
