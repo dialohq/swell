@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InferredQuery {
@@ -64,6 +65,20 @@ pub struct TableSchema {
     pub schema: String,
     pub table: String,
     pub columns: Vec<TableSchemaColumn>,
+    /// Cross-column row-level refinement from `CHECK` constraints
+    /// (e.g. `num_nonnulls(a, b) = 1`, CASE-keyed unions). When
+    /// non-empty, codegen renders the table type as
+    /// `Base & (variant | variant | …)` rather than a flat interface.
+    #[serde(default)]
+    pub row_variants: Vec<TableRowVariant>,
+}
+
+/// One variant in a row-level union. Each entry overrides a column's
+/// TS type within this variant; columns not listed keep their base
+/// type from `columns`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TableRowVariant {
+    pub columns: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

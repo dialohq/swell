@@ -194,6 +194,224 @@ async fn override_type_and_not_null() {
     assert!(!q.columns[0].nullable);
 }
 
+// -------- CHECK constraint refinements (issue #22) --------
+//
+// Tier 1: literal unions. Tier 2: JSON object shapes. Tier 3 (column-
+// level): discriminated unions. Each test creates a small fixture
+// table, then analyzes a SELECT against it. The fixtures are dropped
+// at the end so they don't pollute other tests.
+
+async fn with_table<F>(an: &Analyzer, ddl: &str, drop_stmt: &str, body: F)
+where
+    F: std::future::Future<Output = ()>,
+{
+    an.client.batch_execute(ddl).await.expect("create fixture");
+    body.await;
+    an.client.batch_execute(drop_stmt).await.expect("drop fixture");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn check_literal_union_narrows_string_to_union() {
+    let an = fresh_db().await;
+    with_table(
+        &an,
+        "DROP TABLE IF EXISTS ck_color;
+         CREATE TABLE ck_color (
+             id int PRIMARY KEY,
+             color text NOT NULL CHECK (color IN ('red','green','blue'))
+         );",
+        "DROP TABLE ck_color;",
+        async {
+            let q = an.analyze("SELECT color FROM ck_color WHERE id = $1")
+                .await.expect("analyze");
+            assert_eq!(q.columns[0].name, "color");
+            assert_eq!(
+                q.columns[0].ts_type,
+                r#""red" | "green" | "blue""#,
+                "CHECK IN should narrow `string` to a literal union",
+            );
+            assert!(!q.columns[0].nullable);
+        },
+    ).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn check_single_string_literal_narrows_to_one() {
+    let an = fresh_db().await;
+    with_table(
+        &an,
+        "DROP TABLE IF EXISTS ck_kind;
+         CREATE TABLE ck_kind (
+             id int PRIMARY KEY,
+             kind text NOT NULL CHECK (kind = 'invoice')
+         );",
+        "DROP TABLE ck_kind;",
+        async {
+            let q = an.analyze("SELECT kind FROM ck_kind WHERE id = $1")
+                .await.expect("analyze");
+            assert_eq!(q.columns[0].ts_type, r#""invoice""#);
+        },
+    ).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn check_nullable_or_literal_set() {
+    let an = fresh_db().await;
+    with_table(
+        &an,
+        "DROP TABLE IF EXISTS ck_priority;
+         CREATE TABLE ck_priority (
+             id int PRIMARY KEY,
+             priority text CHECK (priority IS NULL OR priority IN ('low','high'))
+         );",
+        "DROP TABLE ck_priority;",
+        async {
+            let q = an.analyze("SELECT priority FROM ck_priority WHERE id = $1")
+                .await.expect("analyze");
+            // Column-level refinement carries `| null` from the CHECK.
+            // The column is also nullable on the table, so codegen would
+            // append `| null` again — the analyzer only ensures the
+            // *narrowed* ts_type already includes null.
+            assert!(q.columns[0].ts_type.contains("\"low\""));
+            assert!(q.columns[0].ts_type.contains("\"high\""));
+            assert!(q.columns[0].ts_type.contains("null"));
+        },
+    ).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn check_jsonb_object_shape() {
+    let an = fresh_db().await;
+    with_table(
+        &an,
+        "DROP TABLE IF EXISTS ck_meta;
+         CREATE TABLE ck_meta (
+             id int PRIMARY KEY,
+             meta jsonb NOT NULL CHECK (
+                 jsonb_typeof(meta) = 'object'
+                 AND meta ?& array['width','height']
+                 AND jsonb_typeof(meta->'width') = 'number'
+                 AND jsonb_typeof(meta->'height') = 'number'
+             )
+         );",
+        "DROP TABLE ck_meta;",
+        async {
+            let q = an.analyze("SELECT meta FROM ck_meta WHERE id = $1")
+                .await.expect("analyze");
+            let ts = &q.columns[0].ts_type;
+            assert!(ts.contains("width: number"), "got {ts}");
+            assert!(ts.contains("height: number"), "got {ts}");
+            assert!(ts.contains("Record<string, Json>"), "open object form expected: {ts}");
+        },
+    ).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn check_jsonb_discriminated_union() {
+    let an = fresh_db().await;
+    with_table(
+        &an,
+        "DROP TABLE IF EXISTS ck_payload;
+         CREATE TABLE ck_payload (
+             id int PRIMARY KEY,
+             payload jsonb NOT NULL CHECK (
+                  payload->>'kind' = 'text' AND jsonb_typeof(payload->'body') = 'string'
+               OR payload->>'kind' = 'image' AND jsonb_typeof(payload->'url') = 'string'
+                                             AND jsonb_typeof(payload->'alt') = 'string'
+             )
+         );",
+        "DROP TABLE ck_payload;",
+        async {
+            let q = an.analyze("SELECT payload FROM ck_payload WHERE id = $1")
+                .await.expect("analyze");
+            let ts = &q.columns[0].ts_type;
+            assert!(ts.contains("kind: \"text\""), "got {ts}");
+            assert!(ts.contains("kind: \"image\""), "got {ts}");
+            assert!(ts.contains("body: string"), "got {ts}");
+            assert!(ts.contains("url: string"), "got {ts}");
+            assert!(ts.contains(" | "), "expected union, got {ts}");
+        },
+    ).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn check_row_level_num_nonnulls() {
+    // Tier 3 row-level: `num_nonnulls(email, phone) = 1` is reflected
+    // as a row-variant union on the table schema.
+    let an = fresh_db().await;
+    an.client.batch_execute(
+        "DROP TABLE IF EXISTS ck_contact;
+         CREATE TABLE ck_contact (
+             id int PRIMARY KEY,
+             email text,
+             phone text,
+             CHECK (num_nonnulls(email, phone) = 1)
+         );",
+    ).await.unwrap();
+    let schemas = an.table_schemas(&[("public".into(), "ck_contact".into())])
+        .await.expect("table_schemas");
+    let t = schemas.iter().find(|t| t.table == "ck_contact").expect("ck_contact");
+    assert_eq!(t.row_variants.len(), 2, "expected 2 variants, got {:?}", t.row_variants);
+    let any_has = |key: &str, val: &str|
+        t.row_variants.iter().any(|v| v.columns.get(key).map(|s| s.as_str()) == Some(val));
+    assert!(any_has("email", "string"), "no variant with email: string");
+    assert!(any_has("phone", "null"), "no variant with phone: null");
+    assert!(any_has("email", "null"), "no variant with email: null");
+    assert!(any_has("phone", "string"), "no variant with phone: string");
+    an.client.batch_execute("DROP TABLE ck_contact;").await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn check_row_level_case_discriminated_union() {
+    let an = fresh_db().await;
+    an.client.batch_execute(
+        "DROP TABLE IF EXISTS ck_field;
+         DROP TYPE IF EXISTS ck_field_type;
+         CREATE TYPE ck_field_type AS ENUM ('text', 'select');
+         CREATE TABLE ck_field (
+             id int PRIMARY KEY,
+             field_type ck_field_type NOT NULL,
+             config jsonb NOT NULL,
+             CHECK (CASE
+                 WHEN field_type = 'text'   THEN jsonb_typeof(config->'maxLength') = 'number'
+                 WHEN field_type = 'select' THEN jsonb_typeof(config->'options')   = 'array'
+                 ELSE false END)
+         );",
+    ).await.unwrap();
+    let schemas = an.table_schemas(&[("public".into(), "ck_field".into())])
+        .await.expect("table_schemas");
+    let t = schemas.iter().find(|t| t.table == "ck_field").expect("ck_field");
+    assert_eq!(t.row_variants.len(), 2);
+    // First variant pins field_type to "text" and config to a maxLength shape.
+    assert!(t.row_variants[0].columns["field_type"].contains("text"));
+    assert!(t.row_variants[0].columns["config"].contains("maxLength: number"));
+    assert!(t.row_variants[1].columns["field_type"].contains("select"));
+    assert!(t.row_variants[1].columns["config"].contains("options: Json[]"));
+    an.client.batch_execute(
+        "DROP TABLE ck_field; DROP TYPE ck_field_type;",
+    ).await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn check_arbitrary_predicate_leaves_base_type_unchanged() {
+    let an = fresh_db().await;
+    with_table(
+        &an,
+        "DROP TABLE IF EXISTS ck_slug;
+         CREATE TABLE ck_slug (
+             id int PRIMARY KEY,
+             slug text NOT NULL CHECK (length(slug) > 0)
+         );",
+        "DROP TABLE ck_slug;",
+        async {
+            let q = an.analyze("SELECT slug FROM ck_slug WHERE id = $1")
+                .await.expect("analyze");
+            assert_eq!(q.columns[0].ts_type, "string",
+                "arithmetic / function predicates must bail and keep base type");
+        },
+    ).await;
+}
+
 // -------- M7: JSON shape inference --------
 
 #[tokio::test(flavor = "current_thread")]

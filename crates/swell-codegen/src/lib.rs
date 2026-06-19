@@ -162,7 +162,27 @@ fn render_table_interface(t: &TableSchema, names: &TableNameMap) -> String {
     let name = names.lookup(&t.schema, &t.table)
         .unwrap_or_else(|| panic!("TableNameMap missing entry for {}.{}", t.schema, t.table));
     let mut out = String::new();
-    out.push_str(&format!("export interface {name} {{\n"));
+
+    // With no row-level refinement, the table is a flat interface.
+    if t.row_variants.is_empty() {
+        out.push_str(&format!("export interface {name} {{\n"));
+        for col in &t.columns {
+            let nullable = if col.not_null { "" } else { " | null" };
+            out.push_str(&format!(
+                "  {}: {}{};\n",
+                quote_ident(&col.name),
+                col.ts_type,
+                nullable,
+            ));
+        }
+        out.push_str("}\n");
+        return out;
+    }
+
+    // Row-level refinement (Tier 3 cross-column, issue #22): emit a
+    // base interface plus a union over the variants, intersected.
+    let base_name = format!("{name}Base");
+    out.push_str(&format!("export interface {base_name} {{\n"));
     for col in &t.columns {
         let nullable = if col.not_null { "" } else { " | null" };
         out.push_str(&format!(
@@ -173,6 +193,14 @@ fn render_table_interface(t: &TableSchema, names: &TableNameMap) -> String {
         ));
     }
     out.push_str("}\n");
+    out.push_str(&format!("export type {name} = {base_name} & (\n"));
+    for variant in &t.row_variants {
+        let fields: Vec<String> = variant.columns.iter()
+            .map(|(k, v)| format!("{}: {}", quote_ident(k), v))
+            .collect();
+        out.push_str(&format!("  | {{ {} }}\n", fields.join("; ")));
+    }
+    out.push_str(");\n");
     out
 }
 
@@ -354,6 +382,7 @@ mod tests {
             columns: cols.into_iter().map(|(n, t, nn)| TableSchemaColumn {
                 name: n.into(), oid: 0, ts_type: t.into(), not_null: nn,
             }).collect(),
+            row_variants: Vec::new(),
         }
     }
 
@@ -510,6 +539,38 @@ mod tests {
         assert!(out.contains("  id: number;\n"), "got: {}", out);
         assert!(out.contains("  name: string;\n"), "got: {}", out);
         assert!(out.contains("  owner_id: string | null;\n"), "got: {}", out);
+    }
+
+    #[test]
+    fn row_variants_render_as_intersected_union() {
+        use std::collections::BTreeMap;
+        use swell_analyzer::TableRowVariant;
+        let mut v0 = BTreeMap::new();
+        v0.insert("email".into(), "string".into());
+        v0.insert("phone".into(), "null".into());
+        let mut v1 = BTreeMap::new();
+        v1.insert("email".into(), "null".into());
+        v1.insert("phone".into(), "string".into());
+        let tables = vec![TableSchema {
+            schema: "public".into(),
+            table: "contact".into(),
+            columns: vec![
+                TableSchemaColumn { name: "id".into(), oid: 0, ts_type: "number".into(), not_null: true },
+                TableSchemaColumn { name: "email".into(), oid: 0, ts_type: "string".into(), not_null: false },
+                TableSchemaColumn { name: "phone".into(), oid: 0, ts_type: "string".into(), not_null: false },
+            ],
+            row_variants: vec![
+                TableRowVariant { columns: v0 },
+                TableRowVariant { columns: v1 },
+            ],
+        }];
+        let out = render(&[], CodegenOptions {
+            tables: &tables, ..Default::default()
+        });
+        assert!(out.contains("export interface ContactBase {"), "expected base interface, got: {out}");
+        assert!(out.contains("export type Contact = ContactBase & ("), "expected union form, got: {out}");
+        assert!(out.contains("{ email: string; phone: null }"), "got: {out}");
+        assert!(out.contains("{ email: null; phone: string }"), "got: {out}");
     }
 
     #[test]

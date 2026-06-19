@@ -7,6 +7,7 @@
 
 pub mod describe;
 pub mod catalog;
+pub mod checks;
 pub mod nullability;
 pub mod param_nullability;
 pub mod json_shape;
@@ -15,7 +16,8 @@ pub mod ts_types;
 pub mod query;
 
 pub use query::{
-    InferredColumn, InferredParam, InferredQuery, TableColRef, TableSchema, TableSchemaColumn,
+    InferredColumn, InferredParam, InferredQuery, TableColRef, TableRowVariant, TableSchema,
+    TableSchemaColumn,
 };
 pub use ts_types::{Direction, TypeCatalog, TypeOverride};
 
@@ -94,6 +96,15 @@ impl Analyzer {
             &self.client, &self.catalog, sql, described.columns.len(),
         ).await;
 
+        // CHECK-constraint refinements (issue #22, Tiers 1-3): literal
+        // unions, JSON object shapes, JSON discriminated unions.
+        let referenced_tables: Vec<(String, String)> = column_meta.values()
+            .map(|m| (m.table_ref.schema.clone(), m.table_ref.table.clone()))
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        let check_refinements = checks::fetch_refinements(&self.client, &referenced_tables).await;
+
         let param_info = param_nullability::infer(
             &self.client, sql, described.params.len(),
         ).await;
@@ -118,11 +129,28 @@ impl Analyzer {
                 );
                 let oid_ts = catalog::render_for_oid(&self.catalog, c.type_.oid(), &c.type_, Direction::Read);
                 let json_ts = json_shapes.by_target.get(i).cloned().flatten();
-                let inferred_ts = json_ts.unwrap_or(oid_ts);
+                let mut inferred_ts = json_ts.unwrap_or(oid_ts);
 
-                let ov = overrides::parse(&c.name);
                 let table_ref = column_meta.get(&(c.table_oid, c.attnum))
                     .map(|m| m.table_ref.clone());
+
+                // Apply a CHECK-constraint refinement when the column is
+                // a direct base-column reference whose base type is one
+                // we'd be willing to narrow (`string` / `number` /
+                // `boolean` / `Json`). Custom domain renderings (enums,
+                // user types) and user-overridden types are preserved.
+                if let Some(tref) = &table_ref {
+                    let key = (tref.schema.clone(), tref.table.clone(), tref.column.clone());
+                    if let Some(refinement) = check_refinements.get(&key) {
+                        if is_narrowable_base_type(&inferred_ts) {
+                            if let Some(narrowed) = refinement.render_ts() {
+                                inferred_ts = narrowed;
+                            }
+                        }
+                    }
+                }
+
+                let ov = overrides::parse(&c.name);
                 InferredColumn {
                     name: ov.clean_name,
                     oid: c.type_.oid(),
@@ -180,8 +208,57 @@ impl Analyzer {
                 not_null,
             });
         }
+        // Per-column refinements from CHECK (issue #22 Tiers 1-3) —
+        // applied to the table interface so consumers reading the table
+        // type get the narrowed shape too.
+        let table_pairs: Vec<(String, String)> = grouped.keys().cloned().collect();
+        let col_refinements = checks::fetch_refinements(&self.client, &table_pairs).await;
+        for ((schema, table), cols) in grouped.iter_mut() {
+            for col in cols.iter_mut() {
+                let key = (schema.clone(), table.clone(), col.name.clone());
+                if let Some(refinement) = col_refinements.get(&key) {
+                    if is_narrowable_base_type(&col.ts_type) {
+                        if let Some(narrowed) = refinement.render_ts() {
+                            col.ts_type = narrowed;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Row-level refinements (Tier 3 cross-column). Build the (col →
+        // base ts_type) map per table so the row reducer can synthesise
+        // `non-null` variants from the column's actual base type.
+        let mut col_types_per_table: std::collections::HashMap<
+            (String, String),
+            std::collections::HashMap<String, String>,
+        > = std::collections::HashMap::new();
+        for ((schema, table), cols) in &grouped {
+            let mut m = std::collections::HashMap::new();
+            for col in cols {
+                let ts = if col.not_null {
+                    col.ts_type.clone()
+                } else {
+                    format!("{} | null", col.ts_type)
+                };
+                m.insert(col.name.clone(), ts);
+            }
+            col_types_per_table.insert((schema.clone(), table.clone()), m);
+        }
+        let row_refinements = checks::fetch_row_refinements(
+            &self.client, &table_pairs, &col_types_per_table,
+        ).await;
+
         Ok(grouped.into_iter()
-            .map(|((schema, table), columns)| TableSchema { schema, table, columns })
+            .map(|((schema, table), columns)| {
+                let row_variants = row_refinements
+                    .get(&(schema.clone(), table.clone()))
+                    .map(|r| r.variants.iter().map(|v| TableRowVariant {
+                        columns: v.columns.clone(),
+                    }).collect())
+                    .unwrap_or_default();
+                TableSchema { schema, table, columns, row_variants }
+            })
             .collect())
     }
 }
@@ -246,6 +323,14 @@ async fn resolve_column_meta(
         });
     }
     out
+}
+
+/// CHECK refinements only override types we know are wide enough that
+/// narrowing is unambiguously useful. Custom domain / enum renderings
+/// and user `[types.by_name]` overrides are preserved — they already
+/// carry the user's intent.
+fn is_narrowable_base_type(ts: &str) -> bool {
+    matches!(ts, "string" | "number" | "boolean" | "Json")
 }
 
 /// Combine attnotnull and EXPLAIN evidence into a final nullable verdict.
