@@ -194,6 +194,81 @@ async fn override_type_and_not_null() {
     assert!(!q.columns[0].nullable);
 }
 
+// -------- Comment-based overrides (issue #20) --------
+//
+// The alias-suffix form (`AS "col!"`) is sent verbatim to Postgres, so the
+// `!` ends up in the runtime column name and `row.col` is undefined.
+// Comment hints sit inside SQL comments; Postgres drops them, but the
+// analyzer attaches each hint to the column it trails.
+
+#[tokio::test(flavor = "current_thread")]
+async fn comment_hint_force_not_null() {
+    let an = fresh_db().await;
+    let q = an.analyze(
+        "SELECT display_name --@swell.nonnullable\nFROM users WHERE id = $1",
+    ).await.expect("analyze");
+    assert_eq!(q.columns.len(), 1);
+    assert_eq!(q.columns[0].name, "display_name",
+        "comment hint must not leak into the runtime column name");
+    assert!(!q.columns[0].nullable, "comment hint forces NOT NULL");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn comment_hint_force_nullable() {
+    let an = fresh_db().await;
+    let q = an.analyze(
+        "SELECT email /*@swell.nullable*/ FROM users WHERE id = $1",
+    ).await.expect("analyze");
+    assert_eq!(q.columns[0].name, "email");
+    assert!(q.columns[0].nullable, "comment hint forces nullable");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn comment_hint_type_override() {
+    let an = fresh_db().await;
+    let q = an.analyze(
+        "SELECT settings /*@swell.type=UserSettings*/ FROM users WHERE id = $1",
+    ).await.expect("analyze");
+    assert_eq!(q.columns[0].name, "settings");
+    assert_eq!(q.columns[0].ts_type, "UserSettings");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn comment_hint_stacked_attributes() {
+    // Multiple comments on one column → all hints applied.
+    let an = fresh_db().await;
+    let q = an.analyze(
+        "SELECT settings /*@swell.nonnullable*/ /*@swell.type=UserSettings*/ FROM users WHERE id = $1",
+    ).await.expect("analyze");
+    assert_eq!(q.columns[0].ts_type, "UserSettings");
+    assert!(!q.columns[0].nullable);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn comment_hint_attaches_to_preceding_column() {
+    // Two columns, hint trails the first. Only column 0 is affected.
+    let an = fresh_db().await;
+    let q = an.analyze(
+        "SELECT display_name /*@swell.nonnullable*/, email FROM users WHERE id = $1",
+    ).await.expect("analyze");
+    assert_eq!(q.columns.len(), 2);
+    assert!(!q.columns[0].nullable, "trailing comment binds to col 0");
+    assert!(!q.columns[1].nullable, "email is NOT NULL anyway, unaffected");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn comment_hint_runtime_column_name_clean() {
+    // Issue #20 repro: with `AS "createdAt!"`, the `!` lands in the
+    // runtime column name. With a comment hint the alias is left clean.
+    let an = fresh_db().await;
+    let q = an.analyze(
+        r#"SELECT display_name::text AS "displayName" /*@swell.nonnullable*/ FROM users WHERE id = $1"#,
+    ).await.expect("analyze");
+    assert_eq!(q.columns[0].name, "displayName",
+        "no `!` may leak into the runtime column name");
+    assert!(!q.columns[0].nullable);
+}
+
 // -------- M7: JSON shape inference --------
 
 #[tokio::test(flavor = "current_thread")]

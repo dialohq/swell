@@ -7,6 +7,7 @@
 
 pub mod describe;
 pub mod catalog;
+pub mod comment_hints;
 pub mod nullability;
 pub mod param_nullability;
 pub mod json_shape;
@@ -110,6 +111,23 @@ impl Analyzer {
             })
             .collect();
 
+        // Hints from `--@swell.<attr>` / `/*@swell.<attr>*/` SQL
+        // comments. These are a leak-free alternative to the
+        // alias-suffix overrides (the suffix form is sent verbatim to
+        // Postgres and ends up in the runtime column name).
+        let mut comment_overrides: Vec<overrides::Override> =
+            vec![overrides::Override::default(); described.columns.len()];
+        for hint in comment_hints::extract(sql) {
+            if let Some(slot) = comment_overrides.get_mut(hint.column_index) {
+                if hint.override_.force_nullable.is_some() {
+                    slot.force_nullable = hint.override_.force_nullable;
+                }
+                if hint.override_.force_ts_type.is_some() {
+                    slot.force_ts_type = hint.override_.force_ts_type;
+                }
+            }
+        }
+
         let columns = described.columns.iter().enumerate()
             .map(|(i, c)| {
                 let inferred_nullable = decide_nullability(
@@ -120,14 +138,17 @@ impl Analyzer {
                 let json_ts = json_shapes.by_target.get(i).cloned().flatten();
                 let inferred_ts = json_ts.unwrap_or(oid_ts);
 
-                let ov = overrides::parse(&c.name);
+                let suffix_ov = overrides::parse(&c.name);
+                let hint_ov = &comment_overrides[i];
+                let force_nullable = hint_ov.force_nullable.or(suffix_ov.force_nullable);
+                let force_ts = hint_ov.force_ts_type.clone().or(suffix_ov.force_ts_type);
                 let table_ref = column_meta.get(&(c.table_oid, c.attnum))
                     .map(|m| m.table_ref.clone());
                 InferredColumn {
-                    name: ov.clean_name,
+                    name: suffix_ov.clean_name,
                     oid: c.type_.oid(),
-                    nullable: ov.force_nullable.unwrap_or(inferred_nullable),
-                    ts_type: ov.force_ts_type.unwrap_or(inferred_ts),
+                    nullable: force_nullable.unwrap_or(inferred_nullable),
+                    ts_type: force_ts.unwrap_or(inferred_ts),
                     table_ref,
                 }
             })
