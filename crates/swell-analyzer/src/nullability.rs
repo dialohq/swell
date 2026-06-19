@@ -40,11 +40,27 @@ pub enum NullVerdict {
 #[derive(Debug, Clone)]
 pub struct NullabilityHints {
     pub by_column: Vec<NullVerdict>,
+    /// For each column whose `Output` expression is a strict transform
+    /// (currently: `(<col>)::<type>` casts) of a single base column we
+    /// could locate in the plan's scans, the (schema, relation, attname)
+    /// triple. Used by the analyzer to look up `attnotnull` for
+    /// expressions where `RowDescription` dropped `(table_oid, attnum)`.
+    pub base_refs: Vec<Option<BaseColumnRef>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct BaseColumnRef {
+    pub schema: String,
+    pub relation: String,
+    pub attname: String,
 }
 
 impl NullabilityHints {
     pub fn unknown(n: usize) -> Self {
-        Self { by_column: vec![NullVerdict::Unknown; n] }
+        Self {
+            by_column: vec![NullVerdict::Unknown; n],
+            base_refs: vec![None; n],
+        }
     }
 }
 
@@ -71,14 +87,165 @@ pub async fn explain_nullability(
 
     // Bottom-up: compute the set of aliases that can be NULL on this plan.
     let nullable_aliases = collect_nullable_aliases(&plan);
+    // Map each scan-level alias to (schema, relation) so we can resolve
+    // `<alias>.<col>` and unqualified `<col>` (single-relation case)
+    // references inside strict expressions back to base columns.
+    let scans = collect_scans(&plan);
     // Topmost Output list aligned with RowDescription.
     let outputs = collect_topmost_output(&plan).unwrap_or_default();
 
     let mut by_column = vec![NullVerdict::Unknown; n_columns];
+    let mut base_refs: Vec<Option<BaseColumnRef>> = vec![None; n_columns];
     for (i, expr) in outputs.iter().take(n_columns).enumerate() {
         by_column[i] = classify(expr, &nullable_aliases);
+        base_refs[i] = base_column_ref(expr, &scans);
     }
-    Ok(NullabilityHints { by_column })
+    Ok(NullabilityHints { by_column, base_refs })
+}
+
+#[derive(Debug, Clone)]
+struct ScanInfo {
+    alias: String,
+    schema: String,
+    relation: String,
+}
+
+/// Walk the plan and collect every scan node's (alias, schema, relation)
+/// — used to resolve column refs back to base columns.
+fn collect_scans(node: &PlanNode) -> Vec<ScanInfo> {
+    let mut out = Vec::new();
+    collect_scans_rec(node, &mut out);
+    out
+}
+
+fn collect_scans_rec(node: &PlanNode, out: &mut Vec<ScanInfo>) {
+    if let (Some(rel), Some(alias)) = (node.relation_name.as_deref(), node.alias.as_deref()) {
+        out.push(ScanInfo {
+            alias: alias.to_string(),
+            schema: node.schema.clone().unwrap_or_default(),
+            relation: rel.to_string(),
+        });
+    }
+    if let Some(children) = &node.plans {
+        for c in children {
+            collect_scans_rec(c, out);
+        }
+    }
+}
+
+/// If the EXPLAIN `Output` expression is a strict transform of a single
+/// base column we can map to one of the plan's scans, return that base
+/// column. Otherwise `None`.
+///
+/// Strict transforms we recognise:
+///   - `<alias>.<col>`            — bare qualified ref (subqueries can
+///     lose `table_oid` even without a cast)
+///   - `<col>`                    — bare unqualified ref, when exactly
+///     one scan exposes a relation
+///   - `(<inner>)::<type>`        — cast wrapper (recurses)
+fn base_column_ref(expr: &str, scans: &[ScanInfo]) -> Option<BaseColumnRef> {
+    let inner = unwrap_strict_cast(expr);
+    let (alias_opt, col) = parse_column_ref(inner)?;
+    let scan = match alias_opt {
+        Some(alias) => scans.iter().find(|s| s.alias == alias)?,
+        None => {
+            if scans.len() == 1 {
+                &scans[0]
+            } else {
+                return None;
+            }
+        }
+    };
+    Some(BaseColumnRef {
+        schema: scan.schema.clone(),
+        relation: scan.relation.clone(),
+        attname: col.to_string(),
+    })
+}
+
+/// Peel off `(<x>)::<type>` cast wrappers. Multiple chained casts
+/// (`((u.ts)::text)::varchar`) are all stripped.
+fn unwrap_strict_cast(expr: &str) -> &str {
+    let mut cur = expr.trim();
+    loop {
+        let stripped = match cur.strip_prefix('(') {
+            Some(s) => s,
+            None => return cur,
+        };
+        let Some(close) = find_matching_paren(stripped) else { return cur };
+        let after = stripped[close + 1..].trim_start();
+        if !after.starts_with("::") {
+            return cur;
+        }
+        cur = stripped[..close].trim();
+    }
+}
+
+/// Given a string that follows the *content* after a leading `(`, return
+/// the index inside it of the matching `)`. Tracks nesting; ignores
+/// content of single-quoted strings.
+fn find_matching_paren(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut depth: i32 = 1;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' => {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\'' {
+                        if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'(' => { depth += 1; i += 1; }
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// Parse a simple column reference, returning `(alias, col)` if the
+/// expression is exactly `<ident>` or `<alias>.<ident>` (no extra
+/// indirection, no whitespace).
+fn parse_column_ref(expr: &str) -> Option<(Option<&str>, &str)> {
+    let trimmed = expr.trim();
+    if trimmed.is_empty() || !is_ident_start(trimmed.as_bytes()[0]) {
+        return None;
+    }
+    if let Some(dot) = trimmed.find('.') {
+        let head = &trimmed[..dot];
+        let tail = &trimmed[dot + 1..];
+        if is_simple_ident(head) && is_simple_ident(tail) {
+            return Some((Some(head), tail));
+        }
+        return None;
+    }
+    if is_simple_ident(trimmed) {
+        Some((None, trimmed))
+    } else {
+        None
+    }
+}
+
+fn is_ident_start(b: u8) -> bool { b.is_ascii_alphabetic() || b == b'_' }
+fn is_ident_byte(b: u8) -> bool { b.is_ascii_alphanumeric() || b == b'_' }
+fn is_simple_ident(s: &str) -> bool {
+    let b = s.as_bytes();
+    !b.is_empty() && is_ident_start(b[0]) && b.iter().all(|&c| is_ident_byte(c))
 }
 
 // ------------- Plan tree types -------------
@@ -98,6 +265,10 @@ struct PlanNode {
     plans: Option<Vec<PlanNode>>,
     #[serde(default)]
     alias: Option<String>,
+    #[serde(rename = "Relation Name", default)]
+    relation_name: Option<String>,
+    #[serde(default)]
+    schema: Option<String>,
     #[serde(rename = "Join Type", default)]
     join_type: Option<String>,
     #[serde(rename = "Parent Relationship", default)]
@@ -364,4 +535,71 @@ mod tests {
         assert_eq!(classify("u.email", &nulls), NullVerdict::Unknown); // not in nullable set
     }
 
+    fn one_scan() -> Vec<ScanInfo> {
+        vec![ScanInfo {
+            alias: "users".to_string(),
+            schema: "public".to_string(),
+            relation: "users".to_string(),
+        }]
+    }
+
+    fn two_scans() -> Vec<ScanInfo> {
+        vec![
+            ScanInfo { alias: "u".into(), schema: "public".into(), relation: "users".into() },
+            ScanInfo { alias: "p".into(), schema: "public".into(), relation: "posts".into() },
+        ]
+    }
+
+    #[test]
+    fn base_ref_bare_column_single_relation() {
+        let scans = one_scan();
+        let r = base_column_ref("email", &scans).unwrap();
+        assert_eq!(r.schema, "public");
+        assert_eq!(r.relation, "users");
+        assert_eq!(r.attname, "email");
+    }
+
+    #[test]
+    fn base_ref_strips_cast_wrapper() {
+        let scans = one_scan();
+        let r = base_column_ref("(email)::text", &scans).unwrap();
+        assert_eq!(r.attname, "email");
+    }
+
+    #[test]
+    fn base_ref_handles_chained_casts() {
+        let scans = one_scan();
+        let r = base_column_ref("((email)::text)::varchar", &scans).unwrap();
+        assert_eq!(r.attname, "email");
+    }
+
+    #[test]
+    fn base_ref_qualified_resolves_via_alias_map() {
+        let scans = two_scans();
+        let r = base_column_ref("(u.email)::text", &scans).unwrap();
+        assert_eq!(r.relation, "users");
+        assert_eq!(r.attname, "email");
+        let r = base_column_ref("(p.body)::text", &scans).unwrap();
+        assert_eq!(r.relation, "posts");
+        assert_eq!(r.attname, "body");
+    }
+
+    #[test]
+    fn base_ref_bare_column_ambiguous_returns_none() {
+        // With two scans, an unqualified column ref isn't safely
+        // resolvable — skip rather than guess.
+        let scans = two_scans();
+        assert!(base_column_ref("email", &scans).is_none());
+    }
+
+    #[test]
+    fn base_ref_non_strict_expressions_return_none() {
+        let scans = one_scan();
+        // Arithmetic — non-strict to a single column.
+        assert!(base_column_ref("(id + 1)", &scans).is_none());
+        // Function call.
+        assert!(base_column_ref("upper(email)", &scans).is_none());
+        // Concatenation.
+        assert!(base_column_ref("(email || 'x')", &scans).is_none());
+    }
 }

@@ -194,6 +194,56 @@ async fn override_type_and_not_null() {
     assert!(!q.columns[0].nullable);
 }
 
+// -------- Cast over NOT NULL preserves NOT NULL (issue #21) --------
+//
+// `RowDescription` drops (table_oid, attnum) for any expression that isn't
+// a direct column reference (casts, arithmetic, …), so the analyzer used
+// to fall through to a Nullable verdict for `<col>::<type>` even when
+// the base column is NOT NULL. The plan walker now recovers the base
+// column from EXPLAIN's `Output` list and resolves `attnotnull` for it.
+
+#[tokio::test(flavor = "current_thread")]
+async fn cast_over_not_null_column_is_not_null() {
+    let an = fresh_db().await;
+    let q = an.analyze(
+        "SELECT email::text FROM users WHERE id = $1",
+    ).await.expect("analyze");
+    assert_eq!(q.columns[0].name, "email");
+    assert!(!q.columns[0].nullable,
+        "cast over NOT NULL base column must stay NOT NULL");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn aliased_cast_over_not_null_column_is_not_null() {
+    let an = fresh_db().await;
+    let q = an.analyze(
+        r#"SELECT u.email::text AS "userEmail" FROM users u WHERE u.id = $1"#,
+    ).await.expect("analyze");
+    assert_eq!(q.columns[0].name, "userEmail");
+    assert!(!q.columns[0].nullable);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cast_over_nullable_column_stays_nullable() {
+    // Negative control: a cast over a nullable base column must not be
+    // flipped to NOT NULL.
+    let an = fresh_db().await;
+    let q = an.analyze(
+        "SELECT display_name::text FROM users WHERE id = $1",
+    ).await.expect("analyze");
+    assert!(q.columns[0].nullable,
+        "cast must not invent NOT NULL out of a nullable base column");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn chained_casts_preserve_not_null() {
+    let an = fresh_db().await;
+    let q = an.analyze(
+        "SELECT u.email::text::varchar FROM users u WHERE u.id = $1",
+    ).await.expect("analyze");
+    assert!(!q.columns[0].nullable);
+}
+
 // -------- M7: JSON shape inference --------
 
 #[tokio::test(flavor = "current_thread")]

@@ -90,6 +90,16 @@ impl Analyzer {
             nullability::NullabilityHints::unknown(described.columns.len())
         });
 
+        // Resolve `attnotnull` for any base-column refs the plan walker
+        // recovered from strict expressions (e.g. `(<col>)::<type>`
+        // casts) where `RowDescription` dropped (table_oid, attnum).
+        // Without this lookup, casts over NOT NULL columns get inferred
+        // as nullable (issue #21).
+        let base_attnotnull = resolve_base_ref_attnotnull(
+            &self.client,
+            &null_hints.base_refs,
+        ).await;
+
         let json_shapes = json_shape::infer_shapes(
             &self.client, &self.catalog, sql, described.columns.len(),
         ).await;
@@ -112,9 +122,15 @@ impl Analyzer {
 
         let columns = described.columns.iter().enumerate()
             .map(|(i, c)| {
+                let base_ref_not_null = null_hints.base_refs
+                    .get(i)
+                    .and_then(|r| r.as_ref())
+                    .and_then(|r| base_attnotnull.get(r).copied())
+                    .unwrap_or(false);
                 let inferred_nullable = decide_nullability(
                     c, &attnotnull, null_hints.by_column.get(i).copied()
                         .unwrap_or(nullability::NullVerdict::Unknown),
+                    base_ref_not_null,
                 );
                 let oid_ts = catalog::render_for_oid(&self.catalog, c.type_.oid(), &c.type_, Direction::Read);
                 let json_ts = json_shapes.by_target.get(i).cloned().flatten();
@@ -250,17 +266,24 @@ async fn resolve_column_meta(
 
 /// Combine attnotnull and EXPLAIN evidence into a final nullable verdict.
 ///
-/// | base table col? | attnotnull | EXPLAIN          | nullable |
-/// |-----------------|------------|------------------|----------|
-/// | yes             | NOT NULL   | Nullable         | yes (outer-join trumps) |
-/// | yes             | NOT NULL   | otherwise        | no       |
-/// | yes             | nullable   | *                | yes      |
-/// | no              | n/a        | NotNullable      | no       |
-/// | no              | n/a        | otherwise        | yes      |
+/// | base table col? | attnotnull | EXPLAIN     | base ref NN | nullable |
+/// |-----------------|------------|-------------|-------------|----------|
+/// | yes             | NOT NULL   | Nullable    | *           | yes (outer-join trumps) |
+/// | yes             | NOT NULL   | otherwise   | *           | no       |
+/// | yes             | nullable   | *           | *           | yes      |
+/// | no              | n/a        | NotNullable | *           | no       |
+/// | no              | n/a        | Nullable    | *           | yes      |
+/// | no              | n/a        | Unknown     | true        | no       |
+/// | no              | n/a        | Unknown     | false       | yes      |
+///
+/// `base_ref_not_null` carries `attnotnull` for a base column recovered
+/// from a strict expression (e.g. `(<col>)::<type>` cast) when
+/// `RowDescription` dropped the direct (table_oid, attnum) link.
 fn decide_nullability(
     c: &describe::DescribedColumn,
     attnotnull: &std::collections::HashMap<(u32, i16), bool>,
     explain: nullability::NullVerdict,
+    base_ref_not_null: bool,
 ) -> bool {
     use nullability::NullVerdict::*;
     if c.table_oid != 0 && c.attnum > 0 {
@@ -271,6 +294,69 @@ fn decide_nullability(
             (false, _)       => true,
         }
     } else {
-        !matches!(explain, NotNullable)
+        match explain {
+            NotNullable => false,
+            Nullable => true,
+            Unknown => !base_ref_not_null,
+        }
     }
+}
+
+/// Resolve `attnotnull` for every (schema, relation, attname) we want a
+/// nullability lookup for. Returns `false` for keys we couldn't resolve
+/// (missing relation, dropped column, etc.) — the analyzer treats absence
+/// as "no evidence", same as missing pg_attribute entries on the direct
+/// (table_oid, attnum) path.
+async fn resolve_base_ref_attnotnull(
+    client: &Client,
+    refs: &[Option<nullability::BaseColumnRef>],
+) -> std::collections::HashMap<nullability::BaseColumnRef, bool> {
+    let mut out = std::collections::HashMap::new();
+    let unique: std::collections::HashSet<&nullability::BaseColumnRef> =
+        refs.iter().filter_map(|r| r.as_ref()).collect();
+    if unique.is_empty() {
+        return out;
+    }
+    let mut schemas: Vec<&str> = Vec::with_capacity(unique.len());
+    let mut relations: Vec<&str> = Vec::with_capacity(unique.len());
+    let mut attnames: Vec<&str> = Vec::with_capacity(unique.len());
+    for r in &unique {
+        schemas.push(&r.schema);
+        relations.push(&r.relation);
+        attnames.push(&r.attname);
+    }
+    let rows = match client.query(
+        r#"
+        WITH ask(schema, rel, att) AS (
+            SELECT * FROM unnest($1::text[], $2::text[], $3::text[])
+        )
+        SELECT ask.schema, ask.rel, ask.att, a.attnotnull
+        FROM ask
+        JOIN pg_namespace n ON n.nspname = ask.schema OR (ask.schema = '' AND n.nspname = ANY(current_schemas(false)))
+        JOIN pg_class c     ON c.relnamespace = n.oid AND c.relname = ask.rel
+        JOIN pg_attribute a ON a.attrelid = c.oid AND a.attname = ask.att
+        WHERE a.attnum > 0 AND NOT a.attisdropped
+        "#,
+        &[&schemas, &relations, &attnames],
+    ).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::debug!("resolve_base_ref_attnotnull: {e}");
+            return out;
+        }
+    };
+    for row in &rows {
+        let schema: String = row.get(0);
+        let relation: String = row.get(1);
+        let attname: String = row.get(2);
+        let not_null: bool = row.get(3);
+        // For unqualified refs we passed an empty schema in `ask.schema`;
+        // the row reports it back the same way. The map key matches by
+        // value equality on (schema, relation, attname).
+        out.insert(
+            nullability::BaseColumnRef { schema, relation, attname },
+            not_null,
+        );
+    }
+    out
 }
