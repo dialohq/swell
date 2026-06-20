@@ -1,8 +1,5 @@
-//! Top-level `Analyzed` builder.
-//!
-//! Threads PARSE/DESCRIBE + EXPLAIN + the SQL parse tree into one pass
-//! that produces a fully lowered `Analyzed`. No EXPLAIN-text reading
-//! downstream of this point.
+//! Top-level `Analyzed` builder. PARSE/DESCRIBE + EXPLAIN + SQL parse
+//! tree → fully lowered `Analyzed` in one pass.
 
 use crate::analyzed::{Analyzed, Expr, Output, Param, ResolvedCol};
 use crate::describe::DescribedQuery;
@@ -18,8 +15,8 @@ use tokio_postgres::Client;
 
 const SETOP_NONE: i32 = pg_query::protobuf::SetOperation::SetopNone as i32;
 
-/// `(table_oid, attnum)` → resolved `(schema, table, column, attnotnull)`.
-/// Pre-fetched by the caller from `pg_attribute` in one round trip.
+/// `(table_oid, attnum) → resolved base column`. Pre-fetched by the
+/// caller from `pg_attribute` in one round trip.
 pub type ColumnMeta = HashMap<(u32, i16), ResolvedBaseCol>;
 
 #[derive(Debug, Clone)]
@@ -55,8 +52,6 @@ async fn build_inner(
     typname_to_oid: HashMap<String, u32>,
     visited: &HashSet<u32>,
 ) -> Result<Analyzed> {
-    // Scope is the alias-resolution + nullability environment shared
-    // across the whole lowering pass for this statement.
     let mut scope = Scope::build(
         client,
         plan.alias_to_table.clone(),
@@ -66,37 +61,31 @@ async fn build_inner(
         typname_to_oid.clone(),
     ).await?;
 
-    // View references: each `RangeVar` whose underlying `pg_class`
-    // row has `relkind = 'v'` gets its definition recursively
-    // analysed, with the resulting per-column `Expr`s slotted in as a
-    // derived alias.
-    let view_derived = analyze_view_refs(
+    // Attach view-derived columns first so CTE / RangeSubselect
+    // lowering can resolve view refs.
+    let mut derived = analyze_view_refs(
         client, sql, &unsafe_casts, &typname_to_oid, visited,
     ).await?;
-    let mut derived: HashMap<String, Vec<DerivedColumn>> = view_derived;
-    // Attach views first so the SQL-AST derived collection can resolve
-    // CTE / subselect refs to views.
     scope.attach_derived(derived.clone());
     for (k, v) in collect_derived(sql, &scope) {
         derived.entry(k).or_insert(v);
     }
     scope.attach_derived(derived);
 
-    // Pull per-output AST nodes from the SQL once.
     let target_source = collect_target_source(sql);
 
     let outputs = described.columns.iter().enumerate().map(|(i, col)| {
-        let expr = lower_output(i, col, &target_source, &scope, column_meta);
-        Output { name: col.name.clone(), expr }
+        Output {
+            name: col.name.clone(),
+            expr: lower_output(i, col, &target_source, &scope, column_meta),
+        }
     }).collect();
 
     let params = described.params.iter().enumerate().map(|(i, t)| {
         let binding = param_bindings.get(&(i + 1)).cloned().map(|table_ref| {
-            // The Scope's `aliases` is keyed by the EXPLAIN plan's scan
-            // aliases — INSERT/UPDATE target relations aren't aliased
-            // there, so we look up the table by name directly through
-            // `find_alias` (which finds the matching plan alias, if
-            // any) and fall back to the param_nullability tighten.
+            // INSERT/UPDATE targets aren't aliased in the plan walk —
+            // look them up via `find_alias` and fall back to the
+            // param_nullability tighten otherwise.
             let not_null = scope.find_alias(&table_ref.schema, &table_ref.table)
                 .and_then(|a| scope.resolve_alias(a))
                 .and_then(|t| t.col_not_null(&table_ref.column))
@@ -113,7 +102,6 @@ fn lower_output(
     i: usize, col: &crate::describe::DescribedColumn,
     target_source: &TargetSource, scope: &Scope, column_meta: &ColumnMeta,
 ) -> Expr {
-    // First choice: lower the SQL target node 1:1 by position.
     let from_target = match target_source {
         TargetSource::Plain(targets) =>
             targets.get(i).map(|n| lower(n, scope)),
@@ -125,23 +113,21 @@ fn lower_output(
     if let Some(e) = from_target.filter(|e| !matches!(e, Expr::Unknown)) {
         return e;
     }
-    // Fallback: the SQL target didn't slot 1:1 (star expansion, or a
-    // shape the lowering didn't recognise). When RowDescription gives
-    // us a direct `(table_oid, attnum)`, synthesise `Expr::Column`
-    // from the pg_attribute lookup the caller pre-fetched, applying
-    // the scope's outer-join widening for the matching alias.
+    // Fallback: star expansion / shape we didn't recognise. Synthesise
+    // `Expr::Column` from RowDescription's (table_oid, attnum) plus
+    // the scope's pre-fetched attnotnull, applying outer-join widening.
     if let Some(meta) = column_meta.get(&(col.table_oid, col.attnum)) {
         let alias = scope.find_alias(&meta.table_ref.schema, &meta.table_ref.table)
             .unwrap_or("").to_string();
         let widened = !alias.is_empty() && scope.is_nullable_alias(&alias);
-        let force_non_null = !alias.is_empty() && scope.is_non_null_alias(&alias);
+        let force_nn = !alias.is_empty() && scope.is_non_null_alias(&alias);
         let typoid = scope.resolve_alias(&alias)
             .and_then(|t| t.col_typoid(&meta.table_ref.column))
             .unwrap_or(0);
         return Expr::Column(ResolvedCol {
             table_ref: meta.table_ref.clone(),
             alias,
-            not_null: (meta.not_null || force_non_null) && !widened,
+            not_null: (meta.not_null || force_nn) && !widened,
             typoid,
         });
     }
@@ -149,15 +135,11 @@ fn lower_output(
 }
 
 enum TargetSource {
-    /// Plain SELECT / INSERT/UPDATE/DELETE RETURNING.
     Plain(Vec<Node>),
-    /// Set-op (UNION / INTERSECT / EXCEPT). Per-branch target lists in
-    /// flatten order (matches EXPLAIN's Append children).
+    /// Per-branch target lists in EXPLAIN-flatten order.
     SetOp(Vec<Vec<Node>>),
-    /// The target list contains a star — output ordering doesn't match
-    /// target_list 1:1.
+    /// Target list contains a star — output ordering doesn't match 1:1.
     OpaqueStar,
-    /// Something else — DDL, set-returning function at top level, …
     Unknown,
 }
 
@@ -184,11 +166,9 @@ fn collect_target_source(sql: &str) -> TargetSource {
 
 fn collect_setop_branch(s: &SelectStmt, out: &mut Vec<Vec<Node>>) {
     if s.op == SETOP_NONE {
+        // Star inside a branch — empty branch defaults to Unknown.
         if s.target_list.iter().any(target_contains_star) {
-            // Star inside a branch — mark the branch as empty so the
-            // per-column lookup defaults to Unknown.
-            out.push(Vec::new());
-            return;
+            out.push(Vec::new()); return;
         }
         out.push(s.target_list.iter().filter_map(res_target_val).collect());
         return;
@@ -213,15 +193,10 @@ fn target_contains_star(n: &Node) -> bool {
 
 // ---------- View recursion ----------
 
-/// Find every `RangeVar` in the SQL, check `pg_class` for which are
-/// views (`relkind = 'v'`), fetch each view's definition, and
-/// recursively analyse it — returning per-view alias → per-column
-/// `DerivedColumn`s. Cycles (a view that references itself or sits
-/// in a cyclic dependency) are detected via the `visited` OID set and
-/// short-circuited: any view OID currently on the analysis stack
-/// resolves to no derived columns, leaving the lookup to fall through
-/// to `attnotnull` like for an opaque table. Boxed because of async
-/// recursion.
+/// View RangeVars get their `pg_get_viewdef` recursively analysed.
+/// Cycles short-circuit via the `visited` OID set — a view currently
+/// on the analysis stack resolves to no derived columns, letting the
+/// lookup fall through to `attnotnull`. Boxed for async recursion.
 fn analyze_view_refs<'a>(
     client: &'a Client,
     sql: &'a str,
@@ -233,20 +208,15 @@ fn analyze_view_refs<'a>(
         let candidates = find_rangevar_aliases(sql);
         if candidates.is_empty() { return Ok(HashMap::new()); }
         let view_oids = fetch_view_oids(client, &candidates).await;
-        if view_oids.is_empty() { return Ok(HashMap::new()); }
         let mut out = HashMap::new();
         for (alias, oid) in view_oids {
             if visited.contains(&oid) { continue; }
-            let view_sql = match fetch_view_def(client, oid).await {
-                Some(s) => s,
-                None => continue,
-            };
+            let Some(view_sql) = fetch_view_def(client, oid).await else { continue };
             let described = match crate::describe::describe(client, &view_sql).await {
                 Ok(d) => d,
                 Err(e) => { tracing::debug!("describe view {oid}: {e}"); continue; }
             };
-            let plan_walk = crate::plan::explain(client, &view_sql).await
-                .unwrap_or_default();
+            let plan_walk = crate::plan::explain(client, &view_sql).await.unwrap_or_default();
             let pairs: Vec<(u32, i16)> = described.columns.iter()
                 .filter(|c| c.table_oid != 0 && c.attnum > 0)
                 .map(|c| (c.table_oid, c.attnum))
@@ -269,21 +239,13 @@ fn analyze_view_refs<'a>(
     })
 }
 
-/// `(alias_or_relname, schema, relname)` for every `RangeVar` in the
-/// SQL's top-level `from_clause`. We don't yet know which are views;
-/// `fetch_view_oids` filters via `pg_class`.
 fn find_rangevar_aliases(sql: &str) -> Vec<(String, String, String)> {
     let mut out = Vec::new();
     let Ok(parsed) = pg_query::parse(sql) else { return out };
     for raw in &parsed.protobuf.stmts {
-        let Some(stmt) = raw.stmt.as_deref().and_then(|s| s.node.as_ref()) else { continue };
-        let select = match stmt {
-            NB::SelectStmt(s) => s,
-            _ => continue,
-        };
-        for from in &select.from_clause {
-            walk_rangevars(from, &mut out);
-        }
+        let Some(NB::SelectStmt(select)) = raw.stmt.as_deref().and_then(|s| s.node.as_ref())
+            else { continue };
+        for from in &select.from_clause { walk_rangevars(from, &mut out); }
     }
     out
 }
@@ -294,8 +256,7 @@ fn walk_rangevars(n: &Node, out: &mut Vec<(String, String, String)>) {
             let alias = rv.alias.as_ref().map(|a| a.aliasname.clone())
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| rv.relname.clone());
-            let schema = rv.schemaname.clone();
-            out.push((alias, schema, rv.relname.clone()));
+            out.push((alias, rv.schemaname.clone(), rv.relname.clone()));
         }
         Some(NB::JoinExpr(je)) => {
             if let Some(l) = je.larg.as_deref() { walk_rangevars(l, out); }
@@ -305,9 +266,8 @@ fn walk_rangevars(n: &Node, out: &mut Vec<(String, String, String)>) {
     }
 }
 
-/// One round-trip filters the `RangeVar` candidates by
-/// `pg_class.relkind = 'v'`. Returns alias → view OID for each view
-/// candidate.
+/// Filter `RangeVar` candidates by `pg_class.relkind = 'v'`. Returns
+/// alias → view OID pairs for matches.
 async fn fetch_view_oids(
     client: &Client, candidates: &[(String, String, String)],
 ) -> Vec<(String, u32)> {
@@ -330,13 +290,9 @@ async fn fetch_view_oids(
         Ok(r) => r,
         Err(e) => { tracing::debug!("fetch_view_oids: {e}"); return Vec::new(); }
     };
-    let mut by_name: HashMap<(String, String), u32> = HashMap::new();
-    for row in &rows {
-        let schema: String = row.get(0);
-        let name: String = row.get(1);
-        let oid: u32 = row.get(2);
-        by_name.insert((schema, name), oid);
-    }
+    let by_name: HashMap<(String, String), u32> = rows.iter()
+        .map(|r| ((r.get(0), r.get(1)), r.get(2)))
+        .collect();
     candidates.iter().filter_map(|(alias, schema, name)| {
         let s = if schema.is_empty() { "public".to_string() } else { schema.clone() };
         by_name.get(&(s, name.clone())).map(|oid| (alias.clone(), *oid))
@@ -344,39 +300,27 @@ async fn fetch_view_oids(
 }
 
 async fn fetch_view_def(client: &Client, oid: u32) -> Option<String> {
-    let row = client.query_one("SELECT pg_get_viewdef($1::oid)", &[&oid]).await.ok()?;
-    Some(row.get::<_, String>(0))
+    client.query_one("SELECT pg_get_viewdef($1::oid)", &[&oid]).await.ok()
+        .map(|row| row.get::<_, String>(0))
 }
 
 // ---------- Derived tables / CTEs ----------
 
-/// Walk the SQL once and lower every derived-table alias (RangeSubselect
-/// in FROM) and every CTE name (WithClause) into per-column `Expr`s.
-/// The current `scope` is used to lower expressions — derived tables
-/// share the outer scope's tables for simple cases; nested aliases
-/// (a derived table over another derived table) are handled by the
-/// outer pass's `scope.derived` lookup chain.
 fn collect_derived(sql: &str, scope: &Scope) -> HashMap<String, Vec<DerivedColumn>> {
     let mut out = HashMap::new();
     let Ok(parsed) = pg_query::parse(sql) else { return out };
     for raw in &parsed.protobuf.stmts {
-        let Some(stmt) = raw.stmt.as_deref().and_then(|s| s.node.as_ref()) else { continue };
-        let select = match stmt {
-            NB::SelectStmt(s) => s,
-            _ => continue,
-        };
-        // WITH clause CTEs.
+        let Some(NB::SelectStmt(select)) = raw.stmt.as_deref().and_then(|s| s.node.as_ref())
+            else { continue };
         if let Some(wc) = &select.with_clause {
             for cte_node in &wc.ctes {
                 let Some(NB::CommonTableExpr(cte)) = cte_node.node.as_ref() else { continue };
-                let name = &cte.ctename;
-                if name.is_empty() { continue; }
+                if cte.ctename.is_empty() { continue; }
                 if let Some(cols) = lower_subquery_columns(cte.ctequery.as_deref(), &cte.aliascolnames, scope) {
-                    out.insert(name.clone(), cols);
+                    out.insert(cte.ctename.clone(), cols);
                 }
             }
         }
-        // Derived tables in FROM.
         for from in &select.from_clause {
             collect_derived_from(from, scope, &mut out);
         }
@@ -389,8 +333,9 @@ fn collect_derived_from(
 ) {
     match node.node.as_ref() {
         Some(NB::RangeSubselect(rs)) => {
-            let alias_name = rs.alias.as_ref().map(|a| a.aliasname.clone()).unwrap_or_default();
-            if alias_name.is_empty() { return; }
+            let Some(alias_name) = rs.alias.as_ref()
+                .map(|a| a.aliasname.clone()).filter(|s| !s.is_empty())
+                else { return };
             let alias_colnames: Vec<Node> = rs.alias.as_ref()
                 .map(|a| a.colnames.clone()).unwrap_or_default();
             if let Some(cols) = lower_subquery_columns(rs.subquery.as_deref(), &alias_colnames, scope) {
@@ -405,16 +350,10 @@ fn collect_derived_from(
     }
 }
 
-/// Lower the per-column outputs of a subquery (a SelectStmt — either
-/// plain SELECT, VALUES, or a set-op tree). Returns one
-/// `DerivedColumn` per output position. Column names come from
-/// `aliascolnames` (the user's `(col1, col2, …)` after the alias) if
-/// provided, falling back to the subquery's own target names.
 fn lower_subquery_columns(
     subquery: Option<&Node>, aliascolnames: &[Node], scope: &Scope,
 ) -> Option<Vec<DerivedColumn>> {
-    let body = subquery?.node.as_ref()?;
-    let select = match body { NB::SelectStmt(s) => s, _ => return None };
+    let NB::SelectStmt(select) = subquery?.node.as_ref()? else { return None };
     lower_select_columns(select, aliascolnames, scope)
 }
 
@@ -427,41 +366,29 @@ fn lower_select_columns(
             _ => None,
         })
         .collect();
-    // Set-op (UNION / INTERSECT / EXCEPT) or recursive CTE: the base
-    // case (`larg`) sets the floor for column nullability. The
-    // recursive branch (or second set-op branch) must align on type
-    // and column count, so its verdict can't be wider than the base.
+    // Set-op or recursive CTE: base case (`larg`) sets the floor.
     if select.op != SETOP_NONE {
         return select.larg.as_deref()
             .and_then(|s| lower_select_columns(s, aliascolnames, scope));
     }
-    // VALUES (1, 'a'), (2, 'b'). Take the first row.
+    // VALUES — first row's per-column expr.
     if !select.values_lists.is_empty() {
         let first = select.values_lists.first()?;
-        let row = match first.node.as_ref()? {
-            NB::List(l) => &l.items,
-            _ => return None,
-        };
-        let cols = row.iter().enumerate().map(|(i, expr)| DerivedColumn {
+        let NB::List(l) = first.node.as_ref()? else { return None };
+        return Some(l.items.iter().enumerate().map(|(i, expr)| DerivedColumn {
             name: alias_names.get(i).cloned().flatten().unwrap_or_default(),
             expr: lower(expr, scope),
-        }).collect();
-        return Some(cols);
+        }).collect());
     }
-    // Regular SELECT — pull from target_list.
-    let cols = select.target_list.iter().enumerate().filter_map(|(i, t)| {
-        let rt = match t.node.as_ref()? { NB::ResTarget(rt) => rt, _ => return None };
+    Some(select.target_list.iter().enumerate().filter_map(|(i, t)| {
+        let NB::ResTarget(rt) = t.node.as_ref()? else { return None };
         let val = rt.val.as_deref()?;
         let name = alias_names.get(i).cloned().flatten()
             .unwrap_or_else(|| rt.name.clone());
         Some(DerivedColumn { name, expr: lower(val, scope) })
-    }).collect();
-    Some(cols)
+    }).collect())
 }
 
-/// Three-state verdict from a lowered `Expr`. The downstream
-/// `decide_nullability` function combines this with `attnotnull` from
-/// RowDescription's base-column refs.
 pub fn verdict(expr: &Expr) -> Verdict {
     if lowering::is_nullable(expr) { Verdict::Nullable }
     else if lowering::is_non_null(expr) { Verdict::NotNullable }

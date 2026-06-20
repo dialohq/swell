@@ -1,8 +1,4 @@
 //! Name resolution + alias nullability for an `Analyzed` build.
-//!
-//! `Scope` is built once from the EXPLAIN plan tree, then consumed by
-//! the lowering pass to resolve `ColumnRef`s to `ResolvedCol` with the
-//! `not_null` bit already adjusted for outer-join widening.
 
 use crate::analyzed::Expr;
 use anyhow::Result;
@@ -12,19 +8,14 @@ use tokio_postgres::Client;
 #[derive(Debug, Clone)]
 pub struct Scope {
     aliases: HashMap<String, ResolvedTable>,
-    /// SQL-level derived table aliases (RangeSubselect, CTE references)
-    /// resolved to per-column lowered `Expr`s. Set after `Scope::build`
-    /// by `Scope::attach_derived`. Lookup order in `lower_column_ref`
-    /// is: aliases (real tables) → derived (subselects / CTEs).
+    /// SQL-level derived aliases (RangeSubselect / CTE / view).
     derived: HashMap<String, Vec<DerivedColumn>>,
     nullable: HashSet<String>,
     non_null: HashSet<String>,
-    /// `(source_typoid, target_typoid)` pairs with a user-defined
-    /// `castmethod='f'` cast — looked up per-Cast to compute its
-    /// `is_unsafe` flag at lowering time.
+    /// `(source_typoid, target_typoid)` pairs with user-defined
+    /// `castmethod='f'` casts — per-Cast `is_unsafe` lookup.
     unsafe_casts: HashSet<(u32, u32)>,
-    /// `pg_type.typname → oid` for resolving a `TypeCast`'s target
-    /// type name to an OID.
+    /// `pg_type.typname → oid` for resolving `TypeCast` targets.
     typname_to_oid: HashMap<String, u32>,
 }
 
@@ -52,10 +43,6 @@ impl ResolvedTable {
 }
 
 impl Scope {
-    /// Build a `Scope` for a query: map every plan-tree scan alias to
-    /// its base table (with per-column `attnotnull` preloaded), then
-    /// merge in the outer-join / non-null-source alias sets the plan
-    /// walk produced.
     pub async fn build(
         client: &Client,
         alias_to_table: HashMap<String, (String, String)>,
@@ -78,23 +65,16 @@ impl Scope {
         })
     }
 
-    /// `pg_type.typname → oid`. Used by `Cast` lowering to resolve a
-    /// `TypeCast`'s target name to an OID.
     pub fn typname_oid(&self, name: &str) -> Option<u32> {
         self.typname_to_oid.get(name).copied()
     }
 
-    /// True iff this `(source, target)` cast is user-defined
-    /// `castmethod='f'` — the only shape that can return NULL on
-    /// non-NULL input.
     pub fn is_unsafe_cast(&self, source: u32, target: u32) -> bool {
         self.unsafe_casts.contains(&(source, target))
     }
 
-    /// Attach derived-table aliases. Lowering pass calls this after
-    /// `Scope::build` once it has the SQL parse tree — we can't do
-    /// this in `build` because lowering depends on `Scope`, which
-    /// would otherwise create a circular dependency.
+    /// Lowering pass calls this after `Scope::build`. Two-phase to
+    /// avoid circular dependency on lowering inside `build`.
     pub fn attach_derived(&mut self, derived: HashMap<String, Vec<DerivedColumn>>) {
         self.derived = derived;
     }
@@ -104,20 +84,16 @@ impl Scope {
     }
 
     pub fn resolve_alias(&self, alias: &str) -> Option<&ResolvedTable> {
-        // PG renames duplicate scan aliases as `users_1`, `users_2` in
-        // plans. Try the literal alias first; fall back to the
-        // de-numbered form so the user-written alias resolves.
+        // PG renames duplicate scan aliases to `users_1`, `users_2` in
+        // plans — fall back to the de-numbered form.
         self.aliases.get(alias).or_else(|| self.aliases.get(strip_suffix_digits(alias)))
     }
 
-    /// Bare `<col>` resolves to a non-null source iff scope's aliases
-    /// agree on its origin — either a single matching alias, or
-    /// multiple aliases that all point at the same base `(schema,
-    /// table)` (e.g. set-op branches both scanning the same relation;
-    /// PG renames them `users_1`, `users_2`). Falls back to the
-    /// plan-tree non-null verdict when there's a single non-null
-    /// source alias (literal `unnest`, all-literal VALUES) and no
-    /// catalog match.
+    /// Bare `<col>` resolves only when scope's aliases agree on its
+    /// origin (single alias, or multiple aliases on the same base
+    /// table — e.g. set-op branches). Falls back to the plan-tree
+    /// non-null verdict when there's a single non-null source alias
+    /// (literal `unnest`, all-literal VALUES) and no catalog match.
     pub fn resolve_bare(&self, col: &str) -> Option<BareResolved> {
         let matches: Vec<(&String, &ResolvedTable, bool)> = self.aliases.iter()
             .filter_map(|(a, t)| t.col_not_null(col).map(|nn| (a, t, nn)))
@@ -127,27 +103,18 @@ impl Scope {
             let same_table = matches.iter()
                 .all(|(_, t, _)| t.schema == first_table.schema && t.name == first_table.name);
             if !same_table { return None; }
-            // Aliases agree on the origin table. Take the alias whose
-            // nullability state is the strictest (any nullable-side
-            // alias → result is widened). For set-op branches both
-            // referring to the same base table, neither is widened, so
-            // this picks any.
-            let widening = matches.iter()
-                .any(|(a, _, _)| self.is_nullable_alias(a));
-            let force_non_null = matches.iter()
-                .any(|(a, _, _)| self.is_non_null_alias(a));
-            let base_not_null = matches.iter().all(|(_, _, nn)| *nn);
+            let widening = matches.iter().any(|(a, _, _)| self.is_nullable_alias(a));
+            let force_nn = matches.iter().any(|(a, _, _)| self.is_non_null_alias(a));
+            let base_nn = matches.iter().all(|(_, _, nn)| *nn);
             let (alias, table, _) = matches[0];
             return Some(BareResolved {
                 schema: table.schema.clone(),
                 table: table.name.clone(),
                 alias: alias.clone(),
-                not_null: (base_not_null || force_non_null) && !widening,
+                not_null: (base_nn || force_nn) && !widening,
                 typoid: table.col_typoid(col).unwrap_or(0),
             });
         }
-        // Derived-table / CTE: bare `<col>` resolves if exactly one
-        // derived alias has a column by that name.
         let derived_matches: Vec<(&String, &DerivedColumn)> = self.derived.iter()
             .filter_map(|(a, cols)| cols.iter().find(|c| c.name == col).map(|c| (a, c)))
             .collect();
@@ -164,11 +131,8 @@ impl Scope {
         if self.non_null.len() == 1 {
             let alias = self.non_null.iter().next()?.clone();
             return Some(BareResolved {
-                schema: String::new(),
-                table: String::new(),
-                alias,
-                not_null: true,
-                typoid: 0,
+                schema: String::new(), table: String::new(),
+                alias, not_null: true, typoid: 0,
             });
         }
         None
@@ -182,10 +146,8 @@ impl Scope {
         self.non_null.contains(alias) || self.non_null.contains(strip_suffix_digits(alias))
     }
 
-    /// Find an alias whose underlying scan points at `(schema, table)`.
-    /// Used by star expansion to recover the alias for `RangeVar`-only
-    /// star outputs — when multiple aliases match (self-join + star),
-    /// returns the first deterministically (sorted by alias name).
+    /// First alias (alphabetically) pointing at `(schema, table)` —
+    /// deterministic tiebreak for star-expansion outputs on self-joins.
     pub fn find_alias(&self, schema: &str, table: &str) -> Option<&str> {
         let mut matches: Vec<&str> = self.aliases.iter()
             .filter(|(_, t)| t.schema == schema && t.name == table)
@@ -204,14 +166,13 @@ pub struct BareResolved {
     pub typoid: u32,
 }
 
-/// `users_1` → `users`. PG appends `_N` to disambiguate duplicate scan
-/// aliases within a single plan.
+/// `users_1` → `users`. PG appends `_N` to disambiguate duplicate
+/// scan aliases within a plan.
 fn strip_suffix_digits(s: &str) -> &str {
     let t = s.trim_end_matches(|c: char| c.is_ascii_digit());
     t.trim_end_matches('_')
 }
 
-/// One round-trip: per (schema, table) → { column → (attnotnull, atttypid) }.
 async fn fetch_columns(
     client: &Client, pairs: &HashSet<(String, String)>,
 ) -> Result<HashMap<(String, String), HashMap<String, (bool, u32)>>> {

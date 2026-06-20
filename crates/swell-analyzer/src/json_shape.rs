@@ -1,30 +1,21 @@
 //! Structural inference of JSON-building expressions.
 //!
-//! Handles, for each top-level target in a SELECT:
+//! For each top-level target we recognise:
+//!   * `jsonb_build_object(...)` / `json_build_object(...)`
+//!   * `jsonb_agg(expr)` / `json_agg(expr)`            → `T[]`
+//!   * `to_jsonb(alias)` / `row_to_json(alias)`        → `{ col: T; … }`
+//!   * `jsonb_object_agg(k, v)` / `json_object_agg`    → `Record<string, V>`
 //!
-//!   - `jsonb_build_object('a', expr_a, 'b', expr_b, …)`     → `{ a: T_a; b: T_b }`
-//!   - `json_build_object(...)`                               → same
-//!   - `jsonb_agg(expr)` / `json_agg(expr)`                   → `T[]`
-//!   - `to_jsonb(table_alias)` / `row_to_json(table_alias)`   → `{ col1: T1; … }`
-//!
-//! For column references inside these calls we query the catalog (via the
-//! same `tokio_postgres::Client` the analyzer already uses) for the
-//! column's OID and `attnotnull`. Anything more elaborate — sub-selects,
-//! function calls other than the ones above, complex expressions — falls
-//! back to `unknown`.
-//!
-//! When the topmost target isn't a JSON-building call this module returns
-//! `None` for that target — caller keeps whatever the OID-based mapping
-//! produced (which for `jsonb` columns is `unknown`, overridable via
-//! config or `as "col: T"`).
+//! Anything else falls back to the OID-based mapping (`unknown` for
+//! opaque jsonb, overridable via config or `as "col: T"`).
 
 use crate::ts_types::{Direction, TypeCatalog};
-use pg_query::protobuf::{node, FuncCall, JoinExpr, RangeVar, SelectStmt};
+use pg_query::protobuf::{node, FuncCall, RangeVar, SelectStmt};
 use std::collections::HashMap;
 use tokio_postgres::Client;
 
-/// One inferred TS type per top-level target, in target-list order. `None`
-/// means "no JSON shape inference applied — caller defers to OID mapping".
+/// One inferred TS type per top-level target. `None` = defer to the
+/// OID-based mapping.
 #[derive(Debug, Clone, Default)]
 pub struct JsonShapeInferred {
     pub by_target: Vec<Option<String>>,
@@ -36,45 +27,26 @@ pub async fn infer_shapes(
     sql: &str,
     n_targets: usize,
 ) -> JsonShapeInferred {
-    let mut out = JsonShapeInferred {
-        by_target: vec![None; n_targets],
-    };
-
+    let mut out = JsonShapeInferred { by_target: vec![None; n_targets] };
     let parsed = match pg_query::parse(sql) {
         Ok(p) => p,
-        Err(e) => {
-            tracing::debug!("pg_query::parse failed for json_shape: {e}");
-            return out;
-        }
+        Err(e) => { tracing::debug!("pg_query::parse failed for json_shape: {e}"); return out; }
     };
-    // Find the first SELECT stmt at top level.
-    let select = match find_top_select(&parsed.protobuf) {
-        Some(s) => s,
-        None => return out,
-    };
-
-    let alias_map = build_alias_map(&select.from_clause);
-    // Resolve alias name → table OID once per query.
-    let alias_oids = resolve_alias_oids(client, &alias_map).await;
+    let Some(select) = find_top_select(&parsed.protobuf) else { return out };
+    let alias_oids = resolve_alias_oids(client, &build_alias_map(&select.from_clause)).await;
 
     for (i, t) in select.target_list.iter().take(n_targets).enumerate() {
-        if let Some(node::Node::ResTarget(res)) = t.node.as_ref() {
-            if let Some(val) = &res.val {
-                // Only infer at the top level when the target IS a JSON-
-                // building function. Bare column refs and other expressions
-                // are typed via the OID/attnotnull/EXPLAIN path in lib.rs.
-                if let Some(node::Node::FuncCall(fc)) = val.node.as_ref() {
-                    if let Some(ts) = infer_func(client, catalog, &alias_oids, fc).await {
-                        out.by_target[i] = Some(ts);
-                    }
-                }
-            }
+        let Some(node::Node::ResTarget(res)) = t.node.as_ref() else { continue };
+        let Some(val) = &res.val else { continue };
+        // Only infer at the top level when the target IS a JSON-building
+        // FuncCall. Bare column refs flow through the OID path in lib.rs.
+        let Some(node::Node::FuncCall(fc)) = val.node.as_ref() else { continue };
+        if let Some(ts) = infer_func(client, catalog, &alias_oids, fc).await {
+            out.by_target[i] = Some(ts);
         }
     }
     out
 }
-
-// ----- AST helpers -----
 
 fn find_top_select(p: &pg_query::protobuf::ParseResult) -> Option<&SelectStmt> {
     p.stmts.iter().find_map(|raw| match &raw.stmt.as_ref()?.node {
@@ -83,13 +55,9 @@ fn find_top_select(p: &pg_query::protobuf::ParseResult) -> Option<&SelectStmt> {
     })
 }
 
-/// Walk from_clause + JoinExpr trees, returning a map of alias → relation.
-/// `Relation` is `(schema, name)` with empty schema meaning unqualified.
 fn build_alias_map(from_clause: &[pg_query::protobuf::Node]) -> HashMap<String, (String, String)> {
     let mut out = HashMap::new();
-    for n in from_clause {
-        walk_from(n, &mut out);
-    }
+    for n in from_clause { walk_from(n, &mut out); }
     out
 }
 
@@ -97,24 +65,22 @@ fn walk_from(n: &pg_query::protobuf::Node, out: &mut HashMap<String, (String, St
     match n.node.as_ref() {
         Some(node::Node::RangeVar(rv)) => insert_rangevar(rv, out),
         Some(node::Node::JoinExpr(j)) => {
-            let j: &JoinExpr = j;
             if let Some(l) = &j.larg { walk_from(l, out); }
             if let Some(r) = &j.rarg { walk_from(r, out); }
         }
-        _ => { /* sub-selects etc. — skip */ }
+        _ => {}
     }
 }
 
 fn insert_rangevar(rv: &RangeVar, out: &mut HashMap<String, (String, String)>) {
-    let alias_name = rv.alias.as_ref().map(|a| a.aliasname.clone())
+    let alias = rv.alias.as_ref().map(|a| a.aliasname.clone())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| rv.relname.clone());
-    out.insert(alias_name, (rv.schemaname.clone(), rv.relname.clone()));
+    out.insert(alias, (rv.schemaname.clone(), rv.relname.clone()));
 }
 
 async fn resolve_alias_oids(
-    client: &Client,
-    alias_map: &HashMap<String, (String, String)>,
+    client: &Client, alias_map: &HashMap<String, (String, String)>,
 ) -> HashMap<String, u32> {
     let mut out = HashMap::new();
     if alias_map.is_empty() { return out; }
@@ -132,7 +98,7 @@ async fn resolve_alias_oids(
         &[&schemas, &names],
     ).await else { return out };
     let by_relname: HashMap<(String, String), u32> = rows.iter()
-        .map(|row| ((row.get::<_, String>(0), row.get::<_, String>(1)), row.get::<_, i64>(2) as u32))
+        .map(|row| ((row.get(0), row.get(1)), row.get::<_, i64>(2) as u32))
         .collect();
     for (alias, (s, n)) in alias_map {
         if let Some(&oid) = by_relname.get(&(schema_of(s), n.clone())) {
@@ -142,10 +108,9 @@ async fn resolve_alias_oids(
     out
 }
 
-// ----- Per-expression inference -----
+// ---------- Per-expression inference ----------
 
-/// Infer a TS type for a node. Returns `None` when we don't recognise the
-/// shape. Boxed because of recursion through async fn.
+/// Boxed for async recursion through `FuncCall` arguments.
 fn infer_node<'a>(
     client: &'a Client,
     catalog: &'a TypeCatalog,
@@ -157,24 +122,15 @@ fn infer_node<'a>(
             node::Node::FuncCall(fc) => infer_func(client, catalog, alias_oids, fc).await,
             node::Node::ColumnRef(cr) => infer_column_ref(client, catalog, alias_oids, cr).await,
             node::Node::AConst(c) => Some(infer_a_const(c)),
-            node::Node::TypeCast(tc) => infer_type_cast(client, catalog, alias_oids, tc).await,
-            // CASE, COALESCE, etc. — defer to caller (they'll get the OID
-            // type from RowDescription).
+            node::Node::TypeCast(tc) => infer_type_cast(catalog, tc),
             _ => None,
         }
     })
 }
 
-/// Resolve `expr::type` to the TS form of `type` — looks the name up
-/// in the catalog (handles domains, enums, composites) and falls back
-/// to the simple-name mapping for built-in types.
-async fn infer_type_cast(
-    client: &Client,
-    catalog: &TypeCatalog,
-    alias_oids: &HashMap<String, u32>,
-    tc: &pg_query::protobuf::TypeCast,
-) -> Option<String> {
-    let _ = (client, alias_oids); // not used yet — kept for future arg-aware casts
+/// `expr::T` → the catalog's render for `T` (handles domains, enums,
+/// composites; falls back to built-in name mapping).
+fn infer_type_cast(catalog: &TypeCatalog, tc: &pg_query::protobuf::TypeCast) -> Option<String> {
     let names: Vec<String> = tc.type_name.as_ref()?.names.iter()
         .filter_map(|n| match n.node.as_ref()? {
             node::Node::String(s) => Some(s.sval.clone()),
@@ -182,7 +138,7 @@ async fn infer_type_cast(
         })
         .collect();
     let name = names.last()?;
-    Some(catalog.render_oid(0, name, crate::ts_types::Direction::Read))
+    Some(catalog.render_oid(0, name, Direction::Read))
 }
 
 async fn infer_func(
@@ -191,30 +147,23 @@ async fn infer_func(
     alias_oids: &HashMap<String, u32>,
     fc: &FuncCall,
 ) -> Option<String> {
-    // Resolve the funcname to a *canonical* `pg_catalog` short name. Returns
-    // `None` for any function that isn't a verified built-in — we never want
-    // to apply the transform to a user-defined `public.jsonb_build_object`
-    // (or whatever name shadows the catalog one) and silently produce a
-    // structural type that no longer matches the runtime row.
+    // Resolve to a canonical pg_catalog short name — refuses user-defined
+    // shadows so we never produce a structural type that doesn't match
+    // the runtime row.
     let canonical = resolve_to_safe_builtin(catalog, fc)?;
     match canonical {
-        "jsonb_build_object" | "json_build_object" => {
-            infer_build_object(client, catalog, alias_oids, &fc.args).await
-        }
+        "jsonb_build_object" | "json_build_object" =>
+            infer_build_object(client, catalog, alias_oids, &fc.args).await,
         "jsonb_agg" | "json_agg" => {
             let arg = fc.args.first()?;
             let inner = infer_node(client, catalog, alias_oids, arg).await
                 .unwrap_or_else(|| "unknown".to_string());
             Some(format!("{}[]", inner))
         }
-        "to_jsonb" | "row_to_json" => {
-            infer_table_ref(client, catalog, alias_oids, fc.args.first()?).await
-        }
+        "to_jsonb" | "row_to_json" =>
+            infer_table_ref(client, catalog, alias_oids, fc.args.first()?).await,
         "jsonb_object_agg" | "json_object_agg" => {
-            // jsonb_object_agg(key, value) → Record<string, V>.
-            // Aggregates over (key, value) pairs and emits a JSON object.
-            let val_node = fc.args.get(1)?;
-            let val_ts = infer_node(client, catalog, alias_oids, val_node).await
+            let val_ts = infer_node(client, catalog, alias_oids, fc.args.get(1)?).await
                 .unwrap_or_else(|| "unknown".to_string());
             Some(format!("Record<string, {}>", val_ts))
         }
@@ -222,18 +171,14 @@ async fn infer_func(
     }
 }
 
+/// Look up the function's declared return type. Multiple overloads:
+/// take the first match by name (and schema if qualified). Function
+/// returns are nullable in PG — no signature-level NOT NULL.
 async fn infer_user_func_return(
-    client: &Client,
-    catalog: &TypeCatalog,
-    fc: &FuncCall,
+    client: &Client, catalog: &TypeCatalog, fc: &FuncCall,
 ) -> Option<String> {
     let names = funcname_parts(fc);
     let (schema, name) = funcname_split(&names)?;
-    // Look up the function's return type. There can be multiple
-    // overloads with different arg signatures; we take the first that
-    // matches by name (and schema, if qualified). Good enough for the
-    // structural shape — the runtime PARSE/DESCRIBE step already
-    // resolved the right overload for the outer column anyway.
     let row = client.query_opt(
         r#"
         SELECT t.oid::oid, t.typname
@@ -250,44 +195,26 @@ async fn infer_user_func_return(
     ).await.ok()??;
     let oid: u32 = row.get(0);
     let typname: String = row.get(1);
-    let base = catalog.render_oid(oid, &typname, crate::ts_types::Direction::Read);
-    // Function returns are nullable in PG (no signature-level NOT NULL
-    // guarantee).
+    let base = catalog.render_oid(oid, &typname, Direction::Read);
     Some(format!("{} | null", base))
 }
 
-/// Returns the canonical short name (e.g. `"jsonb_build_object"`) iff the
-/// `FuncCall` refers to the genuine `pg_catalog` function. Cases:
-///
-/// 1. Fully-qualified `pg_catalog.X` — trusted; just strip the schema.
-/// 2. Unqualified `X` — only accepted when the analyzer's connect-time probe
-///    confirmed that `to_regproc('X')` resolves to the catalog OID under
-///    the dev DB's `search_path` (no user-defined shadow). The set is in
-///    `catalog.safe_builtin_procs`.
-///
-/// All other forms (schema-qualified with a non-`pg_catalog` schema; an
-/// unqualified name that *is* shadowed) yield `None`, so inference falls
-/// through to the default `Json` rendering. Worst case: opaque jsonb; never
-/// a wrong structural type.
-fn resolve_to_safe_builtin<'c>(
-    catalog: &'c TypeCatalog,
-    fc: &FuncCall,
-) -> Option<&'c str> {
+/// Canonical `pg_catalog` short name iff `fc` refers to the verified
+/// builtin. Fully-qualified `pg_catalog.X` is trusted. Unqualified `X`
+/// is only accepted when the connect-time probe confirmed no
+/// user-defined shadow. Any other shape yields `None` and inference
+/// falls through to the default Json rendering — worst case opaque,
+/// never wrong.
+fn resolve_to_safe_builtin<'c>(catalog: &'c TypeCatalog, fc: &FuncCall) -> Option<&'c str> {
     let parts = funcname_parts(fc);
     let (schema, name) = funcname_split(&parts)?;
     match schema {
-        // Explicit pg_catalog qualification — always trusted.
-        // Unqualified — only safe if connect-time probe confirmed the
-        // name resolves to the catalog OID under the current search_path.
         Some("pg_catalog") | None =>
             Some(catalog.safe_builtin_procs.get_key_value(name)?.0.as_str()),
-        // Any other schema → user-defined; never apply the transform.
         Some(_) => None,
     }
 }
 
-/// Pull the string segments out of a `FuncCall.funcname` — typically
-/// `["pg_catalog", "jsonb_build_object"]` or just `["jsonb_build_object"]`.
 fn funcname_parts(fc: &FuncCall) -> Vec<String> {
     fc.funcname.iter()
         .filter_map(|n| match n.node.as_ref()? {
@@ -297,8 +224,6 @@ fn funcname_parts(fc: &FuncCall) -> Vec<String> {
         .collect()
 }
 
-/// `[name]` → `(None, name)`; `[schema, name]` → `(Some(schema), name)`;
-/// anything else → `None`.
 fn funcname_split(parts: &[String]) -> Option<(Option<&str>, &str)> {
     match parts {
         [name] => Some((None, name.as_str())),
@@ -308,42 +233,26 @@ fn funcname_split(parts: &[String]) -> Option<(Option<&str>, &str)> {
 }
 
 enum KeyKind {
-    /// String / integer literal key — known statically.
     Literal(String),
-    /// Anything else (column ref, function call, …) — value not
-    /// known at type-check time.
     Dynamic,
 }
 
+/// `jsonb_build_object(k1, v1, k2, v2, …)` →
+///   - All literal keys           → `{ k1: V1; k2: V2; … }`
+///   - Mixed with literal keys after all dynamic ones →
+///     `{ [k: string]: V; k1: T1; … }` (literal fields survive PG's
+///     last-occurrence-wins semantics).
+///   - Literal preceding dynamic → `Record<string, V>` (literal could
+///     be overwritten).
 async fn infer_build_object(
-    client: &Client,
-    catalog: &TypeCatalog,
-    alias_oids: &HashMap<String, u32>,
-    args: &[pg_query::protobuf::Node],
+    client: &Client, catalog: &TypeCatalog,
+    alias_oids: &HashMap<String, u32>, args: &[pg_query::protobuf::Node],
 ) -> Option<String> {
-    if args.is_empty() || !args.len().is_multiple_of(2) {
-        return None;
-    }
-
-    // Walk every (key, value) pair, in source order. Three cases:
-    //
-    //   1. Every key is a literal → emit a structural object
-    //      `{ k1: V1; k2: V2; … }`.
-    //   2. Mixed dynamic + literal keys where every literal key comes
-    //      *after* all dynamic keys → emit `{ [k: string]: V; k1: T1; … }`
-    //      (literal fields are guaranteed because `jsonb_build_object`'s
-    //      last-occurrence-wins semantics would have a dynamic
-    //      collision *before* the literal, so the literal always
-    //      survives).
-    //   3. Any literal key precedes a dynamic key → collapse to
-    //      `Record<string, V>` (the literal could be overwritten by a
-    //      same-named dynamic entry).
+    if args.is_empty() || !args.len().is_multiple_of(2) { return None; }
     let mut pairs: Vec<(KeyKind, String)> = Vec::with_capacity(args.len() / 2);
     let mut i = 0;
     while i < args.len() {
-        let key_node = &args[i];
-        let val_node = &args[i + 1];
-        let key_lit: Option<String> = match key_node.node.as_ref() {
+        let key_lit = match args[i].node.as_ref() {
             Some(node::Node::AConst(c)) => match c.val.as_ref() {
                 Some(pg_query::protobuf::a_const::Val::Sval(s)) => Some(s.sval.clone()),
                 Some(pg_query::protobuf::a_const::Val::Ival(v)) => Some(v.ival.to_string()),
@@ -351,29 +260,21 @@ async fn infer_build_object(
             },
             _ => None,
         };
-        // Inside `jsonb_build_object`'s value position we additionally
-        // try `pg_proc`'s declared return type for user-defined function
-        // calls — so `'k', billing.workspace_revenue_cents(w.id)` lands
-        // as the function's `money_cents` (= `string | null`) rather
-        // than `unknown`. Top-level calls (e.g. bare `count(*)`) bypass
-        // this — they already get a proper type from RowDescription
-        // and the function's `prorettype` would mis-report nullability.
+        // In value position, fall back to `pg_proc.prorettype` for
+        // user-defined function calls so `'k', my_func(...)` lands as
+        // the function's declared return type (nullable) rather than
+        // `unknown`.
+        let val_node = &args[i + 1];
         let val_ts = match infer_node(client, catalog, alias_oids, val_node).await {
             Some(t) => t,
-            None => {
-                if let Some(node::Node::FuncCall(fc)) = val_node.node.as_ref() {
+            None => match val_node.node.as_ref() {
+                Some(node::Node::FuncCall(fc)) =>
                     infer_user_func_return(client, catalog, fc).await
-                        .unwrap_or_else(|| "unknown".to_string())
-                } else {
-                    "unknown".to_string()
-                }
+                        .unwrap_or_else(|| "unknown".to_string()),
+                _ => "unknown".to_string(),
             }
         };
-        let kind = match key_lit {
-            Some(k) => KeyKind::Literal(k),
-            None => KeyKind::Dynamic,
-        };
-        pairs.push((kind, val_ts));
+        pairs.push((key_lit.map(KeyKind::Literal).unwrap_or(KeyKind::Dynamic), val_ts));
         i += 2;
     }
     let any_dynamic = pairs.iter().any(|(k, _)| matches!(k, KeyKind::Dynamic));
@@ -389,10 +290,8 @@ async fn infer_build_object(
         return Some(format!("{{ {} }}", body.join("; ")));
     }
 
-    // Dynamic args are the union's "broad" case (any key may map there),
-    // constants are narrow / specific; putting the broad arm first makes
-    // the rendered TS read naturally:
-    //   `Record<string, string | "owner" | "admin">`.
+    // Broad case (dynamic) first, narrow constants after — reads
+    // naturally: `Record<string, string | "owner" | "admin">`.
     let dedup_union = |groups: &[&[&str]]| -> String {
         let mut seen = std::collections::BTreeSet::new();
         let mut out: Vec<String> = Vec::new();
@@ -412,9 +311,6 @@ async fn infer_build_object(
         .is_some_and(|idx| pairs[..=idx].iter().all(|(k, _)| matches!(k, KeyKind::Dynamic)));
 
     if constants_all_last {
-        // `{ [k: string]: V; const1: T1; … }`. The index-signature value
-        // type is the dynamic args' deduped union; the named fields are
-        // the trailing constant pairs.
         let mut body = vec![format!("[k: string]: {}", dedup_union(&[&dyn_vals]))];
         for (k, v) in &pairs {
             if let KeyKind::Literal(name) = k {
@@ -423,42 +319,30 @@ async fn infer_build_object(
         }
         return Some(format!("{{ {} }}", body.join("; ")));
     }
-
     Some(format!("Record<string, {}>", dedup_union(&[&dyn_vals, &lit_vals])))
 }
 
 async fn infer_column_ref(
-    client: &Client,
-    catalog: &TypeCatalog,
-    alias_oids: &HashMap<String, u32>,
-    cr: &pg_query::protobuf::ColumnRef,
+    client: &Client, catalog: &TypeCatalog,
+    alias_oids: &HashMap<String, u32>, cr: &pg_query::protobuf::ColumnRef,
 ) -> Option<String> {
-    let parts: Vec<String> = cr.fields.iter().filter_map(|n| {
-        match n.node.as_ref()? {
-            node::Node::String(s) => Some(s.sval.clone()),
-            _ => None,
-        }
+    let parts: Vec<String> = cr.fields.iter().filter_map(|n| match n.node.as_ref()? {
+        node::Node::String(s) => Some(s.sval.clone()),
+        _ => None,
     }).collect();
-    if parts.is_empty() { return None; }
-
-    let (alias, col) = if parts.len() == 1 {
-        // Bare column — we don't know which table it's from without resolution.
-        // Fall back to unknown; caller can override.
-        return None;
-    } else if parts.len() == 2 {
-        (parts[0].clone(), parts[1].clone())
-    } else {
-        // schema.table.col → use last two
-        let n = parts.len();
-        (parts[n - 2].clone(), parts[n - 1].clone())
+    let (alias, col) = match parts.as_slice() {
+        // Bare column — unknown which table.
+        [_] => return None,
+        [a, c] => (a.clone(), c.clone()),
+        [_, .., a, c] => (a.clone(), c.clone()),
+        _ => return None,
     };
-
     let table_oid = *alias_oids.get(&alias)?;
     column_type(client, catalog, table_oid, &col).await
 }
 
-/// Fetch (attname, oid, notnull, typname) for a single column or every
-/// column of `table_oid` (when `col` is None, ordered by attnum).
+/// Fetch `(attname, oid, notnull, typname)` for one column or every
+/// column of `table_oid` (ordered by attnum when `col` is `None`).
 async fn fetch_attrs(
     client: &Client, table_oid: u32, col: Option<&str>,
 ) -> Vec<(String, u32, bool, String)> {
@@ -497,15 +381,10 @@ async fn column_type(client: &Client, catalog: &TypeCatalog, table_oid: u32, col
 }
 
 async fn infer_table_ref(
-    client: &Client,
-    catalog: &TypeCatalog,
-    alias_oids: &HashMap<String, u32>,
-    arg: &pg_query::protobuf::Node,
+    client: &Client, catalog: &TypeCatalog,
+    alias_oids: &HashMap<String, u32>, arg: &pg_query::protobuf::Node,
 ) -> Option<String> {
-    let cr = match arg.node.as_ref()? {
-        node::Node::ColumnRef(c) => c,
-        _ => return None,
-    };
+    let node::Node::ColumnRef(cr) = arg.node.as_ref()? else { return None };
     let parts: Vec<String> = cr.fields.iter().filter_map(|n| match n.node.as_ref()? {
         node::Node::String(s) => Some(s.sval.clone()),
         _ => None,
@@ -522,9 +401,7 @@ async fn infer_table_ref(
 
 fn infer_a_const(c: &pg_query::protobuf::AConst) -> String {
     use pg_query::protobuf::a_const::Val;
-    if c.isnull {
-        return "null".to_string();
-    }
+    if c.isnull { return "null".to_string(); }
     match c.val.as_ref() {
         Some(Val::Ival(_)) | Some(Val::Fval(_)) => "number".to_string(),
         Some(Val::Sval(_)) => "string".to_string(),

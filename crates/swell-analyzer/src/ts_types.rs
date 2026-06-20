@@ -1,69 +1,45 @@
-//! Postgres `Type` → TypeScript type-string mapping.
-//!
-//! The TS type strings produced here are emitted verbatim into the generated
-//! `.d.ts`. They reflect what the `postgres` (postgres.js) driver actually
-//! returns for each PG type by default:
-//!   - bigint (int8) → `string` (postgres.js stringifies to avoid JS number loss)
-//!   - timestamp / timestamptz → `Date`
-//!   - bytea → `Uint8Array`
-//!   - jsonb / json → `Json` (recursive structural alias). Accessing fields
-//!     requires runtime narrowing; M7's AST-driven shape inference will
-//!     produce concrete row shapes for jsonb literals where possible.
-//!   - enum → `"a" | "b" | ...`
-//!   - array → `T[]`
-//!   - domain → underlying base type
-//!   - composite → `{ field: T; ... }`
-//!   - unknown / pseudo → `unknown`
-//!
-//! User overrides (config, alias `as "col: T"`) plug in higher up the pipeline.
+//! Postgres `Type` → TypeScript type-string mapping. Mirrors what
+//! postgres.js returns by default: int8/numeric/text → `string`,
+//! timestamp{tz} → `Date`, bytea → `Uint8Array`, json{b} → `Json`,
+//! enum → `"a" | "b" | ...`, domain → base, composite → struct,
+//! array → `T[]`, pseudo → `unknown`.
 
 use postgres_types::{Kind, Type};
 use std::collections::BTreeMap;
 
-/// Whether a type is being rendered for a read position (row column, table
-/// interface, json-shape inference) or a write position (query param).
-///
-/// Drivers like node-pg can register parsers but not serializers, so the
-/// read and write shapes for a given PG type can diverge: a `date` column
-/// is read back as `Spacetime` (the parser's output) but accepted on
-/// write as anything node-pg's encoder handles (`Date | string`).
+/// Read (row column, table interface, json shape) vs write (query
+/// param). Drivers can register parse and serialize side independently
+/// — e.g. `date` reads as `Spacetime` but writes as `Date | string`.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum Direction { Read, Write }
 
-/// Per-PG-type override. `parse` is used in read positions, `serialize` in
-/// write positions. A bare string in TOML deserializes to both being equal.
+/// Per-type override. Bare string in TOML deserializes both fields
+/// equal; `{ parse, serialize }` lets them diverge.
 #[derive(Debug, Clone)]
 pub struct TypeOverride {
     pub parse: String,
     pub serialize: String,
 }
 
-/// Per-database lookups gathered from `pg_catalog` ahead of type rendering.
-/// Built once per analyzer connection then reused for every query.
+/// `pg_catalog` info gathered at connect time, reused per query.
 #[derive(Debug, Clone, Default)]
 pub struct TypeCatalog {
-    /// enum OID → ordered labels
     pub enums: BTreeMap<u32, Vec<String>>,
-    /// domain OID → (base type OID, base type name) — keep the name so that
-    /// recursing through a domain resolves to the right TS scalar.
+    /// domain OID → (base OID, base typname). Keeping the typname lets
+    /// us resolve the right TS scalar when recursing through a domain.
     pub domains: BTreeMap<u32, (u32, String)>,
-    /// composite type OID → list of (field_name, field_type_oid, field_type_name).
-    /// `field_type_name` is the `pg_type.typname` for the field's type, so
-    /// `render_oid` can map it to a TS type even when postgres-types
-    /// hasn't seen the OID (which happens for user-defined element types).
+    /// composite OID → `[(name, field_typoid, field_typname), …]`.
     pub composites: BTreeMap<u32, Vec<(String, u32, String)>>,
-    /// range / multirange OID → element type OID (and its name)
+    /// range / multirange OID → (element OID, name).
     pub ranges: BTreeMap<u32, (u32, String)>,
-    /// array OID → element type OID (and its name) — covers user-defined
-    /// arrays we wouldn't otherwise resolve via postgres-types.
+    /// User-defined array OID → (element OID, name). Built-ins flow
+    /// through `Type::Kind::Array(_)` automatically.
     pub arrays: BTreeMap<u32, (u32, String)>,
-    /// User-supplied per-PG-type overrides keyed by PG type name (e.g. "jsonb").
+    /// Per-PG-typname overrides (`"jsonb" → …`).
     pub by_name: BTreeMap<String, TypeOverride>,
-    /// Unqualified built-in proname → canonical `pg_catalog` proc OID, *only*
-    /// populated when the analyzer has verified at connect-time that the
-    /// name resolves to the catalog version under the current `search_path`
-    /// (i.e. no user-defined shadow). Used by the JSON shape inference to
-    /// avoid treating a user-shadowed `jsonb_build_object` as the built-in.
+    /// Unqualified builtin proname → canonical `pg_catalog` OID, only
+    /// when the connect-time probe confirmed no user-defined shadow in
+    /// the current `search_path`. Consumed by json_shape inference.
     pub safe_builtin_procs: BTreeMap<String, u32>,
 }
 
@@ -75,16 +51,10 @@ impl TypeCatalog {
         })
     }
 
-    /// Render a Postgres type as a TypeScript type-string.
     pub fn render(&self, t: &Type, dir: Direction) -> String {
-        // 1. user override by PG type name wins
-        if let Some(over) = self.override_for(t.name(), dir) {
-            return over.to_string();
-        }
-        // 2. structural cases. For user types the postgres-types crate
-        //    sees opaque OIDs, so route through render_oid to pick up the
-        //    catalog (enum labels, domain bases, composite fields,
-        //    range elements, custom arrays).
+        if let Some(over) = self.override_for(t.name(), dir) { return over.to_string(); }
+        // For user types `postgres-types` sees opaque OIDs — route
+        // through `render_oid` to pick up catalog info.
         match t.kind() {
             Kind::Simple => {
                 if self.enums.contains_key(&t.oid())
@@ -120,27 +90,17 @@ impl TypeCatalog {
         }
     }
 
-    /// Lookup by raw OID, going through the catalog for user-defined types
-    /// that the postgres-types crate doesn't carry full info on. Falls back to
-    /// the bare name if all else fails.
+    /// OID lookup through the catalog for user-defined types.
     pub fn render_oid(&self, oid: u32, name: &str, dir: Direction) -> String {
-        // user override
-        if let Some(over) = self.override_for(name, dir) {
-            return over.to_string();
-        }
+        if let Some(over) = self.override_for(name, dir) { return over.to_string(); }
         if let Some(labels) = self.enums.get(&oid) {
-            if labels.is_empty() {
-                return "string".into();
-            }
-            return enum_union(labels);
+            return if labels.is_empty() { "string".into() } else { enum_union(labels) };
         }
         if let Some((base_oid, base_name)) = self.domains.get(&oid) {
             return self.render_oid(*base_oid, base_name, dir);
         }
         if let Some(fields) = self.composites.get(&oid) {
-            // Composite attributes are always nullable in Postgres
-            // (there's no NOT NULL on composite-type attributes), so
-            // each field renders as `<ts> | null`.
+            // PG composite attributes are always nullable.
             let inner: Vec<String> = fields.iter()
                 .map(|(n, t_oid, t_name)| {
                     let ts = self.render_oid(*t_oid, t_name, dir);
@@ -159,11 +119,10 @@ impl TypeCatalog {
         }
         simple_name_to_ts(name).to_string()
     }
-
 }
 
+/// Mirrors postgres.js default decoding.
 fn simple_name_to_ts(name: &str) -> &'static str {
-    // Mapping mirrors postgres.js default decoding behaviour.
     match name {
         "bool" => "boolean",
         "int2" | "int4" | "float4" | "float8" => "number",
@@ -174,7 +133,6 @@ fn simple_name_to_ts(name: &str) -> &'static str {
         "date" | "timestamp" | "timestamptz" => "Date",
         "json" | "jsonb" => "Json",
         "void" => "void",
-        // Vector / extension types we don't auto-detect
         _ => "unknown",
     }
 }
@@ -186,8 +144,7 @@ fn enum_union(labels: &[String]) -> String {
         .join(" | ")
 }
 
-/// `T | null` becomes `(T | null)[]` when written as an array — without
-/// parens TS would parse it as `T | null[]`.
+/// `T | null` arrays need parens: `(T | null)[]` not `T | null[]`.
 fn maybe_paren_for_array(inner: &str) -> String {
     let needs_paren = inner.contains(" | ")
         || inner.contains(" & ")

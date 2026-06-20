@@ -37,9 +37,8 @@ pub struct Scan {
     pub include: Vec<String>,
     #[serde(default = "default_exclude")]
     pub exclude: Vec<String>,
-    /// Modules (in addition to `"swell"`) that re-export `q`. The default
-    /// covers the per-package codegen output at the usual import depths.
-    /// Override only if your project's layout doesn't fit.
+    /// Modules (besides `@dialo/swell`) that re-export `q`. Defaults
+    /// cover the per-package codegen output.
     #[serde(default = "default_q_modules")]
     pub q_modules: Vec<String>,
 }
@@ -71,11 +70,9 @@ pub struct Output {
     pub file: PathBuf,
     #[serde(default = "default_pretty")]
     pub pretty: bool,
-    /// Extra `import type { ... } from "..."` lines injected at the top
-    /// of the generated file. Use when a per-column override
-    /// (`AS "col!: Foo"` or `[[types.column]]` with `ts = "Foo"`)
-    /// references a project-local type swell would otherwise emit as
-    /// an undefined name.
+    /// Extra `import type { ... }` lines injected at the top of the
+    /// generated file (for per-column overrides that reference
+    /// project-local types).
     #[serde(default)]
     pub imports: Vec<ImportSpec>,
 }
@@ -129,16 +126,11 @@ pub enum OnError { Skip, Fail }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Types {
-    /// Per-OID overrides keyed by Postgres type name (e.g. "jsonb" -> "Json").
-    ///
-    /// Each entry is either a bare string (used for both parse and serialize
-    /// positions) or an inline table `{ parse = "...", serialize = "..." }`.
-    /// The split form is for drivers that only let you register parsers
-    /// (node-pg) — the read shape is what your parser returns, the write
-    /// shape is whatever the driver's default encoder accepts.
+    /// Per-typname overrides. Each entry is either a bare string (both
+    /// parse + serialize) or `{ parse, serialize }` for drivers like
+    /// node-pg where the two directions diverge.
     #[serde(default)]
     pub by_name: std::collections::BTreeMap<String, TypeOverride>,
-    /// Per-column overrides.
     #[serde(default)]
     pub column: Vec<ColumnOverride>,
 }
@@ -151,18 +143,8 @@ pub enum TypeOverride {
 }
 
 impl TypeOverride {
-    pub fn parse(&self) -> &str {
-        match self {
-            Self::Both(s) => s,
-            Self::Split { parse, .. } => parse,
-        }
-    }
-    pub fn serialize(&self) -> &str {
-        match self {
-            Self::Both(s) => s,
-            Self::Split { serialize, .. } => serialize,
-        }
-    }
+    pub fn parse(&self) -> &str { match self { Self::Both(s) | Self::Split { parse: s, .. } => s } }
+    pub fn serialize(&self) -> &str { match self { Self::Both(s) | Self::Split { serialize: s, .. } => s } }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1,13 +1,7 @@
-//! Content-addressed analyzer cache.
-//!
-//! Layout: `<cache_dir>/<sha256(sql)>.json`. Each file holds one
-//! `CacheEntry` with the inferred query plus the schema fingerprint and
-//! tool version that produced it. Online runs check the fingerprint and
-//! re-analyse stale entries; offline (`swell check`) trusts the file as
-//! committed.
-//!
-//! Layout matches SQLx's `.sqlx/` philosophy — the cache is committed so CI
-//! can run offline.
+//! Content-addressed analyzer cache: `<cache_dir>/<sha256(sql)>.json`.
+//! Online runs check `schema_fingerprint` + `tool_version` and
+//! re-analyse stale entries; `swell check` trusts the file as
+//! committed (CI / offline mode, à la SQLx's `.sqlx/`).
 
 use anyhow::{Context, Result};
 use swell_analyzer::InferredQuery;
