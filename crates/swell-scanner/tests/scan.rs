@@ -1,11 +1,13 @@
-use swell_scanner::{scan_file, ScanOptions};
 use std::path::Path;
+use swell_scanner::{scan_file, ScanOptions};
 
 fn scan(src: &str) -> Vec<swell_scanner::ScannedQuery> {
     scan_file(
         Path::new("test.ts"),
         src,
-        ScanOptions { q_modules: &["./swell.generated"] },
+        ScanOptions {
+            q_modules: &["./swell.generated"],
+        },
     )
     .expect("scan ok")
 }
@@ -108,7 +110,11 @@ fn template_literal_with_interpolation_skipped() {
         q(`SELECT ${id} FROM t`);
     "#;
     let qs = scan(src);
-    assert!(qs.is_empty(), "interpolated template literal should be skipped, got {:?}", qs);
+    assert!(
+        qs.is_empty(),
+        "interpolated template literal should be skipped, got {:?}",
+        qs
+    );
 }
 
 #[test]

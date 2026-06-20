@@ -32,7 +32,9 @@ pub struct InferredParam {
     pub table_ref: Option<TableColRef>,
 }
 
-fn default_nullable() -> bool { true }
+fn default_nullable() -> bool {
+    true
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InferredColumn {

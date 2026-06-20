@@ -16,14 +16,22 @@ pub(crate) fn collect(
     opts: &ScanOptions<'_>,
     out: &mut Vec<ScannedQuery>,
 ) {
-    let mut binders = ImportBinders { opts, locals: HashSet::new() };
+    let mut binders = ImportBinders {
+        opts,
+        locals: HashSet::new(),
+    };
     module.visit_with(&mut binders);
 
     if binders.locals.is_empty() {
         return;
     }
 
-    let mut collector = CallCollector { cm, path, locals: &binders.locals, out };
+    let mut collector = CallCollector {
+        cm,
+        path,
+        locals: &binders.locals,
+        out,
+    };
     module.visit_with(&mut collector);
 }
 
@@ -36,15 +44,20 @@ struct ImportBinders<'a> {
 impl<'a> Visit for ImportBinders<'a> {
     fn visit_import_decl(&mut self, n: &ImportDecl) {
         let raw = String::from_utf8_lossy(n.src.value.as_bytes());
-        let from_q_source = raw == "@dialo/swell"
-            || self.opts.q_modules.iter().any(|m| *m == raw.as_ref());
-        if !from_q_source { return; }
+        let from_q_source =
+            raw == "@dialo/swell" || self.opts.q_modules.iter().any(|m| *m == raw.as_ref());
+        if !from_q_source {
+            return;
+        }
         for spec in &n.specifiers {
-            let ImportSpecifier::Named(named) = spec else { continue };
+            let ImportSpecifier::Named(named) = spec else {
+                continue;
+            };
             let imported = match &named.imported {
                 Some(ModuleExportName::Ident(id)) => id.sym.to_string(),
-                Some(ModuleExportName::Str(s)) =>
-                    String::from_utf8_lossy(s.value.as_bytes()).into_owned(),
+                Some(ModuleExportName::Str(s)) => {
+                    String::from_utf8_lossy(s.value.as_bytes()).into_owned()
+                }
                 None => named.local.sym.to_string(),
             };
             if imported == "q" {
@@ -86,7 +99,9 @@ impl<'a> Visit for CallCollector<'a> {
 
 fn first_arg_as_static_string(arg: Option<&ExprOrSpread>) -> Option<String> {
     let arg = arg?;
-    if arg.spread.is_some() { return None; }
+    if arg.spread.is_some() {
+        return None;
+    }
     match &*arg.expr {
         Expr::Lit(Lit::Str(s)) => Some(String::from_utf8_lossy(s.value.as_bytes()).into_owned()),
         Expr::Tpl(t) if t.exprs.is_empty() && t.quasis.len() == 1 => {

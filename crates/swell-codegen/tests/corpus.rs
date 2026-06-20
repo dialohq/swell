@@ -57,8 +57,7 @@ async fn corpus() {
         .collect();
     assert!(!files.is_empty(), "no .md suites under {}", root.display());
 
-    let url = std::env::var("DATABASE_URL")
-        .expect("DATABASE_URL must point at a dev Postgres");
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must point at a dev Postgres");
 
     let mut failures: Vec<String> = Vec::new();
     let mut promotions: Vec<PathBuf> = Vec::new();
@@ -95,11 +94,12 @@ enum SuiteOutcome {
 }
 
 async fn run_suite(path: &Path, url: &str) -> Result<SuiteOutcome, String> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    let text =
+        std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let mut suite = parse_suite(&text, path)?;
 
-    apply_sql(url, &suite.setup_sql).await
+    apply_sql(url, &suite.setup_sql)
+        .await
         .map_err(|e| format!("apply setup: {e}"))?;
 
     let an = Analyzer::connect(AnalyzerOptions {
@@ -138,7 +138,9 @@ async fn run_suite(path: &Path, url: &str) -> Result<SuiteOutcome, String> {
         }
     }
     let pairs: Vec<(String, String)> = pair_set.into_iter().collect();
-    let tables = an.table_schemas(&pairs).await
+    let tables = an
+        .table_schemas(&pairs)
+        .await
         .map_err(|e| format!("table_schemas: {e}"))?;
 
     let actual_common = render_table_interfaces(&tables);
@@ -161,7 +163,8 @@ async fn run_suite(path: &Path, url: &str) -> Result<SuiteOutcome, String> {
     }
     for (i, test) in suite.tests.iter().enumerate() {
         if test.expected_is_error() {
-            let needle = test.expected
+            let needle = test
+                .expected
                 .trim()
                 .strip_prefix("error:")
                 .unwrap_or("")
@@ -200,8 +203,7 @@ async fn run_suite(path: &Path, url: &str) -> Result<SuiteOutcome, String> {
             }
         }
         let rewritten = rewrite_suite(&text, &suite);
-        std::fs::write(path, rewritten)
-            .map_err(|e| format!("write for promote: {e}"))?;
+        std::fs::write(path, rewritten).map_err(|e| format!("write for promote: {e}"))?;
         return Ok(SuiteOutcome::Promoted);
     }
     Err(format!(
@@ -246,9 +248,19 @@ struct PartialTest {
 impl PartialTest {
     fn flush_into(&mut self, into: &mut Vec<TestCase>) {
         if let Some(name) = self.name.take() {
-            let sql = self.sqls.first().cloned().unwrap_or_default().trim().to_string();
+            let sql = self
+                .sqls
+                .first()
+                .cloned()
+                .unwrap_or_default()
+                .trim()
+                .to_string();
             let expected = self.expecteds.first().cloned().unwrap_or_default();
-            into.push(TestCase { name, sql, expected });
+            into.push(TestCase {
+                name,
+                sql,
+                expected,
+            });
         }
         self.sqls.clear();
         self.expecteds.clear();
@@ -256,7 +268,12 @@ impl PartialTest {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Section { None, Setup, CommonTypes, Tests }
+enum Section {
+    None,
+    Setup,
+    CommonTypes,
+    Tests,
+}
 
 /// Parse the suite via pulldown-cmark events. Headings drive section
 /// transitions; fenced code blocks attach to whichever section / test
@@ -280,7 +297,10 @@ fn parse_suite(text: &str, path: &Path) -> Result<Suite, String> {
 
     for event in parser {
         match event {
-            Event::Start(Tag::Heading { level: HeadingLevel::H1, .. }) => {
+            Event::Start(Tag::Heading {
+                level: HeadingLevel::H1,
+                ..
+            }) => {
                 cur.flush_into(&mut tests);
                 in_h1 = true;
                 h1_text.clear();
@@ -302,7 +322,10 @@ fn parse_suite(text: &str, path: &Path) -> Result<Suite, String> {
                     Section::None
                 };
             }
-            Event::Start(Tag::Heading { level: HeadingLevel::H2, .. }) if section == Section::Tests => {
+            Event::Start(Tag::Heading {
+                level: HeadingLevel::H2,
+                ..
+            }) if section == Section::Tests => {
                 cur.flush_into(&mut tests);
                 in_h2 = true;
                 h2_text.clear();
@@ -345,19 +368,28 @@ fn parse_suite(text: &str, path: &Path) -> Result<Suite, String> {
         setup_inline.join("\n")
     };
     let common_types = common_types.join("");
-    let schemas = read_schema_list(path.parent().unwrap())
-        .unwrap_or_else(|| vec!["public".into()]);
-    Ok(Suite { setup_sql, schemas, common_types, tests })
+    let schemas = read_schema_list(path.parent().unwrap()).unwrap_or_else(|| vec!["public".into()]);
+    Ok(Suite {
+        setup_sql,
+        schemas,
+        common_types,
+        tests,
+    })
 }
 
 fn read_schema_list(dir: &Path) -> Option<Vec<String>> {
     let path = dir.join("_schemas.txt");
     let text = std::fs::read_to_string(path).ok()?;
-    let names: Vec<String> = text.lines()
+    let names: Vec<String> = text
+        .lines()
         .map(|l| l.trim().to_string())
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
         .collect();
-    if names.is_empty() { None } else { Some(names) }
+    if names.is_empty() {
+        None
+    } else {
+        Some(names)
+    }
 }
 
 fn sorted_files_with_ext(dir: &Path, ext: &str) -> Vec<PathBuf> {
@@ -375,12 +407,15 @@ async fn apply_sql(url: &str, sql: &str) -> Result<(), String> {
     if sql.trim().is_empty() {
         return Ok(());
     }
-    let (client, conn) = tokio_postgres::connect(url, tokio_postgres::NoTls).await
+    let (client, conn) = tokio_postgres::connect(url, tokio_postgres::NoTls)
+        .await
         .map_err(|e| format!("connect: {e}"))?;
     let h = tokio::spawn(async move {
         let _ = conn.await;
     });
-    let res = client.batch_execute(sql).await
+    let res = client
+        .batch_execute(sql)
+        .await
         .map_err(|e| format!("batch_execute: {e}"));
     drop(client);
     let _ = h.await;
@@ -411,13 +446,15 @@ fn rewrite_suite(original: &str, suite: &Suite) -> String {
                 ""
             };
             current_test = None;
-            out.push_str(line); out.push('\n');
+            out.push_str(line);
+            out.push('\n');
             continue;
         }
         if section == "tests" {
             if let Some(rest) = line.strip_prefix("## ") {
                 current_test = Some(rest.trim().to_string());
-                out.push_str(line); out.push('\n');
+                out.push_str(line);
+                out.push('\n');
                 continue;
             }
         }
@@ -431,7 +468,8 @@ fn rewrite_suite(original: &str, suite: &Suite) -> String {
             } else if section == "common-types" {
                 Some(&suite.common_types)
             } else if section == "tests" {
-                current_test.as_ref()
+                current_test
+                    .as_ref()
                     .and_then(|n| suite.tests.iter().find(|t| &t.name == n))
                     .filter(|t| !t.expected_is_error())
                     .map(|t| t.expected.as_str())
@@ -439,11 +477,14 @@ fn rewrite_suite(original: &str, suite: &Suite) -> String {
                 None
             };
             if let Some(body) = replacement {
-                out.push_str(line); out.push('\n');
+                out.push_str(line);
+                out.push('\n');
                 for inner in lines.by_ref() {
                     if inner.trim_start().starts_with("```") {
                         out.push_str(body);
-                        if !body.ends_with('\n') { out.push('\n'); }
+                        if !body.ends_with('\n') {
+                            out.push('\n');
+                        }
                         out.push_str(inner);
                         out.push('\n');
                         break;
@@ -452,7 +493,8 @@ fn rewrite_suite(original: &str, suite: &Suite) -> String {
                 continue;
             }
         }
-        out.push_str(line); out.push('\n');
+        out.push_str(line);
+        out.push('\n');
     }
     out
 }
@@ -469,11 +511,13 @@ fn diff_unified(expected: &str, actual: &str) -> String {
                 let sign = match change.tag() {
                     ChangeTag::Delete => '-',
                     ChangeTag::Insert => '+',
-                    ChangeTag::Equal  => ' ',
+                    ChangeTag::Equal => ' ',
                 };
                 out.push(sign);
                 out.push_str(change.value());
-                if !out.ends_with('\n') { out.push('\n'); }
+                if !out.ends_with('\n') {
+                    out.push('\n');
+                }
             }
         }
     }

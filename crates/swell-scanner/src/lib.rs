@@ -10,7 +10,7 @@ mod visit;
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use swc_core::common::{sync::Lrc, FileName, SourceMap, GLOBALS, Globals};
+use swc_core::common::{sync::Lrc, FileName, Globals, SourceMap, GLOBALS};
 use swc_core::ecma::ast::{EsVersion, Module};
 use swc_core::ecma::parser::{lexer::Lexer, Parser, StringInput, Syntax, TsSyntax};
 
@@ -36,7 +36,11 @@ pub struct ScanOptions<'a> {
 }
 
 /// Scan a single TS/TSX file. Returns one `ScannedQuery` per call site.
-pub fn scan_file(path: &Path, src: &str, opts: ScanOptions<'_>) -> anyhow::Result<Vec<ScannedQuery>> {
+pub fn scan_file(
+    path: &Path,
+    src: &str,
+    opts: ScanOptions<'_>,
+) -> anyhow::Result<Vec<ScannedQuery>> {
     let cm: Lrc<SourceMap> = Default::default();
     let file = cm.new_source_file(
         Lrc::new(FileName::Real(path.to_path_buf())),
@@ -52,7 +56,8 @@ pub fn scan_file(path: &Path, src: &str, opts: ScanOptions<'_>) -> anyhow::Resul
     let lexer = Lexer::new(syntax, EsVersion::EsNext, StringInput::from(&*file), None);
     let mut parser = Parser::new_from(lexer);
 
-    let module: Module = GLOBALS.set(&Globals::new(), || parser.parse_module())
+    let module: Module = GLOBALS
+        .set(&Globals::new(), || parser.parse_module())
         .map_err(|e| anyhow::anyhow!("parse error in {}: {:?}", path.display(), e))?;
 
     let mut out = Vec::new();

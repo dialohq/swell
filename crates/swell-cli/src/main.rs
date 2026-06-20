@@ -7,7 +7,10 @@ mod commands;
 mod config;
 
 #[derive(Parser)]
-#[command(name = "swell", about = "Static type-checking for inline Postgres queries in TypeScript")]
+#[command(
+    name = "swell",
+    about = "Static type-checking for inline Postgres queries in TypeScript"
+)]
 struct Cli {
     /// Path to swell.toml. Defaults to ./swell.toml.
     #[arg(short, long, global = true)]
@@ -32,8 +35,10 @@ enum Cmd {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| "swell=info".into()))
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "swell=info".into()),
+        )
         .init();
 
     let cli = Cli::parse();
@@ -41,9 +46,9 @@ async fn main() -> Result<()> {
     let cfg = config::load(&config_path)?;
 
     match cli.cmd {
-        Cmd::Gen     => commands::gen(&cfg).await,
-        Cmd::Watch   => commands::watch(&cfg).await,
-        Cmd::Check   => commands::check(&cfg).await,
+        Cmd::Gen => commands::gen(&cfg).await,
+        Cmd::Watch => commands::watch(&cfg).await,
+        Cmd::Check => commands::check(&cfg).await,
         Cmd::Prepare => commands::prepare(&cfg).await,
     }
 }
