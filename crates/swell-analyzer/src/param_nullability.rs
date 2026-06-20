@@ -6,7 +6,7 @@
 //! `coalesce($1, …)`) keep the param nullable since callers can
 //! legitimately pass NULL there.
 
-use crate::pg_util::norm_schema;
+use crate::pg_util::{norm_schema, restarget_val};
 use crate::query::TableColRef;
 use pg_query::protobuf::{node, InsertStmt, UpdateStmt};
 use std::collections::{HashMap, HashSet};
@@ -189,8 +189,7 @@ fn collect_update(upd: &UpdateStmt, out: &mut Vec<Binding>) {
         let Some(node::Node::ResTarget(rt)) = tgt.node.as_ref() else {
             continue;
         };
-        let Some(val) = rt.val.as_ref() else { continue };
-        let Some(node::Node::ParamRef(p)) = val.node.as_ref() else {
+        let Some(node::Node::ParamRef(p)) = restarget_val(tgt).and_then(|v| v.node.as_ref()) else {
             continue;
         };
         out.push(Binding {
