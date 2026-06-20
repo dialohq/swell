@@ -334,12 +334,10 @@ fn scan_project(cfg: &Config) -> Result<Vec<ScannedQuery>> {
             continue;
         }
 
-        let src = match std::fs::read_to_string(abs) {
-            Ok(s) => s,
-            Err(e) => {
-                warn!("could not read {}: {e}", abs.display());
-                continue;
-            }
+        let Ok(src) = std::fs::read_to_string(abs)
+            .inspect_err(|e| warn!("could not read {}: {e}", abs.display()))
+        else {
+            continue;
         };
         match scan_file(abs, &src, opts.clone()) {
             Ok(qs) => out.extend(qs),
