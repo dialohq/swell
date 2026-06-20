@@ -502,17 +502,15 @@ mod tests {
 
     #[test]
     fn extra_imports_render_after_swell_import() {
-        let imports = vec![(
+        let imports = [(
             "@/lib/types".into(),
             vec!["ImportSchema".into(), "JsonSchema".into()],
         )];
-        let out = render(
-            &[],
-            CodegenOptions {
-                extra_imports: &imports,
-                tables: &[],
-            },
-        );
+        let opts = CodegenOptions {
+            extra_imports: &imports,
+            tables: &[],
+        };
+        let out = render(&[], opts);
         assert_has(
             &out,
             "import { type ImportSchema, type JsonSchema } from \"@/lib/types\";",
@@ -590,13 +588,8 @@ mod tests {
 
     #[test]
     fn multiple_entries_render_in_one_interface() {
-        let out = render(
-            &[
-                q("SELECT 1", vec![], vec![col("n", "number", false)]),
-                q("SELECT 2", vec![], vec![col("n", "number", false)]),
-            ],
-            CodegenOptions::default(),
-        );
+        let mk = |sql| q(sql, vec![], vec![col("n", "number", false)]);
+        let out = render(&[mk("SELECT 1"), mk("SELECT 2")], CodegenOptions::default());
         assert_has(
             &out,
             "declare module \"@dialo/swell\" {\n  interface Registry {\n",

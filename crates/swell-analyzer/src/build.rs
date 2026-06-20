@@ -398,10 +398,10 @@ fn lower_subquery_columns(
     aliascolnames: &[Node],
     scope: &Scope,
 ) -> Option<Vec<DerivedColumn>> {
-    let NB::SelectStmt(select) = subquery?.node.as_ref()? else {
-        return None;
-    };
-    lower_select_columns(select, aliascolnames, scope)
+    match subquery?.node.as_ref()? {
+        NB::SelectStmt(s) => lower_select_columns(s, aliascolnames, scope),
+        _ => None,
+    }
 }
 
 fn lower_select_columns(
