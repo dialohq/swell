@@ -168,11 +168,32 @@ fn infer_node<'a>(
             node::Node::FuncCall(fc) => infer_func(client, catalog, alias_oids, fc).await,
             node::Node::ColumnRef(cr) => infer_column_ref(client, catalog, alias_oids, cr).await,
             node::Node::AConst(c) => Some(infer_a_const(c)),
+            node::Node::TypeCast(tc) => infer_type_cast(client, catalog, alias_oids, tc).await,
             // CASE, COALESCE, etc. — defer to caller (they'll get the OID
             // type from RowDescription).
             _ => None,
         }
     })
+}
+
+/// Resolve `expr::type` to the TS form of `type` — looks the name up
+/// in the catalog (handles domains, enums, composites) and falls back
+/// to the simple-name mapping for built-in types.
+async fn infer_type_cast(
+    client: &Client,
+    catalog: &TypeCatalog,
+    alias_oids: &HashMap<String, u32>,
+    tc: &pg_query::protobuf::TypeCast,
+) -> Option<String> {
+    let _ = (client, alias_oids); // not used yet — kept for future arg-aware casts
+    let names: Vec<String> = tc.type_name.as_ref()?.names.iter()
+        .filter_map(|n| match n.node.as_ref()? {
+            node::Node::String(s) => Some(s.sval.clone()),
+            _ => None,
+        })
+        .collect();
+    let name = names.last()?;
+    Some(catalog.render_oid(0, name, crate::ts_types::Direction::Read))
 }
 
 async fn infer_func(
@@ -210,6 +231,61 @@ async fn infer_func(
         }
         _ => None,
     }
+}
+
+async fn infer_user_func_return(
+    client: &Client,
+    catalog: &TypeCatalog,
+    fc: &FuncCall,
+) -> Option<String> {
+    let names: Vec<String> = fc.funcname.iter()
+        .filter_map(|n| match n.node.as_ref()? {
+            node::Node::String(s) => Some(s.sval.clone()),
+            _ => None,
+        })
+        .collect();
+    let (schema, name) = match names.as_slice() {
+        [n]        => (None, n.as_str()),
+        [s, n]     => (Some(s.as_str()), n.as_str()),
+        _ => return None,
+    };
+    // Look up the function's return type. There can be multiple
+    // overloads with different arg signatures; we take the first that
+    // matches by name (and schema, if qualified). Good enough for the
+    // structural shape — the runtime PARSE/DESCRIBE step already
+    // resolved the right overload for the outer column anyway.
+    let rows_res = if let Some(schema) = schema {
+        client.query(
+            r#"
+            SELECT t.oid::oid, t.typname
+            FROM pg_proc p
+            JOIN pg_type t ON t.oid = p.prorettype
+            JOIN pg_namespace n ON n.oid = p.pronamespace
+            WHERE p.proname = $1 AND n.nspname = $2
+            LIMIT 1
+            "#,
+            &[&name, &schema],
+        ).await
+    } else {
+        client.query(
+            r#"
+            SELECT t.oid::oid, t.typname
+            FROM pg_proc p
+            JOIN pg_type t ON t.oid = p.prorettype
+            WHERE p.proname = $1
+              AND p.pronamespace = ANY(current_schemas(true)::regnamespace[])
+            LIMIT 1
+            "#,
+            &[&name],
+        ).await
+    };
+    let row = rows_res.ok()?.into_iter().next()?;
+    let oid: u32 = row.get(0);
+    let typname: String = row.get(1);
+    let base = catalog.render_oid(oid, &typname, crate::ts_types::Direction::Read);
+    // Function returns are nullable in PG (no signature-level NOT NULL
+    // guarantee).
+    Some(format!("{} | null", base))
 }
 
 /// Returns the canonical short name (e.g. `"jsonb_build_object"`) iff the
@@ -255,6 +331,14 @@ fn resolve_to_safe_builtin<'c>(
     }
 }
 
+enum KeyKind {
+    /// String / integer literal key — known statically.
+    Literal(String),
+    /// Anything else (column ref, function call, …) — value not
+    /// known at type-check time.
+    Dynamic,
+}
+
 async fn infer_build_object(
     client: &Client,
     catalog: &TypeCatalog,
@@ -265,19 +349,24 @@ async fn infer_build_object(
         return None;
     }
 
-    // Walk every (key, value) pair. If every key is a literal we emit a
-    // structural object; if any key is dynamic we emit a homogeneous
-    // `Record<string, V>` whose value type is the union of all observed
-    // value types.
-    let mut literal_fields: Vec<(String, String)> = Vec::with_capacity(args.len() / 2);
-    let mut value_types: Vec<String> = Vec::with_capacity(args.len() / 2);
-    let mut any_dynamic_key = false;
-
+    // Walk every (key, value) pair, in source order. Three cases:
+    //
+    //   1. Every key is a literal → emit a structural object
+    //      `{ k1: V1; k2: V2; … }`.
+    //   2. Mixed dynamic + literal keys where every literal key comes
+    //      *after* all dynamic keys → emit `{ [k: string]: V; k1: T1; … }`
+    //      (literal fields are guaranteed because `jsonb_build_object`'s
+    //      last-occurrence-wins semantics would have a dynamic
+    //      collision *before* the literal, so the literal always
+    //      survives).
+    //   3. Any literal key precedes a dynamic key → collapse to
+    //      `Record<string, V>` (the literal could be overwritten by a
+    //      same-named dynamic entry).
+    let mut pairs: Vec<(KeyKind, String)> = Vec::with_capacity(args.len() / 2);
     let mut i = 0;
     while i < args.len() {
         let key_node = &args[i];
         let val_node = &args[i + 1];
-
         let key_lit: Option<String> = match key_node.node.as_ref() {
             Some(node::Node::AConst(c)) => match c.val.as_ref() {
                 Some(pg_query::protobuf::a_const::Val::Sval(s)) => Some(s.sval.clone()),
@@ -286,36 +375,98 @@ async fn infer_build_object(
             },
             _ => None,
         };
-
-        let val_ts = infer_node(client, catalog, alias_oids, val_node).await
-            .unwrap_or_else(|| "unknown".to_string());
-        value_types.push(val_ts.clone());
-
-        if let Some(k) = key_lit {
-            literal_fields.push((k, val_ts));
-        } else {
-            any_dynamic_key = true;
-        }
+        // Inside `jsonb_build_object`'s value position we additionally
+        // try `pg_proc`'s declared return type for user-defined function
+        // calls — so `'k', billing.workspace_revenue_cents(w.id)` lands
+        // as the function's `money_cents` (= `string | null`) rather
+        // than `unknown`. Top-level calls (e.g. bare `count(*)`) bypass
+        // this — they already get a proper type from RowDescription
+        // and the function's `prorettype` would mis-report nullability.
+        let val_ts = match infer_node(client, catalog, alias_oids, val_node).await {
+            Some(t) => t,
+            None => {
+                if let Some(node::Node::FuncCall(fc)) = val_node.node.as_ref() {
+                    infer_user_func_return(client, catalog, fc).await
+                        .unwrap_or_else(|| "unknown".to_string())
+                } else {
+                    "unknown".to_string()
+                }
+            }
+        };
+        let kind = match key_lit {
+            Some(k) => KeyKind::Literal(k),
+            None => KeyKind::Dynamic,
+        };
+        pairs.push((kind, val_ts));
         i += 2;
     }
+    let any_dynamic = pairs.iter().any(|(k, _)| matches!(k, KeyKind::Dynamic));
+    let last_dynamic_idx = pairs.iter().rposition(|(k, _)| matches!(k, KeyKind::Dynamic));
 
-    if any_dynamic_key {
-        // Deduplicate value types preserving first-seen order.
+    if !any_dynamic {
+        let body: Vec<String> = pairs.iter()
+            .filter_map(|(k, v)| match k {
+                KeyKind::Literal(name) => Some(format!("{}: {}", quote_field(name), v)),
+                _ => None,
+            })
+            .collect();
+        return Some(format!("{{ {} }}", body.join("; ")));
+    }
+
+    // From here every branch has at least one dynamic key.
+    // List dynamic-arg value types first, then constant-arg values,
+    // deduped. Dynamic args are the union's "broad" case (any key may
+    // map there), constants are narrow / specific; putting the broad
+    // arm first makes the rendered TS read naturally:
+    //   `Record<string, string | "owner" | "admin">`.
+    let value_union = {
         let mut seen = std::collections::BTreeSet::new();
         let mut dedup: Vec<String> = Vec::new();
-        for v in &value_types {
-            if seen.insert(v.clone()) {
+        for (k, v) in &pairs {
+            if matches!(k, KeyKind::Dynamic) && seen.insert(v.clone()) {
                 dedup.push(v.clone());
             }
         }
-        let union = if dedup.is_empty() { "unknown".to_string() } else { dedup.join(" | ") };
-        Some(format!("Record<string, {}>", union))
-    } else {
-        let body: Vec<String> = literal_fields.iter()
-            .map(|(k, v)| format!("{}: {}", quote_field(k), v))
-            .collect();
-        Some(format!("{{ {} }}", body.join("; ")))
+        for (k, v) in &pairs {
+            if matches!(k, KeyKind::Literal(_)) && seen.insert(v.clone()) {
+                dedup.push(v.clone());
+            }
+        }
+        if dedup.is_empty() { "unknown".to_string() } else { dedup.join(" | ") }
+    };
+
+    let constants_all_last = match last_dynamic_idx {
+        Some(idx) => pairs[..=idx]
+            .iter()
+            .all(|(k, _)| matches!(k, KeyKind::Dynamic)),
+        None => false,
+    };
+
+    if constants_all_last {
+        // Build `{ [k: string]: V; const1: T1; const2: T2; … }`.
+        // The index-signature value type is the dynamic args' value
+        // type (union of every dynamic pair's value); the named fields
+        // are the trailing constant pairs.
+        let dyn_value_union = {
+            let mut seen = std::collections::BTreeSet::new();
+            let mut dedup: Vec<String> = Vec::new();
+            for (k, v) in &pairs {
+                if matches!(k, KeyKind::Dynamic) && seen.insert(v.clone()) {
+                    dedup.push(v.clone());
+                }
+            }
+            if dedup.is_empty() { "unknown".to_string() } else { dedup.join(" | ") }
+        };
+        let mut body = vec![format!("[k: string]: {}", dyn_value_union)];
+        for (k, v) in &pairs {
+            if let KeyKind::Literal(name) = k {
+                body.push(format!("{}: {}", quote_field(name), v));
+            }
+        }
+        return Some(format!("{{ {} }}", body.join("; ")));
     }
+
+    Some(format!("Record<string, {}>", value_union))
 }
 
 async fn infer_column_ref(

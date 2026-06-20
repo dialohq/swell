@@ -250,7 +250,7 @@ FROM users u WHERE u.id = $1
 
 ```ts
 $1: string | null
-result: { payload: { [k: string]: string; role: "admin" | "member" } }
+result: { payload: { [k: string]: string; static_key: "admin" | "member" } }
 ```
 
 ## Enum inside jsonb build object
