@@ -132,12 +132,8 @@ pub fn render(queries: &[InferredQuery], opts: CodegenOptions<'_>) -> String {
 /// `scheduler.campaigns` → `SchedulerCampaigns`. `public.users` →
 /// `Users` (the default `public` schema is elided for ergonomics).
 fn type_name(schema: &str, table: &str) -> String {
-    let schema_prefix = if schema == "public" {
-        String::new()
-    } else {
-        pascal_case(schema)
-    };
-    format!("{}{}", schema_prefix, pascal_case(table))
+    let prefix = if schema == "public" { String::new() } else { pascal_case(schema) };
+    format!("{prefix}{}", pascal_case(table))
 }
 
 fn pascal_case(s: &str) -> String {
@@ -355,34 +351,24 @@ fn detect_star_prefix(
 /// join inferences widened it — avoids `string | null | null` noise
 /// in the generated output.
 fn render_typed(
-    ts_type: &str,
-    nullable: bool,
+    ts_type: &str, nullable: bool,
     table_ref: Option<&TableColRef>,
-    names: &TableNameMap,
-    tables: &[TableSchema],
+    names: &TableNameMap, tables: &[TableSchema],
 ) -> String {
     let base = table_ref
         .and_then(|r| indexed_table_ref(r, names))
         .unwrap_or_else(|| ts_type.to_string());
     // `unknown` already admits null at the type level.
-    if !nullable || base == "unknown" {
-        return base;
-    }
-    // For indexed-access references, only append `| null` when the
-    // column wasn't already nullable in the underlying table — i.e.
-    // an outer join / override widened it past the interface's shape.
-    if let Some(r) = table_ref {
-        let base_already_nullable = tables
-            .iter()
-            .find(|t| t.schema == r.schema && t.table == r.table)
-            .and_then(|t| t.columns.iter().find(|c| c.name == r.column))
-            .map(|c| !c.not_null)
-            .unwrap_or(false);
-        if base_already_nullable {
-            return base;
-        }
-    }
-    format!("{base} | null")
+    if !nullable || base == "unknown" { return base; }
+    // For indexed-access refs the interface already encodes the
+    // column's natural nullability — only append `| null` when our
+    // verdict is wider than what the interface carries (outer-join /
+    // override widening).
+    let interface_already_nullable = table_ref.is_some_and(|r| tables.iter()
+        .find(|t| t.schema == r.schema && t.table == r.table)
+        .and_then(|t| t.columns.iter().find(|c| c.name == r.column))
+        .is_some_and(|c| !c.not_null));
+    if interface_already_nullable { base } else { format!("{base} | null") }
 }
 
 fn indexed_table_ref(r: &TableColRef, names: &TableNameMap) -> Option<String> {
