@@ -404,7 +404,7 @@ mod tests {
             sql: sql.into(),
             params,
             columns,
-            row_variants: Vec::new(),
+            ..Default::default()
         }
     }
 
