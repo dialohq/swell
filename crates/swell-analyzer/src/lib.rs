@@ -7,6 +7,11 @@
 
 pub mod describe;
 pub mod catalog;
+pub mod analyzed;
+pub mod plan;
+pub mod scope;
+pub mod lowering;
+pub mod build;
 pub mod explain_expr;
 pub mod nullability;
 pub mod param_nullability;
@@ -75,52 +80,44 @@ impl Analyzer {
             .filter(|c| c.table_oid != 0 && c.attnum > 0)
             .map(|c| (c.table_oid, c.attnum))
             .collect();
-        // One round trip resolves both `attnotnull` and the
-        // `(schema, table, column)` triple for every referenced base
-        // column — the two used to be separate queries.
+        // Per-(table_oid, attnum) → (schema, table, column, attnotnull)
+        // in one round trip. Used both to populate
+        // `InferredColumn.table_ref` and as the fallback source of
+        // `Expr::Column` for star-expansion outputs.
         let column_meta = resolve_column_meta(&self.client, &pairs).await;
-        let attnotnull: std::collections::HashMap<(u32, i16), bool> = column_meta
-            .iter().map(|(k, v)| (*k, v.not_null)).collect();
 
-        let null_hints = nullability::explain_nullability(
-            &self.client, sql, &described.params, described.columns.len(),
-        )
-        .await
-        .unwrap_or_else(|e| {
-            tracing::debug!("EXPLAIN failed for `{sql}`: {e}");
-            nullability::NullabilityHints::unknown(described.columns.len())
-        });
+        // Walk the EXPLAIN plan tree for structural facts only —
+        // scan aliases, outer-join widening, function-scan non-null
+        // sources, root FULL JOIN. No EXPLAIN-text expression
+        // strings are read from this point on.
+        let plan_walk = plan::explain(&self.client, sql).await
+            .unwrap_or_else(|e| {
+                tracing::debug!("EXPLAIN failed for `{sql}`: {e}");
+                plan::PlanWalk::default()
+            });
 
-        // Pre-fetch attnotnull for every (schema, table) referenced
-        // by an EXPLAIN scan. Used by the post-pass refinements:
-        //   - `refine_coalesce_non_null`: coalesce arg is a NOT NULL col.
-        //   - `refine_via_attnotnull`:    bare column-ref expressions
-        //     (including all branches of a UNION/INTERSECT/EXCEPT)
-        //     classify as Unknown but are actually NOT NULL.
-        let scan_attnotnull = fetch_scan_attnotnull(
-            &self.client,
-            &null_hints.alias_to_table,
+        let param_info = param_nullability::infer(
+            &self.client, sql, described.params.len(),
         ).await;
+        let param_bindings: std::collections::HashMap<usize, TableColRef> = param_info.iter()
+            .enumerate()
+            .filter_map(|(i, info)| info.table_ref.clone().map(|tr| (i + 1, tr)))
+            .collect();
 
-        // Per-column NOT NULL refinement, two sources combined into one
-        // bitmask:
-        //   - `COALESCE(...)` whose any arg is a NOT NULL base column.
-        //     classify already handles `coalesce(x, 'lit')`; this picks
-        //     up `coalesce(nullable, not_null_col)` via attnotnull.
-        //   - SET-OP branches whose every branch is a NOT NULL base
-        //     column ref. Handles UNION/INTERSECT/EXCEPT cases that the
-        //     classifier can't see through.
-        let refine_upgrade = refine_to_not_null(&null_hints, &scan_attnotnull);
+        // Single-pass lowering: SQL AST + plan-derived scope + the
+        // pre-fetched column_meta → `Analyzed`. Every downstream
+        // verdict / TS-type / row-variant decision walks the `Expr`
+        // tree this produces.
+        let analyzed = build::build(
+            &self.client, sql, &described, plan_walk.clone(),
+            &column_meta, &param_bindings,
+        ).await?;
 
         let json_shapes = json_shape::infer_shapes(
             &self.client, &self.catalog, sql, described.columns.len(),
         ).await;
 
-        let param_info = param_nullability::infer(
-            &self.client, sql, described.params.len(),
-        ).await;
-
-        let params = described.params.iter().enumerate()
+        let params: Vec<InferredParam> = described.params.iter().enumerate()
             .map(|(i, t)| {
                 let info = param_info.get(i).cloned().unwrap_or_default();
                 InferredParam {
@@ -133,23 +130,14 @@ impl Analyzer {
 
         let columns: Vec<InferredColumn> = described.columns.iter().enumerate()
             .map(|(i, c)| {
-                let raw = null_hints.by_column.get(i).copied()
-                    .unwrap_or(nullability::NullVerdict::Unknown);
-                // Only upgrade an `Unknown` verdict — never override a
-                // Nullable verdict (e.g. an outer-join's RHS column).
-                let upgrade = matches!(raw, nullability::NullVerdict::Unknown)
-                    && refine_upgrade.get(i).copied().unwrap_or(false);
-                let verdict = if upgrade { nullability::NullVerdict::NotNullable } else { raw };
-                let inferred_nullable = decide_nullability(c, &attnotnull, verdict);
+                let expr = analyzed.outputs.get(i)
+                    .map(|o| &o.expr)
+                    .unwrap_or(&analyzed::Expr::Unknown);
+                let verdict = build::verdict(expr);
+                let inferred_nullable = decide_nullability(c, &column_meta, verdict);
                 let oid_ts = catalog::render_for_oid(&self.catalog, c.type_.oid(), &c.type_, Direction::Read);
                 let json_ts = json_shapes.by_target.get(i).cloned().flatten();
-                // Literal-type union across set-op branches: when every
-                // branch's expression is a bare literal (string / int /
-                // bool), the result column type is the deduped union of
-                // those literals — e.g. `UNION ALL SELECT 'paid'` and
-                // `'open'` becomes `"paid" | "open"`.
-                let setop_lit_ts = null_hints.branches.get(i)
-                    .and_then(|b| infer_setop_literal_union(b));
+                let setop_lit_ts = infer_setop_literal_union(expr);
                 let inferred_ts = setop_lit_ts.or(json_ts).unwrap_or(oid_ts);
 
                 // SQLx-style alias suffix overrides: `as "col!"` /
@@ -173,7 +161,7 @@ impl Analyzer {
             })
             .collect();
 
-        let row_variants = build_row_variants(sql, &null_hints, &columns);
+        let row_variants = build_row_variants(sql, &analyzed, &plan_walk, &columns);
         Ok(InferredQuery { sql: sql.to_string(), params, columns, row_variants })
     }
 
@@ -226,34 +214,18 @@ impl Analyzer {
     }
 }
 
-/// Per-(table_oid, attnum) result of the one-shot column-metadata
-/// lookup: the originating `(schema, table, column)` triple plus the
-/// base column's `attnotnull` bit. Used by `analyze` to fill both
-/// `InferredColumn.table_ref` and the join-nullability verdict from
-/// `decide_nullability`.
-struct ColumnMeta {
-    table_ref: TableColRef,
-    not_null: bool,
-}
-
-/// Resolve `(table_oid, attnum)` → `ColumnMeta` in one round trip,
-/// fusing what used to be separate `fetch_attnotnull` and
-/// `resolve_column_refs` queries.
+/// Resolve `(table_oid, attnum)` → `ResolvedBaseCol` in one round
+/// trip — populates `InferredColumn.table_ref` *and* provides the
+/// star-expansion fallback for `build::build`.
 async fn resolve_column_meta(
     client: &Client,
     pairs: &[(u32, i16)],
-) -> HashMap<(u32, i16), ColumnMeta> {
-    if pairs.is_empty() {
-        return HashMap::new();
-    }
-    let mut unique: std::collections::HashSet<(u32, i16)> = std::collections::HashSet::new();
-    for p in pairs { unique.insert(*p); }
-    let mut tables = Vec::with_capacity(unique.len());
-    let mut attnums = Vec::with_capacity(unique.len());
-    for (t, a) in &unique {
-        tables.push(*t as i64);
-        attnums.push(*a as i32);
-    }
+) -> build::ColumnMeta {
+    use build::ResolvedBaseCol;
+    if pairs.is_empty() { return HashMap::new(); }
+    let unique: std::collections::HashSet<(u32, i16)> = pairs.iter().copied().collect();
+    let tables:  Vec<i64> = unique.iter().map(|(t, _)| *t as i64).collect();
+    let attnums: Vec<i32> = unique.iter().map(|(_, a)| *a as i32).collect();
     let rows = match client.query(
         r#"
         WITH ask(t, a) AS (SELECT * FROM unnest($1::bigint[], $2::int[]))
@@ -267,10 +239,7 @@ async fn resolve_column_meta(
         &[&tables, &attnums],
     ).await {
         Ok(r) => r,
-        Err(e) => {
-            tracing::debug!("resolve_column_meta: {e}");
-            return HashMap::new();
-        }
+        Err(e) => { tracing::debug!("resolve_column_meta: {e}"); return HashMap::new(); }
     };
     let mut out = HashMap::with_capacity(rows.len());
     for row in &rows {
@@ -280,7 +249,7 @@ async fn resolve_column_meta(
         let t: i64 = row.get(3);
         let a: i32 = row.get(4);
         let not_null: bool = row.get(5);
-        out.insert((t as u32, a as i16), ColumnMeta {
+        out.insert((t as u32, a as i16), ResolvedBaseCol {
             table_ref: TableColRef { schema, table, column },
             not_null,
         });
@@ -288,131 +257,31 @@ async fn resolve_column_meta(
     out
 }
 
-type AttnotnullMap = std::collections::HashMap<(String, String, String), bool>;
-
-/// Bulk-fetch `attnotnull` for every column of every scan table in
-/// `alias_to_table`. Returned map is keyed by `(schema, table, col)`.
-async fn fetch_scan_attnotnull(
-    client: &Client,
-    alias_to_table: &std::collections::HashMap<String, (String, String)>,
-) -> AttnotnullMap {
-    use std::collections::HashSet;
-    let mut out: AttnotnullMap = std::collections::HashMap::new();
-    if alias_to_table.is_empty() {
-        return out;
-    }
-    let pairs: HashSet<(String, String)> = alias_to_table.values().cloned().collect();
-    let schemas: Vec<String> = pairs.iter().map(|p| p.0.clone()).collect();
-    let tables: Vec<String> = pairs.iter().map(|p| p.1.clone()).collect();
-    let rows_res = client.query(
-        r#"
-        WITH ask(schema, name) AS (SELECT * FROM unnest($1::text[], $2::text[]))
-        SELECT n.nspname::text, c.relname::text, a.attname::text, a.attnotnull
-        FROM ask
-        JOIN pg_namespace n ON n.nspname = ask.schema
-        JOIN pg_class c     ON c.relnamespace = n.oid AND c.relname = ask.name
-        JOIN pg_attribute a ON a.attrelid = c.oid
-        WHERE a.attnum > 0 AND NOT a.attisdropped
-        "#,
-        &[&schemas, &tables],
-    ).await;
-    if let Ok(rows) = rows_res {
-        for row in &rows {
-            out.insert((row.get(0), row.get(1), row.get(2)), row.get(3));
-        }
-    }
-    out
-}
-
-/// Per-column NOT NULL refinement combining two evidence sources:
-///   - `COALESCE(...)` where any arg is a NOT NULL base column or a
-///     non-null literal.
-///   - Every SET-OP branch is a NOT NULL base column reference.
-fn refine_to_not_null(
-    hints: &nullability::NullabilityHints,
-    attnotnull: &AttnotnullMap,
-) -> Vec<bool> {
-    let n = hints.exprs.len().max(hints.branches.len());
-    let mut out = vec![false; n];
-    for i in 0..n {
-        // Coalesce: any arg is a non-null literal or NOT NULL column.
-        if let Some(expr) = hints.exprs.get(i) {
-            if let Some(args) = explain_expr::parse_call_args(expr, "coalesce") {
-                let non_null = args.iter().any(|a| {
-                    explain_expr::is_literal_non_null(a)
-                    || resolve_arg(a, &hints.alias_to_table, attnotnull)
-                        .map(|k| attnotnull.get(&k).copied().unwrap_or(false))
-                        .unwrap_or(false)
-                });
-                if non_null { out[i] = true; continue; }
-            }
-        }
-        // Set-op branches: every branch is a bare NOT NULL column. Casts
-        // are excluded — `id::text` isn't guaranteed to preserve NOT NULL
-        // semantics for user-defined types.
-        if let Some(branches) = hints.branches.get(i) {
-            if !branches.is_empty() && branches.iter().all(|expr| {
-                if expr.contains("::") { return false; }
-                resolve_arg(expr, &hints.alias_to_table, attnotnull)
-                    .map(|k| attnotnull.get(&k).copied().unwrap_or(false))
-                    .unwrap_or(false)
-            }) {
-                out[i] = true;
-            }
-        }
-    }
-    out
-}
-
-/// Resolve an EXPLAIN expression (possibly with `(…)::cast` wrapping)
-/// to a `(schema, table, col)` key. Handles qualified `<alias>.<col>`
-/// (looks up via `alias_to_table`) and bare `<col>` (picks the unique
-/// scan table that has a column by that name).
-fn resolve_arg(
-    arg: &str,
-    alias_to_table: &std::collections::HashMap<String, (String, String)>,
-    attnotnull: &AttnotnullMap,
-) -> Option<(String, String, String)> {
-    match explain_expr::parse_ref(arg)? {
-        explain_expr::Ref::Qualified { alias, col } => {
-            // PG renames duplicate scan aliases as `users_1`, `users_2`
-            // in plans (e.g. for FULL JOIN). Try the literal alias
-            // first; fall back to the de-numbered form so the user's
-            // `alias_to_table` entry still resolves.
-            let key = alias_to_table.get(alias)
-                .or_else(|| alias_to_table.get(explain_expr::strip_suffix_digits(alias)));
-            key.map(|(s, t)| (s.clone(), t.clone(), col.to_string()))
-        }
-        explain_expr::Ref::Bare(col) => {
-            let mut matches = alias_to_table.values().filter_map(|(s, t)| {
-                let k = (s.clone(), t.clone(), col.to_string());
-                attnotnull.contains_key(&k).then_some(k)
-            });
-            let first = matches.next()?;
-            matches.next().is_none().then_some(first)
-        }
-    }
-}
-
 /// Across set-op branches, if every branch's expression is a bare
 /// literal, render the column type as a deduped TS literal union.
-fn infer_setop_literal_union(branches: &[String]) -> Option<String> {
+/// Walks the lowered `Expr::SetOp` — each branch is a structured
+/// `Expr`, no EXPLAIN-text parsing.
+fn infer_setop_literal_union(expr: &analyzed::Expr) -> Option<String> {
+    let branches = match expr {
+        analyzed::Expr::SetOp(b) => b,
+        _ => return None,
+    };
     if branches.len() < 2 { return None; }
     let mut unique: Vec<String> = Vec::new();
     for b in branches {
-        let lit = explain_expr::parse_literal_ts(b)?;
+        let lit = lowering::as_literal(b)?.to_ts_literal();
         if !unique.contains(&lit) { unique.push(lit); }
     }
     (!unique.is_empty()).then(|| unique.join(" | "))
 }
 
 /// Build row-level variants for queries that produce a discriminated
-/// union. Currently two cases are handled:
+/// union. Two cases:
 ///
 ///   - FULL OUTER JOIN: three variants — left-only, right-only, both.
-///     A column's side is inferred from its EXPLAIN expression's
-///     leading alias. The "absent" side's columns become literal
-///     `null`; the present side keeps the rendered TS type.
+///     A column's side is inferred from `Expr::Column.alias` on the
+///     lowered output expression. The "absent" side's columns become
+///     literal `null`; the present side keeps its rendered TS type.
 ///
 ///   - GROUPING SETS (a, b, c, …): one variant per grouping set.
 ///     Columns whose names appear in the set keep their type;
@@ -420,10 +289,11 @@ fn infer_setop_literal_union(branches: &[String]) -> Option<String> {
 ///     (count, sum, …) are untouched.
 fn build_row_variants(
     sql: &str,
-    hints: &nullability::NullabilityHints,
+    analyzed: &analyzed::Analyzed,
+    plan_walk: &plan::PlanWalk,
     columns: &[InferredColumn],
 ) -> Vec<RowVariant> {
-    if let Some(v) = build_full_join_variants(hints, columns) {
+    if let Some(v) = build_full_join_variants(analyzed, plan_walk, columns) {
         return v;
     }
     if let Some(v) = build_grouping_sets_variants(sql, columns) {
@@ -433,26 +303,30 @@ fn build_row_variants(
 }
 
 fn build_full_join_variants(
-    hints: &nullability::NullabilityHints,
+    analyzed: &analyzed::Analyzed,
+    plan_walk: &plan::PlanWalk,
     columns: &[InferredColumn],
 ) -> Option<Vec<RowVariant>> {
-    let (left, right) = hints.root_full_join.as_ref()?;
-    // Decide each column's source side via its EXPLAIN expression's
-    // leading alias (Some(true) = left, Some(false) = right). Columns
-    // whose source can't be determined are present in every variant.
+    let (left, right) = plan_walk.root_full_join.as_ref()?;
+    // Decide each column's source side from its lowered output expr.
+    // `Expr::Column` (or `Cast(Column)`) gives us the alias straight
+    // off the resolved base ref — no string parsing on the EXPLAIN
+    // deparse text.
+    let strip_suffix = |s: &str| {
+        let t = s.trim_end_matches(|c: char| c.is_ascii_digit());
+        t.trim_end_matches('_').to_string()
+    };
     let side_of = |a: &str| {
         if left.contains(a) { Some(true) }
         else if right.contains(a) { Some(false) }
         else { None }
     };
     let col_side: Vec<Option<bool>> = (0..columns.len()).map(|i| {
-        let expr = hints.exprs.get(i).map(String::as_str).unwrap_or("");
-        let alias = explain_expr::leading_alias(expr);
-        alias.and_then(side_of)
-            .or_else(|| alias.and_then(|a| side_of(explain_expr::strip_suffix_digits(a))))
+        let alias = analyzed.outputs.get(i)
+            .and_then(|o| lowering::as_column(&o.expr))
+            .map(|c| c.alias.clone())?;
+        side_of(&alias).or_else(|| side_of(&strip_suffix(&alias)))
     }).collect();
-    // Three variants: only-left (right→null), only-right (left→null),
-    // both (no overrides; falls back to base columns).
     let mk = |on_left_null: bool, on_right_null: bool| -> RowVariant {
         let overrides = columns.iter().enumerate()
             .filter_map(|(i, c)| match col_side[i] {
@@ -557,29 +431,31 @@ fn build_grouping_sets_variants(
     Some(variants)
 }
 
-/// Combine attnotnull and EXPLAIN evidence into a final nullable verdict.
+/// Combine RowDescription's `attnotnull` with the lowered-Expr verdict
+/// into a final nullable bool.
 ///
-/// | base table col? | attnotnull | EXPLAIN          | nullable |
-/// |-----------------|------------|------------------|----------|
-/// | yes             | NOT NULL   | Nullable         | yes (outer-join trumps) |
-/// | yes             | NOT NULL   | otherwise        | no       |
-/// | yes             | nullable   | *                | yes      |
-/// | no              | n/a        | NotNullable      | no       |
-/// | no              | n/a        | otherwise        | yes      |
+/// | base table col? | attnotnull | verdict     | nullable |
+/// |-----------------|------------|-------------|----------|
+/// | yes             | NOT NULL   | Nullable    | yes (outer-join trumps) |
+/// | yes             | NOT NULL   | otherwise   | no       |
+/// | yes             | nullable   | *           | yes      |
+/// | no              | n/a        | NotNullable | no       |
+/// | no              | n/a        | otherwise   | yes      |
 fn decide_nullability(
     c: &describe::DescribedColumn,
-    attnotnull: &std::collections::HashMap<(u32, i16), bool>,
-    explain: nullability::NullVerdict,
+    column_meta: &build::ColumnMeta,
+    verdict: build::Verdict,
 ) -> bool {
-    use nullability::NullVerdict::*;
+    use build::Verdict::*;
     if c.table_oid != 0 && c.attnum > 0 {
-        let base_not_null = attnotnull.get(&(c.table_oid, c.attnum)).copied().unwrap_or(false);
-        match (base_not_null, explain) {
+        let base_not_null = column_meta.get(&(c.table_oid, c.attnum))
+            .map(|m| m.not_null).unwrap_or(false);
+        match (base_not_null, verdict) {
             (true, Nullable) => true,
             (true, _)        => false,
             (false, _)       => true,
         }
     } else {
-        !matches!(explain, NotNullable)
+        !matches!(verdict, NotNullable)
     }
 }
