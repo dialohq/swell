@@ -198,6 +198,34 @@ CREATE TABLE field_configs (
     END)
 );
 
+-- Multi-column OR-of-AND row narrowing: each branch pins a different
+-- combination of `kind` (literal) and which of `url` / `body` is
+-- non-null. The row reducer recognises arbitrary AND-chains of
+-- atomic predicates (`= lit`, `IS NOT NULL`, `IS NULL`).
+CREATE TABLE blocks (
+    id    uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    kind  text NOT NULL,
+    url   text,
+    body  text,
+    CHECK (
+        (kind = 'image' AND url  IS NOT NULL AND body IS NULL)
+        OR (kind = 'text' AND body IS NOT NULL AND url  IS NULL)
+    )
+);
+
+-- CASE THEN with a NullTest narrows a non-discriminant column per
+-- variant; ELSE true widens with the discriminant catch-all.
+CREATE TABLE shipments (
+    id        uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    status    text NOT NULL,
+    paid_at   timestamptz,
+    CHECK (CASE
+        WHEN status = 'paid'  THEN paid_at IS NOT NULL
+        WHEN status = 'draft' THEN paid_at IS NULL
+        ELSE true
+    END)
+);
+
 -- ---------- Functions ----------
 
 -- Sum of paid invoices in cents for a workspace. The `SET search_path`
@@ -275,6 +303,13 @@ export interface BillingAuditEvents {
   payload: Json;
   created_at: Date;
 }
+export interface BillingBlocksBase {
+  id: string;
+  kind: string;
+  url: string | null;
+  body: string | null;
+}
+export type BillingBlocks = BillingBlocksBase & ({ body: null; kind: "image"; url: string } | { body: string; kind: "text"; url: null });
 export interface BillingContactsBase {
   id: string;
   email: string | null;
@@ -336,6 +371,12 @@ export interface BillingPromotions {
   discount_pct: string;
   code_lower: string | null;
 }
+export interface BillingShipmentsBase {
+  id: string;
+  status: string;
+  paid_at: Date | null;
+}
+export type BillingShipments = BillingShipmentsBase & ({ paid_at: Date; status: "paid" } | { paid_at: null; status: "draft" } | { status: Exclude<string, "paid" | "draft"> });
 export interface BillingSubscriptions {
   id: string;
   workspace_id: string;
@@ -1493,4 +1534,26 @@ SELECT * FROM billing.contacts WHERE id = $1
 ```ts
 $1: string | null
 result: BillingContacts
+```
+
+## Check OR-of-AND with multi-column narrowing emits row variants
+
+```sql
+SELECT * FROM billing.blocks WHERE id = $1
+```
+
+```ts
+$1: string | null
+result: BillingBlocks
+```
+
+## Check CASE THEN with IS NOT NULL pins per-branch nullability
+
+```sql
+SELECT * FROM billing.shipments WHERE id = $1
+```
+
+```ts
+$1: string | null
+result: BillingShipments
 ```

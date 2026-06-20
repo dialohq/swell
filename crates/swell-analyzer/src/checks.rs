@@ -220,8 +220,100 @@ fn reduce_row_predicate(
     match node.node.as_ref()? {
         NodeBody::AExpr(e) => reduce_num_nonnulls_eq(e, table_columns),
         NodeBody::CaseExpr(c) => reduce_case(c, table_columns),
+        NodeBody::BoolExpr(b) if b.boolop == protobuf::BoolExprType::OrExpr as i32 => {
+            reduce_or_row_variants(&b.args, table_columns)
+        }
         _ => None,
     }
+}
+
+/// `(AND-chain) OR (AND-chain) OR …` where each branch reduces to a
+/// map of per-column atomic narrowings → row variants. Pure single-
+/// column ORs bail out so col-level Tier 3 Union handles them with the
+/// cleaner `T = a | b | …` shape rather than a row intersection.
+fn reduce_or_row_variants(
+    args: &[protobuf::Node],
+    table_columns: &HashMap<String, String>,
+) -> Option<RowRefinement> {
+    if args.len() < 2 {
+        return None;
+    }
+    let mut variants: Vec<RowVariant> = Vec::with_capacity(args.len());
+    let mut multi_column_seen = false;
+    let mut first_col: Option<String> = None;
+    for arg in args {
+        let columns = reduce_branch_to_columns(arg, table_columns)?;
+        if columns.is_empty() {
+            return None;
+        }
+        if columns.len() > 1 {
+            multi_column_seen = true;
+        }
+        // Track whether every branch is one-column targeting the same
+        // column — that's the col-level Union case.
+        if columns.len() == 1 {
+            let only = columns.keys().next().cloned();
+            match (&first_col, &only) {
+                (None, Some(_)) => first_col = only,
+                (Some(prev), Some(c)) if prev != c => multi_column_seen = true,
+                _ => {}
+            }
+        } else {
+            multi_column_seen = true;
+        }
+        variants.push(RowVariant { columns });
+    }
+    if !multi_column_seen {
+        return None;
+    }
+    Some(RowRefinement { variants })
+}
+
+/// Reduce one branch (either an AND-chain or a single atom) to a map
+/// of per-column TS narrowings. Each atomic predicate must target a
+/// single base column; conflicting refinements on the same column
+/// inside one branch bail.
+fn reduce_branch_to_columns(
+    node: &protobuf::Node,
+    table_columns: &HashMap<String, String>,
+) -> Option<BTreeMap<String, String>> {
+    let args: Vec<&protobuf::Node> = match node.node.as_ref()? {
+        NodeBody::BoolExpr(b) if b.boolop == protobuf::BoolExprType::AndExpr as i32 => {
+            b.args.iter().collect()
+        }
+        _ => vec![node],
+    };
+    let mut out: BTreeMap<String, String> = BTreeMap::new();
+    for arg in args {
+        let (col, narrowing) = reduce_atom_to_column(arg, table_columns)?;
+        match out.get(&col) {
+            Some(prev) if prev != &narrowing => return None,
+            Some(_) => {}
+            None => { out.insert(col, narrowing); }
+        }
+    }
+    Some(out)
+}
+
+/// One atomic predicate → `(column, TS render)`. Handles `IS NULL` /
+/// `IS NOT NULL` and any col-level Refinement that `reduce_predicate`
+/// recognises (literal-set / object shape).
+fn reduce_atom_to_column(
+    node: &protobuf::Node,
+    table_columns: &HashMap<String, String>,
+) -> Option<(String, String)> {
+    if let Some(NodeBody::NullTest(nt)) = node.node.as_ref() {
+        let col = column_ref_name(nt.arg.as_deref()?)?;
+        if nt.nulltesttype == protobuf::NullTestType::IsNotNull as i32 {
+            return Some((col.clone(), non_null_form(table_columns.get(&col)?)));
+        }
+        if nt.nulltesttype == protobuf::NullTestType::IsNull as i32 {
+            return Some((col, "null".to_string()));
+        }
+        return None;
+    }
+    let (col, r) = reduce_predicate(node)?;
+    Some((col, r.render_ts()?))
 }
 
 /// `num_nonnulls(a, b, …) = 1` → one variant per argument.
@@ -296,10 +388,15 @@ fn reduce_case(
         covered.push(lit);
         let then = when.result.as_deref()?;
         if !is_const_true(then) {
-            let (target, refinement) = reduce_predicate(then)?;
-            if target != col {
-                let ts = refinement.render_ts()?;
-                variant.columns.insert(target, ts);
+            // Multi-column THEN: AND-chain of atomic narrowings, each
+            // on a single column. Falls back through `reduce_branch_to_
+            // columns` to handle `IS NOT NULL`, literal sets, and the
+            // jsonb shapes that `reduce_predicate` covers.
+            let extras = reduce_branch_to_columns(then, table_columns)?;
+            for (target, ts) in extras {
+                if target != col {
+                    variant.columns.insert(target, ts);
+                }
             }
         }
         variants.push(variant);
@@ -315,7 +412,7 @@ fn reduce_case(
         catchall.columns.insert(disc, format!("Exclude<{}, {}>", base, lits));
         variants.push(catchall);
     }
-    if variants.len() < 2 {
+    if variants.is_empty() {
         return None;
     }
     Some(RowRefinement { variants })
@@ -1152,5 +1249,109 @@ mod tests {
         ).unwrap();
         assert_eq!(r.variants.len(), 3);
         assert_eq!(r.variants[2].columns["kind"], "Exclude<string, \"a\" | \"b\">");
+    }
+
+    // ---- Multi-column row narrowings (OR-of-AND, NullTest CASE THEN) ----
+
+    #[test]
+    fn row_or_of_and_with_disjoint_null_tests() {
+        // Generic XOR encoding equivalent to `num_nonnulls(a, b) = 1`
+        // but spelled as OR-of-AND of `IS NOT NULL` / `IS NULL`.
+        let t = types(&[("email", "string | null"), ("phone", "string | null")]);
+        let r = parse_row_check_def(
+            "CHECK (((email IS NOT NULL) AND (phone IS NULL)) \
+              OR ((email IS NULL) AND (phone IS NOT NULL)))",
+            &t,
+        ).unwrap();
+        assert_eq!(r.variants.len(), 2);
+        assert_eq!(r.variants[0].columns["email"], "string");
+        assert_eq!(r.variants[0].columns["phone"], "null");
+        assert_eq!(r.variants[1].columns["email"], "null");
+        assert_eq!(r.variants[1].columns["phone"], "string");
+    }
+
+    #[test]
+    fn row_or_of_and_with_literal_discriminant_and_payload_columns() {
+        // Different rows depending on `kind`: `image` rows have non-null
+        // `url`; `text` rows have non-null `body`; the unused payload
+        // column is required to be null in each variant.
+        let t = types(&[
+            ("kind", "string"),
+            ("url",  "string | null"),
+            ("body", "string | null"),
+        ]);
+        let r = parse_row_check_def(
+            "CHECK ((((kind = 'image'::text) \
+                       AND (url IS NOT NULL) AND (body IS NULL)) \
+                     OR ((kind = 'text'::text) \
+                       AND (body IS NOT NULL) AND (url IS NULL))))",
+            &t,
+        ).unwrap();
+        assert_eq!(r.variants.len(), 2);
+        assert_eq!(r.variants[0].columns["kind"], "\"image\"");
+        assert_eq!(r.variants[0].columns["url"], "string");
+        assert_eq!(r.variants[0].columns["body"], "null");
+        assert_eq!(r.variants[1].columns["kind"], "\"text\"");
+        assert_eq!(r.variants[1].columns["body"], "string");
+        assert_eq!(r.variants[1].columns["url"], "null");
+    }
+
+    #[test]
+    fn row_or_of_and_single_column_bails_to_col_level() {
+        // `(kind='a') OR (kind='b')` is single-column — the col-level
+        // Tier 3 Union represents it more cleanly, so the row reducer
+        // should bail.
+        let t = types(&[("kind", "string")]);
+        assert!(parse_row_check_def(
+            "CHECK (((kind = 'a'::text)) OR ((kind = 'b'::text)))",
+            &t,
+        ).is_none());
+    }
+
+    #[test]
+    fn row_or_of_and_branches_with_no_columns_bails() {
+        let t = types(&[("a", "string | null")]);
+        // Each branch is empty — nothing to narrow.
+        assert!(parse_row_check_def("CHECK ((true) OR (true))", &t).is_none());
+    }
+
+    #[test]
+    fn row_case_then_is_not_null_refines_column() {
+        // CASE THEN with a NullTest: `WHEN status = 'paid' THEN paid_at
+        // IS NOT NULL` makes paid_at non-null in the 'paid' variant.
+        let t = types(&[("status", "string"), ("paid_at", "Date | null")]);
+        let r = parse_row_check_def(
+            "CHECK (CASE \
+                WHEN (status = 'paid'::text)  THEN (paid_at IS NOT NULL) \
+                WHEN (status = 'draft'::text) THEN (paid_at IS NULL) \
+                ELSE true END)",
+            &t,
+        ).unwrap();
+        // 2 WHENs + catch-all (ELSE true widens) = 3.
+        assert_eq!(r.variants.len(), 3);
+        assert_eq!(r.variants[0].columns["status"], "\"paid\"");
+        assert_eq!(r.variants[0].columns["paid_at"], "Date");
+        assert_eq!(r.variants[1].columns["status"], "\"draft\"");
+        assert_eq!(r.variants[1].columns["paid_at"], "null");
+    }
+
+    #[test]
+    fn row_case_then_and_chain_of_multiple_atoms() {
+        // CASE THEN with AND-chain narrowing two extra columns at once.
+        let t = types(&[
+            ("kind", "string"),
+            ("a",    "string | null"),
+            ("b",    "string | null"),
+        ]);
+        let r = parse_row_check_def(
+            "CHECK (CASE \
+                WHEN (kind = 'x'::text) THEN ((a IS NOT NULL) AND (b IS NULL)) \
+                ELSE false END)",
+            &t,
+        ).unwrap();
+        assert_eq!(r.variants.len(), 1);
+        assert_eq!(r.variants[0].columns["kind"], "\"x\"");
+        assert_eq!(r.variants[0].columns["a"], "string");
+        assert_eq!(r.variants[0].columns["b"], "null");
     }
 }
