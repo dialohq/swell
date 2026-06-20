@@ -1,78 +1,77 @@
 # End-to-end test corpus
 
-Each `.md` file in a category subdirectory is **one test case**. The
-runner lives in `tests/corpus.rs` and exposes a single `cargo test`
-case (`corpus`) that walks every case, runs the full pipeline
-(Postgres → analyzer → codegen), and compares against the expected
-output embedded in the markdown.
+One `.md` file = one **suite** of tests sharing a schema. The runner
+lives in `tests/corpus.rs`; `cargo test -p swell-codegen --test
+corpus` runs every suite, parsing the markdown with `pulldown-cmark`
+and asserting each test against the full pipeline (live Postgres →
+analyzer → codegen helpers).
 
-## Layout
+## Suite format
 
-```
-tests/corpus/
-├── README.md
-├── analyzer/
-│   ├── _setup.sql              ← shared fixture, applied once
-│   ├── scalar_select_with_param.md
-│   └── …
-└── billing/
-    ├── _setup.sql
-    ├── _schemas.txt            ← non-public schemas the analyzer needs
-    └── …
+```md
+# [Setup](./analyzer.setup.sql)
+
+# Common types
+
+```ts
+export interface Users { id: string; … }
 ```
 
-`_setup.sql` (optional) is applied once per category before any case
-in it runs. It must be idempotent — `DROP … IF EXISTS … CASCADE`
-followed by `CREATE …`. Cases reuse the tables it creates.
+# Tests
 
-`_schemas.txt` (optional) is one schema name per line. Defaults to
-`public`. Used so the analyzer's type catalog picks up enums /
-domains / composite types defined in non-`public` schemas.
-
-## Case format
-
-A case is markdown with one or more fenced code blocks. Free-form
-prose between fences documents the case — it doesn't affect what
-runs.
-
-* **Zero or one** ` ```sql ` block for an **ad-hoc schema** the case
-  needs in addition to the shared `_setup.sql`. The runner snapshots
-  `pg_class` before/after and drops exactly what this block created.
-* **Zero or one** ` ```sql ` block for the **query** to analyze
-  (must follow the schema block if both are present).
-* **Exactly one** of:
-  * ` ```ts ` — the full expected codegen output. The auto-gen banner
-    is stripped before comparison.
-  * ` ```err ` — substring that must appear in the analyzer's error.
-    Use for "this SQL should fail" tests.
-
-## Promotion (cram-style)
-
-When the actual output drifts:
-
-```
-CORPUS_PROMOTE=1 cargo test -p swell-codegen --test corpus
-```
-
-The runner rewrites the ` ```ts ` block in each affected `.md` with
-the actual output. Read `git diff` to confirm the change is intended.
-
-## Adding a case
-
-```bash
-cat > tests/corpus/analyzer/my_new_test.md <<'EOF'
-# My new test
+## A scenario name
 
 ```sql
-SELECT id FROM users WHERE id = $1
+SELECT id, email FROM users WHERE id = $1
 ```
 
 ```ts
+$1: string | null
+result: { id: Users["id"]; email: Users["email"] }
 ```
-EOF
+```
 
+Sections, recognised by H1 headings:
+
+* **`# Setup`** — either an inline ` ```sql ` block applied to the DB,
+  or a markdown link `# [Setup](./_some.sql)` pointing to a sibling
+  file. Use the link form when the same fixture is shared across
+  multiple suites.
+* **`# Common types`** — the rendered table interfaces. Maintained
+  automatically: when the schema changes, `CORPUS_PROMOTE=1` rewrites
+  this block.
+* **`# Tests`** — header marker. Each `## <name>` underneath is one
+  test case with two blocks: a ` ```sql ` (the query) and a ` ```ts `
+  (the expected). The expected uses the **compact form**:
+    * `$N: <type>` — one line per param.
+    * `result: <ts-type>` — the row type, or `result: never` for
+      write-only queries.
+    * `error: <substring>` — the analyzer must fail with this
+      substring in the error text. No other content allowed in an
+      error case.
+
+`_schemas.txt` (one schema per line) lists schemas the analyzer's
+type catalog should load — needed when fixtures put their objects in
+a non-`public` schema (e.g. `billing`). Defaults to `public`.
+
+## Promotion (cram-style)
+
+```bash
 CORPUS_PROMOTE=1 cargo test -p swell-codegen --test corpus
 ```
 
-The empty ` ```ts ` block gets filled with the actual output. Inspect,
-commit.
+The runner rewrites the `# Common types` block and each `## <test>`'s
+` ```ts ` block in place, preserving everything else byte-for-byte.
+Inspect with `git diff`, commit if right.
+
+## Adding a test
+
+Drop a `## <name>` block into the appropriate suite with the SQL
+fence and an empty ` ```ts ``` ` block. Run with `CORPUS_PROMOTE=1`.
+The expected gets filled in automatically.
+
+## Adding a suite
+
+Create `tests/corpus/<name>.md` (top-level — suites are flat,
+file-per-suite). Either include an inline ` ```sql ` block under
+`# Setup` or link to a sibling `_setup.sql`.
