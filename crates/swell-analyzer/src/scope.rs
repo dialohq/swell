@@ -53,15 +53,27 @@ impl Scope {
     ) -> Result<Self> {
         let distinct: HashSet<(String, String)> = alias_to_table.values().cloned().collect();
         let columns = fetch_columns(client, &distinct).await?;
-        let aliases = alias_to_table.into_iter()
+        let aliases = alias_to_table
+            .into_iter()
             .filter_map(|(alias, (schema, name))| {
                 let cols = columns.get(&(schema.clone(), name.clone()))?.clone();
-                Some((alias, ResolvedTable { schema, name, columns: cols }))
+                Some((
+                    alias,
+                    ResolvedTable {
+                        schema,
+                        name,
+                        columns: cols,
+                    },
+                ))
             })
             .collect();
         Ok(Self {
-            aliases, derived: HashMap::new(), nullable, non_null,
-            unsafe_casts, typname_to_oid,
+            aliases,
+            derived: HashMap::new(),
+            nullable,
+            non_null,
+            unsafe_casts,
+            typname_to_oid,
         })
     }
 
@@ -86,7 +98,9 @@ impl Scope {
     pub fn resolve_alias(&self, alias: &str) -> Option<&ResolvedTable> {
         // PG renames duplicate scan aliases to `users_1`, `users_2` in
         // plans — fall back to the de-numbered form.
-        self.aliases.get(alias).or_else(|| self.aliases.get(strip_suffix_digits(alias)))
+        self.aliases
+            .get(alias)
+            .or_else(|| self.aliases.get(strip_suffix_digits(alias)))
     }
 
     /// Bare `<col>` resolves only when scope's aliases agree on its
@@ -95,14 +109,19 @@ impl Scope {
     /// non-null verdict when there's a single non-null source alias
     /// (literal `unnest`, all-literal VALUES) and no catalog match.
     pub fn resolve_bare(&self, col: &str) -> Option<BareResolved> {
-        let matches: Vec<(&String, &ResolvedTable, bool)> = self.aliases.iter()
+        let matches: Vec<(&String, &ResolvedTable, bool)> = self
+            .aliases
+            .iter()
             .filter_map(|(a, t)| t.col_not_null(col).map(|nn| (a, t, nn)))
             .collect();
         if !matches.is_empty() {
             let (_, first_table, _) = matches[0];
-            let same_table = matches.iter()
+            let same_table = matches
+                .iter()
                 .all(|(_, t, _)| t.schema == first_table.schema && t.name == first_table.name);
-            if !same_table { return None; }
+            if !same_table {
+                return None;
+            }
             let widening = matches.iter().any(|(a, _, _)| self.is_nullable_alias(a));
             let force_nn = matches.iter().any(|(a, _, _)| self.is_non_null_alias(a));
             let base_nn = matches.iter().all(|(_, _, nn)| *nn);
@@ -115,7 +134,9 @@ impl Scope {
                 typoid: table.col_typoid(col).unwrap_or(0),
             });
         }
-        let derived_matches: Vec<(&String, &DerivedColumn)> = self.derived.iter()
+        let derived_matches: Vec<(&String, &DerivedColumn)> = self
+            .derived
+            .iter()
             .filter_map(|(a, cols)| cols.iter().find(|c| c.name == col).map(|c| (a, c)))
             .collect();
         if derived_matches.len() == 1 {
@@ -131,8 +152,11 @@ impl Scope {
         if self.non_null.len() == 1 {
             let alias = self.non_null.iter().next()?.clone();
             return Some(BareResolved {
-                schema: String::new(), table: String::new(),
-                alias, not_null: true, typoid: 0,
+                schema: String::new(),
+                table: String::new(),
+                alias,
+                not_null: true,
+                typoid: 0,
             });
         }
         None
@@ -149,7 +173,9 @@ impl Scope {
     /// First alias (alphabetically) pointing at `(schema, table)` —
     /// deterministic tiebreak for star-expansion outputs on self-joins.
     pub fn find_alias(&self, schema: &str, table: &str) -> Option<&str> {
-        let mut matches: Vec<&str> = self.aliases.iter()
+        let mut matches: Vec<&str> = self
+            .aliases
+            .iter()
             .filter(|(_, t)| t.schema == schema && t.name == table)
             .map(|(a, _)| a.as_str())
             .collect();
@@ -174,13 +200,17 @@ fn strip_suffix_digits(s: &str) -> &str {
 }
 
 async fn fetch_columns(
-    client: &Client, pairs: &HashSet<(String, String)>,
+    client: &Client,
+    pairs: &HashSet<(String, String)>,
 ) -> Result<HashMap<(String, String), HashMap<String, (bool, u32)>>> {
-    if pairs.is_empty() { return Ok(HashMap::new()); }
+    if pairs.is_empty() {
+        return Ok(HashMap::new());
+    }
     let schemas: Vec<&str> = pairs.iter().map(|p| p.0.as_str()).collect();
-    let tables: Vec<&str>  = pairs.iter().map(|p| p.1.as_str()).collect();
-    let rows = client.query(
-        r#"
+    let tables: Vec<&str> = pairs.iter().map(|p| p.1.as_str()).collect();
+    let rows = client
+        .query(
+            r#"
         WITH ask(schema, name) AS (SELECT * FROM unnest($1::text[], $2::text[]))
         SELECT n.nspname, c.relname, a.attname, a.attnotnull, a.atttypid::oid
         FROM ask
@@ -189,16 +219,19 @@ async fn fetch_columns(
         JOIN pg_attribute a ON a.attrelid = c.oid
         WHERE a.attnum > 0 AND NOT a.attisdropped
         "#,
-        &[&schemas, &tables],
-    ).await?;
+            &[&schemas, &tables],
+        )
+        .await?;
     let mut out: HashMap<(String, String), HashMap<String, (bool, u32)>> = HashMap::new();
     for row in &rows {
         let schema: String = row.get(0);
-        let table: String  = row.get(1);
-        let col: String    = row.get(2);
-        let nn: bool       = row.get(3);
-        let oid: u32       = row.get(4);
-        out.entry((schema, table)).or_default().insert(col, (nn, oid));
+        let table: String = row.get(1);
+        let col: String = row.get(2);
+        let nn: bool = row.get(3);
+        let oid: u32 = row.get(4);
+        out.entry((schema, table))
+            .or_default()
+            .insert(col, (nn, oid));
     }
     Ok(out)
 }

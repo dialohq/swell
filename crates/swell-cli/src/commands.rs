@@ -4,13 +4,13 @@ use crate::cache;
 use crate::config::{Config, OnError};
 use anyhow::{anyhow, bail, Context, Result};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use swell_analyzer::{Analyzer, AnalyzerOptions, InferredQuery, TableSchema};
-use swell_codegen::{render, CodegenOptions};
-use swell_scanner::{scan_file, ScanOptions, ScannedQuery};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
+use swell_analyzer::{Analyzer, AnalyzerOptions, InferredQuery, TableSchema};
+use swell_codegen::{render, CodegenOptions};
+use swell_scanner::{scan_file, ScanOptions, ScannedQuery};
 use tracing::{info, warn};
 
 #[derive(Clone, Copy)]
@@ -24,9 +24,21 @@ pub struct RunOpts {
 }
 
 impl RunOpts {
-    pub const GEN:     Self = Self { allow_db: true,  prune: true,  require_cache: false };
-    pub const PREPARE: Self = Self { allow_db: true,  prune: true,  require_cache: false };
-    pub const CHECK:   Self = Self { allow_db: false, prune: false, require_cache: true  };
+    pub const GEN: Self = Self {
+        allow_db: true,
+        prune: true,
+        require_cache: false,
+    };
+    pub const PREPARE: Self = Self {
+        allow_db: true,
+        prune: true,
+        require_cache: false,
+    };
+    pub const CHECK: Self = Self {
+        allow_db: false,
+        prune: false,
+        require_cache: true,
+    };
 }
 
 pub struct RunSummary {
@@ -66,10 +78,12 @@ pub async fn watch(cfg: &Config) -> Result<()> {
     }
 
     let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
-    let mut watcher: RecommendedWatcher =
-        notify::recommended_watcher(move |res| { let _ = tx.send(res); })
-        .context("creating file watcher")?;
-    watcher.watch(&cfg.root, RecursiveMode::Recursive)
+    let mut watcher: RecommendedWatcher = notify::recommended_watcher(move |res| {
+        let _ = tx.send(res);
+    })
+    .context("creating file watcher")?;
+    watcher
+        .watch(&cfg.root, RecursiveMode::Recursive)
         .context("watching project root")?;
 
     info!("watching {} (Ctrl-C to exit)", cfg.root.display());
@@ -78,7 +92,10 @@ pub async fn watch(cfg: &Config) -> Result<()> {
     let mut pending = false;
     loop {
         match rx.recv_timeout(WATCH_DEBOUNCE) {
-            Ok(Ok(ev)) if is_relevant(&ev, cfg) => { last = Some(Instant::now()); pending = true; }
+            Ok(Ok(ev)) if is_relevant(&ev, cfg) => {
+                last = Some(Instant::now());
+                pending = true;
+            }
             Ok(_) => {}
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -94,16 +111,23 @@ pub async fn watch(cfg: &Config) -> Result<()> {
 }
 
 fn is_relevant(ev: &Event, cfg: &Config) -> bool {
-    if !matches!(ev.kind, EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)) {
+    if !matches!(
+        ev.kind,
+        EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)
+    ) {
         return false;
     }
     let cache_dir = cfg.cache.dir.to_string_lossy();
     let out_file = cfg.output.file.to_string_lossy();
     ev.paths.iter().any(|p| {
         let s = p.to_string_lossy();
-        if s.contains(&*cache_dir) || s.ends_with(&*out_file) { return false; }
-        matches!(p.extension().and_then(|e| e.to_str()),
-            Some("ts" | "tsx" | "sql" | "toml"))
+        if s.contains(&*cache_dir) || s.ends_with(&*out_file) {
+            return false;
+        }
+        matches!(
+            p.extension().and_then(|e| e.to_str()),
+            Some("ts" | "tsx" | "sql" | "toml")
+        )
     })
 }
 
@@ -115,9 +139,13 @@ async fn run_pipeline(cfg: &Config, opts: RunOpts) -> Result<RunSummary> {
     let scanned = scan_project(cfg)?;
     info!("found {} sql() call sites", scanned.len());
 
-    let unique: BTreeMap<String, &ScannedQuery> = scanned.iter()
+    let unique: BTreeMap<String, &ScannedQuery> = scanned
+        .iter()
         .map(|q| (q.static_parts.first().cloned().unwrap_or_default(), q))
-        .fold(BTreeMap::new(), |mut acc, (k, v)| { acc.entry(k).or_insert(v); acc });
+        .fold(BTreeMap::new(), |mut acc, (k, v)| {
+            acc.entry(k).or_insert(v);
+            acc
+        });
     info!("{} unique queries", unique.len());
 
     let cache_dir = cfg.root.join(&cfg.cache.dir);
@@ -126,13 +154,23 @@ async fn run_pipeline(cfg: &Config, opts: RunOpts) -> Result<RunSummary> {
         match Analyzer::connect(AnalyzerOptions {
             database_url: cfg.database.url.clone().unwrap(),
             schemas: cfg.database.schemas.clone(),
-            type_overrides: cfg.types.by_name.iter().map(|(k, v)| {
-                (k.clone(), swell_analyzer::TypeOverride {
-                    parse: v.parse().to_string(),
-                    serialize: v.serialize().to_string(),
+            type_overrides: cfg
+                .types
+                .by_name
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        k.clone(),
+                        swell_analyzer::TypeOverride {
+                            parse: v.parse().to_string(),
+                            serialize: v.serialize().to_string(),
+                        },
+                    )
                 })
-            }).collect(),
-        }).await {
+                .collect(),
+        })
+        .await
+        {
             Ok(a) => Some(a),
             Err(e) if !opts.require_cache => {
                 warn!("could not connect to Postgres: {e:#}; trying offline cache");
@@ -140,10 +178,15 @@ async fn run_pipeline(cfg: &Config, opts: RunOpts) -> Result<RunSummary> {
             }
             Err(e) => return Err(e).context("connecting to dev Postgres"),
         }
-    } else { None };
+    } else {
+        None
+    };
 
     let schema_fp = match &analyzer {
-        Some(an) => an.schema_fingerprint(&cfg.database.schemas).await.unwrap_or_default(),
+        Some(an) => an
+            .schema_fingerprint(&cfg.database.schemas)
+            .await
+            .unwrap_or_default(),
         None => String::new(),
     };
 
@@ -158,9 +201,10 @@ async fn run_pipeline(cfg: &Config, opts: RunOpts) -> Result<RunSummary> {
         seen.push(key.clone());
 
         let cached = cache::read(&cache_dir, &key);
-        let stale = cached.as_ref().is_some_and(|e|
+        let stale = cached.as_ref().is_some_and(|e| {
             e.tool_version != cache::TOOL_VERSION
-            || (analyzer.is_some() && e.schema_fingerprint != schema_fp));
+                || (analyzer.is_some() && e.schema_fingerprint != schema_fp)
+        });
 
         if let Some(entry) = cached.filter(|_| !stale) {
             hits += 1;
@@ -170,8 +214,10 @@ async fn run_pipeline(cfg: &Config, opts: RunOpts) -> Result<RunSummary> {
 
         let Some(an) = analyzer.as_ref() else {
             errors = true;
-            warn!("offline mode: query at {}:{}:{} not found in cache",
-                scan.file, scan.line, scan.col);
+            warn!(
+                "offline mode: query at {}:{}:{} not found in cache",
+                scan.file, scan.line, scan.col
+            );
             continue;
         };
 
@@ -207,8 +253,12 @@ async fn run_pipeline(cfg: &Config, opts: RunOpts) -> Result<RunSummary> {
         }
     }
 
-    let extra_imports: Vec<(String, Vec<String>)> = cfg.output.imports.iter()
-        .map(|i| (i.from.clone(), i.names.clone())).collect();
+    let extra_imports: Vec<(String, Vec<String>)> = cfg
+        .output
+        .imports
+        .iter()
+        .map(|i| (i.from.clone(), i.names.clone()))
+        .collect();
 
     // Base tables referenced by any column / param. Offline: skipped
     // (codegen falls back to inline types).
@@ -219,7 +269,10 @@ async fn run_pipeline(cfg: &Config, opts: RunOpts) -> Result<RunSummary> {
 
     let dts = render(
         &inferred,
-        CodegenOptions { extra_imports: &extra_imports, tables: &tables },
+        CodegenOptions {
+            extra_imports: &extra_imports,
+            tables: &tables,
+        },
     );
     let out_path = cfg.root.join(&cfg.output.file);
     if let Some(parent) = out_path.parent() {
@@ -227,11 +280,16 @@ async fn run_pipeline(cfg: &Config, opts: RunOpts) -> Result<RunSummary> {
             .with_context(|| format!("create dir: {}", parent.display()))?;
     }
     write_if_changed(&out_path, &dts)?;
-    info!("wrote {} ({} entries; {hits} hits, {misses} misses)",
-        out_path.display(), inferred.len());
+    info!(
+        "wrote {} ({} entries; {hits} hits, {misses} misses)",
+        out_path.display(),
+        inferred.len()
+    );
 
     if errors && cfg.diagnostics.on_error == OnError::Fail {
-        return Err(anyhow!("one or more queries failed analysis (diagnostics.on_error = fail)"));
+        return Err(anyhow!(
+            "one or more queries failed analysis (diagnostics.on_error = fail)"
+        ));
     }
     Ok(RunSummary { hits, errors })
 }
@@ -275,14 +333,21 @@ fn scan_project(cfg: &Config) -> Result<Vec<ScannedQuery>> {
         .filter_entry(|e| !is_hidden(e))
     {
         let entry = entry?;
-        if !entry.file_type().is_file() { continue }
+        if !entry.file_type().is_file() {
+            continue;
+        }
         let abs = entry.path();
         let rel = abs.strip_prefix(&cfg.root).unwrap_or(abs);
-        if exclude.is_match(rel) || !include.is_match(rel) { continue }
+        if exclude.is_match(rel) || !include.is_match(rel) {
+            continue;
+        }
 
         let src = match std::fs::read_to_string(abs) {
             Ok(s) => s,
-            Err(e) => { warn!("could not read {}: {e}", abs.display()); continue; }
+            Err(e) => {
+                warn!("could not read {}: {e}", abs.display());
+                continue;
+            }
         };
         match scan_file(abs, &src, opts.clone()) {
             Ok(qs) => out.extend(qs),
@@ -293,7 +358,8 @@ fn scan_project(cfg: &Config) -> Result<Vec<ScannedQuery>> {
 }
 
 fn is_hidden(e: &walkdir::DirEntry) -> bool {
-    e.file_name().to_str()
+    e.file_name()
+        .to_str()
         .map(|s| s.starts_with('.') && s != "." && s != ".." && s != ".swell")
         .unwrap_or(false)
 }
@@ -307,7 +373,8 @@ fn build_globset(patterns: &[String]) -> Result<globset::GlobSet> {
 }
 
 fn write_if_changed(path: &Path, contents: &str) -> Result<()> {
-    if std::fs::read_to_string(path).ok().as_deref() == Some(contents) { return Ok(()) }
-    std::fs::write(path, contents)
-        .with_context(|| format!("write: {}", path.display()))
+    if std::fs::read_to_string(path).ok().as_deref() == Some(contents) {
+        return Ok(());
+    }
+    std::fs::write(path, contents).with_context(|| format!("write: {}", path.display()))
 }

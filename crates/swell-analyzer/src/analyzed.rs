@@ -41,16 +41,25 @@ pub enum Expr {
     /// source; `is_unsafe` flags the specific `(source, target)` pair
     /// as a user-defined `castmethod='f'` cast that could return NULL
     /// on non-NULL input.
-    Cast { inner: Box<Expr>, target_oid: u32, is_unsafe: bool },
+    Cast {
+        inner: Box<Expr>,
+        target_oid: u32,
+        is_unsafe: bool,
+    },
     /// `ARRAY[…]` — never null regardless of elements.
     ArrayConstructor,
     Column(ResolvedCol),
-    Func { kind: FuncKind, args: Vec<Expr> },
+    Func {
+        kind: FuncKind,
+        args: Vec<Expr>,
+    },
     /// Non-null iff any arg is non-null.
     Coalesce(Vec<Expr>),
     /// `has_else_non_null` short-circuits the verdict — a missing ELSE
     /// makes the result nullable.
-    Case { has_else_non_null: bool },
+    Case {
+        has_else_non_null: bool,
+    },
     /// Scalar subquery. Verdict comes from its first output.
     SubQuery(Box<Analyzed>),
     /// One output position in a set-op (UNION / INTERSECT / EXCEPT) —

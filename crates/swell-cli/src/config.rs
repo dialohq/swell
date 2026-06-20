@@ -29,7 +29,9 @@ pub struct Database {
     pub schemas: Vec<String>,
 }
 
-fn default_schemas() -> Vec<String> { vec!["public".into()] }
+fn default_schemas() -> Vec<String> {
+    vec!["public".into()]
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Scan {
@@ -53,8 +55,12 @@ impl Default for Scan {
     }
 }
 
-fn default_include() -> Vec<String> { vec!["src/**/*.ts".into(), "src/**/*.tsx".into()] }
-fn default_exclude() -> Vec<String> { vec!["**/*.test.ts".into(), "node_modules/**".into()] }
+fn default_include() -> Vec<String> {
+    vec!["src/**/*.ts".into(), "src/**/*.tsx".into()]
+}
+fn default_exclude() -> Vec<String> {
+    vec!["**/*.test.ts".into(), "node_modules/**".into()]
+}
 fn default_q_modules() -> Vec<String> {
     vec![
         "./swell.generated".into(),
@@ -93,8 +99,12 @@ impl Default for Output {
     }
 }
 
-fn default_output_file() -> PathBuf { PathBuf::from("src/swell.generated.ts") }
-fn default_pretty() -> bool { true }
+fn default_output_file() -> PathBuf {
+    PathBuf::from("src/swell.generated.ts")
+}
+fn default_pretty() -> bool {
+    true
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Cache {
@@ -103,10 +113,16 @@ pub struct Cache {
 }
 
 impl Default for Cache {
-    fn default() -> Self { Self { dir: default_cache_dir() } }
+    fn default() -> Self {
+        Self {
+            dir: default_cache_dir(),
+        }
+    }
 }
 
-fn default_cache_dir() -> PathBuf { PathBuf::from(".swell") }
+fn default_cache_dir() -> PathBuf {
+    PathBuf::from(".swell")
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Diagnostics {
@@ -115,14 +131,23 @@ pub struct Diagnostics {
 }
 
 impl Default for Diagnostics {
-    fn default() -> Self { Self { on_error: default_on_error() } }
+    fn default() -> Self {
+        Self {
+            on_error: default_on_error(),
+        }
+    }
 }
 
-fn default_on_error() -> OnError { OnError::Fail }
+fn default_on_error() -> OnError {
+    OnError::Fail
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
-pub enum OnError { Skip, Fail }
+pub enum OnError {
+    Skip,
+    Fail,
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Types {
@@ -143,8 +168,16 @@ pub enum TypeOverride {
 }
 
 impl TypeOverride {
-    pub fn parse(&self) -> &str { match self { Self::Both(s) | Self::Split { parse: s, .. } => s } }
-    pub fn serialize(&self) -> &str { match self { Self::Both(s) | Self::Split { serialize: s, .. } => s } }
+    pub fn parse(&self) -> &str {
+        match self {
+            Self::Both(s) | Self::Split { parse: s, .. } => s,
+        }
+    }
+    pub fn serialize(&self) -> &str {
+        match self {
+            Self::Both(s) | Self::Split { serialize: s, .. } => s,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -161,8 +194,8 @@ pub fn load(path: &Path) -> Result<Config> {
         .with_context(|| format!("config file not found: {}", path.display()))?;
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("read config: {}", path.display()))?;
-    let mut cfg: Config = toml::from_str(&text)
-        .with_context(|| format!("parse config: {}", path.display()))?;
+    let mut cfg: Config =
+        toml::from_str(&text).with_context(|| format!("parse config: {}", path.display()))?;
     cfg.root = path.parent().unwrap_or(Path::new(".")).to_path_buf();
 
     // Env-var fallback for the database URL.

@@ -22,13 +22,19 @@ pub struct DescribedColumn {
 }
 
 pub async fn describe(client: &Client, sql: &str) -> anyhow::Result<DescribedQuery> {
-    let stmt = client.prepare(sql).await
-        .map_err(|e| anyhow::anyhow!("PARSE/DESCRIBE failed for query:\n  {}\n  → {}",
-            sql.trim(), format_pg_error(&e)))?;
+    let stmt = client.prepare(sql).await.map_err(|e| {
+        anyhow::anyhow!(
+            "PARSE/DESCRIBE failed for query:\n  {}\n  → {}",
+            sql.trim(),
+            format_pg_error(&e)
+        )
+    })?;
 
     Ok(DescribedQuery {
         params: stmt.params().to_vec(),
-        columns: stmt.columns().iter()
+        columns: stmt
+            .columns()
+            .iter()
             .map(|c| DescribedColumn {
                 name: c.name().to_string(),
                 type_: c.type_().clone(),
@@ -42,10 +48,18 @@ pub async fn describe(client: &Client, sql: &str) -> anyhow::Result<DescribedQue
 /// Unwrap a `tokio_postgres::Error` to surface the actual server message.
 /// The default Display impl is unhelpfully terse ("db error").
 pub(crate) fn format_pg_error(e: &tokio_postgres::Error) -> String {
-    let Some(db) = e.as_db_error() else { return e.to_string() };
+    let Some(db) = e.as_db_error() else {
+        return e.to_string();
+    };
     let mut out = db.message().to_string();
-    if let Some(d) = db.detail() { out.push_str("\n  detail: "); out.push_str(d); }
-    if let Some(h) = db.hint()   { out.push_str("\n  hint: ");   out.push_str(h); }
+    if let Some(d) = db.detail() {
+        out.push_str("\n  detail: ");
+        out.push_str(d);
+    }
+    if let Some(h) = db.hint() {
+        out.push_str("\n  hint: ");
+        out.push_str(h);
+    }
     out.push_str(&format!(" (SQLSTATE {})", db.code().code()));
     out
 }

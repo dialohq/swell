@@ -8,31 +8,62 @@ use pg_query::protobuf::{a_const::Val, node::Node as NB, Node, SubLinkType, Type
 
 /// Aggregates that return `NULL` on empty input.
 const NULLABLE_AGGS: &[&str] = &[
-    "sum", "avg", "min", "max",
-    "array_agg", "json_agg", "jsonb_agg",
-    "string_agg", "bool_and", "bool_or",
+    "sum",
+    "avg",
+    "min",
+    "max",
+    "array_agg",
+    "json_agg",
+    "jsonb_agg",
+    "string_agg",
+    "bool_and",
+    "bool_or",
 ];
 
 /// Functions guaranteed non-NULL by construction.
 const NEVER_NULL_FUNCS: &[&str] = &[
     "count",
-    "row_number", "rank", "dense_rank", "ntile", "cume_dist", "percent_rank",
-    "now", "current_timestamp", "current_date", "current_time",
-    "localtimestamp", "localtime",
-    "current_user", "session_user", "current_database",
-    "current_schema", "current_setting",
-    "gen_random_uuid", "uuid_generate_v1", "uuid_generate_v4",
-    "pg_advisory_lock", "pg_advisory_xact_lock",
-    "jsonb_build_object", "json_build_object",
-    "jsonb_build_array", "json_build_array",
-    "to_jsonb", "to_json", "row_to_json", "array_to_json",
+    "row_number",
+    "rank",
+    "dense_rank",
+    "ntile",
+    "cume_dist",
+    "percent_rank",
+    "now",
+    "current_timestamp",
+    "current_date",
+    "current_time",
+    "localtimestamp",
+    "localtime",
+    "current_user",
+    "session_user",
+    "current_database",
+    "current_schema",
+    "current_setting",
+    "gen_random_uuid",
+    "uuid_generate_v1",
+    "uuid_generate_v4",
+    "pg_advisory_lock",
+    "pg_advisory_xact_lock",
+    "jsonb_build_object",
+    "json_build_object",
+    "jsonb_build_array",
+    "json_build_array",
+    "to_jsonb",
+    "to_json",
+    "row_to_json",
+    "array_to_json",
 ];
 
 pub fn lower(node: &Node, scope: &Scope) -> Expr {
-    let Some(body) = node.node.as_ref() else { return Expr::Unknown };
+    let Some(body) = node.node.as_ref() else {
+        return Expr::Unknown;
+    };
     match body {
         NB::AConst(c) => {
-            if c.isnull { return Expr::Null; }
+            if c.isnull {
+                return Expr::Null;
+            }
             match c.val.as_ref() {
                 Some(Val::Sval(s)) => Expr::Literal(Lit::Str(s.sval.clone())),
                 Some(Val::Ival(i)) => Expr::Literal(Lit::Num(i.ival.to_string())),
@@ -42,36 +73,64 @@ pub fn lower(node: &Node, scope: &Scope) -> Expr {
             }
         }
         NB::TypeCast(tc) => {
-            let inner = tc.arg.as_deref().map(|a| lower(a, scope)).unwrap_or(Expr::Unknown);
-            let target_oid = tc.type_name.as_ref()
+            let inner = tc
+                .arg
+                .as_deref()
+                .map(|a| lower(a, scope))
+                .unwrap_or(Expr::Unknown);
+            let target_oid = tc
+                .type_name
+                .as_ref()
                 .and_then(|tn| resolve_typename_oid(tn, scope))
                 .unwrap_or(0);
             let is_unsafe = match (inner_type_oid(&inner), target_oid) {
                 (Some(src), tgt) if tgt != 0 => scope.is_unsafe_cast(src, tgt),
                 _ => false,
             };
-            Expr::Cast { inner: Box::new(inner), target_oid, is_unsafe }
+            Expr::Cast {
+                inner: Box::new(inner),
+                target_oid,
+                is_unsafe,
+            }
         }
         NB::AArrayExpr(_) => Expr::ArrayConstructor,
         // Parse-time COALESCE comes through as FuncCall — CoalesceExpr is
         // post-analysis. We handle both.
         NB::CoalesceExpr(ce) => Expr::Coalesce(lower_args(&ce.args, scope)),
         NB::CaseExpr(ce) => Expr::Case {
-            has_else_non_null: ce.defresult.as_deref()
+            has_else_non_null: ce
+                .defresult
+                .as_deref()
                 .is_some_and(|d| is_non_null(&lower(d, scope))),
         },
         NB::FuncCall(fc) => {
-            let Some(NB::String(s)) = fc.funcname.last().and_then(|n| n.node.as_ref())
-                else { return Expr::Unknown };
+            let Some(NB::String(s)) = fc.funcname.last().and_then(|n| n.node.as_ref()) else {
+                return Expr::Unknown;
+            };
             let name = s.sval.as_str();
             let args = lower_args(&fc.args, scope);
-            if name == "coalesce" { Expr::Coalesce(args) }
-            else if NEVER_NULL_FUNCS.contains(&name) { Expr::Func { kind: FuncKind::NeverNull, args } }
-            else if NULLABLE_AGGS.contains(&name) { Expr::Func { kind: FuncKind::NullableAgg, args } }
-            else { Expr::Func { kind: FuncKind::Other, args } }
+            if name == "coalesce" {
+                Expr::Coalesce(args)
+            } else if NEVER_NULL_FUNCS.contains(&name) {
+                Expr::Func {
+                    kind: FuncKind::NeverNull,
+                    args,
+                }
+            } else if NULLABLE_AGGS.contains(&name) {
+                Expr::Func {
+                    kind: FuncKind::NullableAgg,
+                    args,
+                }
+            } else {
+                Expr::Func {
+                    kind: FuncKind::Other,
+                    args,
+                }
+            }
         }
         NB::ColumnRef(cr) => lower_column_ref(cr, scope)
-            .map(Expr::Column).unwrap_or(Expr::Unknown),
+            .map(Expr::Column)
+            .unwrap_or(Expr::Unknown),
         NB::SubLink(sl) => lower_sublink(sl, scope),
         _ => Expr::Unknown,
     }
@@ -85,18 +144,24 @@ pub fn lower(node: &Node, scope: &Scope) -> Expr {
 fn lower_sublink(sl: &pg_query::protobuf::SubLink, scope: &Scope) -> Expr {
     match SubLinkType::try_from(sl.sub_link_type).unwrap_or(SubLinkType::Undefined) {
         SubLinkType::ExistsSublink => Expr::Func {
-            kind: FuncKind::NeverNull, args: Vec::new(),
+            kind: FuncKind::NeverNull,
+            args: Vec::new(),
         },
         SubLinkType::ArraySublink => Expr::ArrayConstructor,
         SubLinkType::ExprSublink => {
-            let Some(sub) = sl.subselect.as_deref() else { return Expr::Unknown };
-            let Some(NB::SelectStmt(s)) = sub.node.as_ref() else { return Expr::Unknown };
-            if !is_provably_one_row_select(s) { return Expr::Unknown; }
-            let first = s.target_list.first()
-                .and_then(|t| match t.node.as_ref()? {
-                    NB::ResTarget(rt) => rt.val.as_deref(),
-                    _ => None,
-                });
+            let Some(sub) = sl.subselect.as_deref() else {
+                return Expr::Unknown;
+            };
+            let Some(NB::SelectStmt(s)) = sub.node.as_ref() else {
+                return Expr::Unknown;
+            };
+            if !is_provably_one_row_select(s) {
+                return Expr::Unknown;
+            }
+            let first = s.target_list.first().and_then(|t| match t.node.as_ref()? {
+                NB::ResTarget(rt) => rt.val.as_deref(),
+                _ => None,
+            });
             first.map(|n| lower(n, scope)).unwrap_or(Expr::Unknown)
         }
         _ => Expr::Unknown,
@@ -104,11 +169,19 @@ fn lower_sublink(sl: &pg_query::protobuf::SubLink, scope: &Scope) -> Expr {
 }
 
 fn is_provably_one_row_select(s: &pg_query::protobuf::SelectStmt) -> bool {
-    if !s.group_clause.is_empty() || s.target_list.is_empty() { return false; }
+    if !s.group_clause.is_empty() || s.target_list.is_empty() {
+        return false;
+    }
     s.target_list.iter().all(|t| {
-        let Some(NB::ResTarget(rt)) = t.node.as_ref() else { return false };
-        let Some(val) = rt.val.as_deref() else { return false };
-        let Some(NB::FuncCall(fc)) = val.node.as_ref() else { return false };
+        let Some(NB::ResTarget(rt)) = t.node.as_ref() else {
+            return false;
+        };
+        let Some(val) = rt.val.as_deref() else {
+            return false;
+        };
+        let Some(NB::FuncCall(fc)) = val.node.as_ref() else {
+            return false;
+        };
         let name = fc.funcname.last().and_then(|n| match n.node.as_ref()? {
             NB::String(s) => Some(s.sval.as_str()),
             _ => None,
@@ -122,7 +195,9 @@ fn lower_args(args: &[Node], scope: &Scope) -> Vec<Expr> {
 }
 
 fn lower_column_ref(cr: &pg_query::protobuf::ColumnRef, scope: &Scope) -> Option<ResolvedCol> {
-    let parts: Vec<&str> = cr.fields.iter()
+    let parts: Vec<&str> = cr
+        .fields
+        .iter()
         .filter_map(|n| match n.node.as_ref()? {
             NB::String(s) => Some(s.sval.as_str()),
             _ => None,
@@ -133,9 +208,13 @@ fn lower_column_ref(cr: &pg_query::protobuf::ColumnRef, scope: &Scope) -> Option
             let r = scope.resolve_bare(col)?;
             return Some(ResolvedCol {
                 table_ref: TableColRef {
-                    schema: r.schema.clone(), table: r.table.clone(), column: (*col).to_string(),
+                    schema: r.schema.clone(),
+                    table: r.table.clone(),
+                    column: (*col).to_string(),
                 },
-                alias: r.alias, not_null: r.not_null, typoid: r.typoid,
+                alias: r.alias,
+                not_null: r.not_null,
+                typoid: r.typoid,
             });
         }
         [alias, col] | [_, alias, col] => (*alias, *col),
@@ -147,7 +226,9 @@ fn lower_column_ref(cr: &pg_query::protobuf::ColumnRef, scope: &Scope) -> Option
         let force_nn = scope.is_non_null_alias(alias);
         return Some(ResolvedCol {
             table_ref: TableColRef {
-                schema: table.schema.clone(), table: table.name.clone(), column: col.to_string(),
+                schema: table.schema.clone(),
+                table: table.name.clone(),
+                column: col.to_string(),
             },
             alias: alias.to_string(),
             not_null: (base_nn || force_nn) && !widened,
@@ -160,7 +241,9 @@ fn lower_column_ref(cr: &pg_query::protobuf::ColumnRef, scope: &Scope) -> Option
         let child = derived.iter().find(|c| c.name == col)?;
         return Some(ResolvedCol {
             table_ref: TableColRef {
-                schema: String::new(), table: alias.to_string(), column: col.to_string(),
+                schema: String::new(),
+                table: alias.to_string(),
+                column: col.to_string(),
             },
             alias: alias.to_string(),
             not_null: is_non_null(&child.expr),
@@ -172,7 +255,9 @@ fn lower_column_ref(cr: &pg_query::protobuf::ColumnRef, scope: &Scope) -> Option
     if scope.is_non_null_alias(alias) && !scope.is_nullable_alias(alias) {
         return Some(ResolvedCol {
             table_ref: TableColRef {
-                schema: String::new(), table: alias.to_string(), column: col.to_string(),
+                schema: String::new(),
+                table: alias.to_string(),
+                column: col.to_string(),
             },
             alias: alias.to_string(),
             not_null: true,
@@ -191,9 +276,14 @@ fn lower_column_ref(cr: &pg_query::protobuf::ColumnRef, scope: &Scope) -> Option
 pub fn is_non_null(e: &Expr) -> bool {
     match e {
         Expr::Literal(_) | Expr::ArrayConstructor => true,
-        Expr::Cast { inner, is_unsafe, .. } => !*is_unsafe && is_non_null(inner),
+        Expr::Cast {
+            inner, is_unsafe, ..
+        } => !*is_unsafe && is_non_null(inner),
         Expr::Column(c) => c.not_null,
-        Expr::Func { kind: FuncKind::NeverNull, .. } => true,
+        Expr::Func {
+            kind: FuncKind::NeverNull,
+            ..
+        } => true,
         Expr::Coalesce(args) => args.iter().any(is_non_null),
         Expr::Case { has_else_non_null } => *has_else_non_null,
         Expr::SubQuery(a) => a.outputs.first().is_some_and(|o| is_non_null(&o.expr)),
@@ -207,10 +297,17 @@ pub fn is_non_null(e: &Expr) -> bool {
 pub fn is_nullable(e: &Expr) -> bool {
     match e {
         Expr::Null => true,
-        Expr::Cast { inner, is_unsafe, .. } => is_nullable(inner) || *is_unsafe,
+        Expr::Cast {
+            inner, is_unsafe, ..
+        } => is_nullable(inner) || *is_unsafe,
         Expr::Column(c) => !c.not_null,
-        Expr::Func { kind: FuncKind::NullableAgg, .. } => true,
-        Expr::Case { has_else_non_null: false } => true,
+        Expr::Func {
+            kind: FuncKind::NullableAgg,
+            ..
+        } => true,
+        Expr::Case {
+            has_else_non_null: false,
+        } => true,
         Expr::SetOp(branches) => branches.iter().any(is_nullable),
         _ => false,
     }
@@ -249,6 +346,8 @@ fn inner_type_oid(e: &Expr) -> Option<u32> {
 
 fn resolve_typename_oid(tn: &TypeName, scope: &Scope) -> Option<u32> {
     let last = tn.names.last()?;
-    let NB::String(s) = last.node.as_ref()? else { return None };
+    let NB::String(s) = last.node.as_ref()? else {
+        return None;
+    };
     scope.typname_oid(&s.sval)
 }

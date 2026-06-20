@@ -4,11 +4,11 @@
 //! committed (CI / offline mode, à la SQLx's `.sqlx/`).
 
 use anyhow::{Context, Result};
-use swell_analyzer::InferredQuery;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
+use swell_analyzer::InferredQuery;
 
 pub const TOOL_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -36,8 +36,7 @@ pub fn read(dir: &Path, k: &str) -> Option<CacheEntry> {
 }
 
 pub fn write(dir: &Path, k: &str, entry: &CacheEntry) -> Result<()> {
-    fs::create_dir_all(dir)
-        .with_context(|| format!("create cache dir: {}", dir.display()))?;
+    fs::create_dir_all(dir).with_context(|| format!("create cache dir: {}", dir.display()))?;
     let path = path_for(dir, k);
     fs::write(&path, serde_json::to_string_pretty(entry)?)
         .with_context(|| format!("write cache file: {}", path.display()))?;
@@ -45,8 +44,11 @@ pub fn write(dir: &Path, k: &str, entry: &CacheEntry) -> Result<()> {
 }
 
 pub fn list_keys(dir: &Path) -> Vec<String> {
-    let Ok(entries) = fs::read_dir(dir) else { return Vec::new() };
-    let mut out: Vec<String> = entries.flatten()
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = entries
+        .flatten()
         .filter_map(|e| {
             let p = e.path();
             (p.extension().and_then(|s| s.to_str()) == Some("json"))
@@ -70,10 +72,14 @@ mod tests {
             query: InferredQuery {
                 sql: "SELECT 1".into(),
                 params: vec![InferredParam {
-                    ts_type: "number".into(), nullable: true, table_ref: None,
+                    ts_type: "number".into(),
+                    nullable: true,
+                    table_ref: None,
                 }],
                 columns: vec![InferredColumn {
-                    name: "n".into(), nullable: false, ts_type: "number".into(),
+                    name: "n".into(),
+                    nullable: false,
+                    ts_type: "number".into(),
                     table_ref: None,
                 }],
                 row_variants: Vec::new(),

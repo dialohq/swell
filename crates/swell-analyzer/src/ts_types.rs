@@ -11,7 +11,10 @@ use std::collections::BTreeMap;
 /// param). Drivers can register parse and serialize side independently
 /// — e.g. `date` reads as `Spacetime` but writes as `Date | string`.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum Direction { Read, Write }
+pub enum Direction {
+    Read,
+    Write,
+}
 
 /// Per-type override. Bare string in TOML deserializes both fields
 /// equal; `{ parse, serialize }` lets them diverge.
@@ -52,7 +55,9 @@ impl TypeCatalog {
     }
 
     pub fn render(&self, t: &Type, dir: Direction) -> String {
-        if let Some(over) = self.override_for(t.name(), dir) { return over.to_string(); }
+        if let Some(over) = self.override_for(t.name(), dir) {
+            return over.to_string();
+        }
         // For user types `postgres-types` sees opaque OIDs — route
         // through `render_oid` to pick up catalog info.
         match t.kind() {
@@ -73,17 +78,31 @@ impl TypeCatalog {
             }
             Kind::Range(inner) => {
                 let inner_ts = self.render(inner, dir);
-                format!("{{ lower: {} | null; upper: {} | null }}", inner_ts, inner_ts)
+                format!(
+                    "{{ lower: {} | null; upper: {} | null }}",
+                    inner_ts, inner_ts
+                )
             }
             Kind::Domain(base) => self.render(base, dir),
             Kind::Composite(fields) => {
-                let inner: Vec<String> = fields.iter()
-                    .map(|f| format!("{}: {} | null", quote_field(f.name()), self.render(f.type_(), dir)))
+                let inner: Vec<String> = fields
+                    .iter()
+                    .map(|f| {
+                        format!(
+                            "{}: {} | null",
+                            quote_field(f.name()),
+                            self.render(f.type_(), dir)
+                        )
+                    })
                     .collect();
                 format!("{{ {} }}", inner.join("; "))
             }
             Kind::Enum(labels) => {
-                if labels.is_empty() { "string".into() } else { enum_union(labels) }
+                if labels.is_empty() {
+                    "string".into()
+                } else {
+                    enum_union(labels)
+                }
             }
             Kind::Pseudo => "unknown".to_string(),
             _ => "unknown".to_string(),
@@ -92,16 +111,23 @@ impl TypeCatalog {
 
     /// OID lookup through the catalog for user-defined types.
     pub fn render_oid(&self, oid: u32, name: &str, dir: Direction) -> String {
-        if let Some(over) = self.override_for(name, dir) { return over.to_string(); }
+        if let Some(over) = self.override_for(name, dir) {
+            return over.to_string();
+        }
         if let Some(labels) = self.enums.get(&oid) {
-            return if labels.is_empty() { "string".into() } else { enum_union(labels) };
+            return if labels.is_empty() {
+                "string".into()
+            } else {
+                enum_union(labels)
+            };
         }
         if let Some((base_oid, base_name)) = self.domains.get(&oid) {
             return self.render_oid(*base_oid, base_name, dir);
         }
         if let Some(fields) = self.composites.get(&oid) {
             // PG composite attributes are always nullable.
-            let inner: Vec<String> = fields.iter()
+            let inner: Vec<String> = fields
+                .iter()
                 .map(|(n, t_oid, t_name)| {
                     let ts = self.render_oid(*t_oid, t_name, dir);
                     format!("{}: {} | null", quote_field(n), ts)
@@ -126,9 +152,8 @@ fn simple_name_to_ts(name: &str) -> &'static str {
     match name {
         "bool" => "boolean",
         "int2" | "int4" | "float4" | "float8" => "number",
-        "int8" | "numeric" | "text" | "varchar" | "bpchar" | "char" | "name"
-            | "uuid" | "cidr" | "inet" | "macaddr" | "citext"
-            | "time" | "timetz" | "interval" => "string",
+        "int8" | "numeric" | "text" | "varchar" | "bpchar" | "char" | "name" | "uuid" | "cidr"
+        | "inet" | "macaddr" | "citext" | "time" | "timetz" | "interval" => "string",
         "bytea" => "Uint8Array",
         "date" | "timestamp" | "timestamptz" => "Date",
         "json" | "jsonb" => "Json",
@@ -138,7 +163,8 @@ fn simple_name_to_ts(name: &str) -> &'static str {
 }
 
 fn enum_union(labels: &[String]) -> String {
-    labels.iter()
+    labels
+        .iter()
         .map(|l| format!("\"{}\"", l.replace('\\', "\\\\").replace('"', "\\\"")))
         .collect::<Vec<_>>()
         .join(" | ")
@@ -146,17 +172,23 @@ fn enum_union(labels: &[String]) -> String {
 
 /// `T | null` arrays need parens: `(T | null)[]` not `T | null[]`.
 fn maybe_paren_for_array(inner: &str) -> String {
-    let needs_paren = inner.contains(" | ")
-        || inner.contains(" & ")
-        || inner.contains(" => ");
-    if needs_paren { format!("({})", inner) } else { inner.to_string() }
+    let needs_paren = inner.contains(" | ") || inner.contains(" & ") || inner.contains(" => ");
+    if needs_paren {
+        format!("({})", inner)
+    } else {
+        inner.to_string()
+    }
 }
 
 fn quote_field(name: &str) -> String {
     let simple = !name.is_empty()
         && name.chars().next().unwrap().is_ascii_alphabetic()
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-    if simple { name.to_string() } else { format!("\"{}\"", name.replace('"', "\\\"")) }
+    if simple {
+        name.to_string()
+    } else {
+        format!("\"{}\"", name.replace('"', "\\\""))
+    }
 }
 
 #[cfg(test)]
@@ -164,7 +196,10 @@ mod tests {
     use super::*;
 
     fn over(s: &str) -> TypeOverride {
-        TypeOverride { parse: s.into(), serialize: s.into() }
+        TypeOverride {
+            parse: s.into(),
+            serialize: s.into(),
+        }
     }
 
     #[test]
@@ -200,14 +235,23 @@ mod tests {
     #[test]
     fn override_split_parse_vs_serialize() {
         let mut c = TypeCatalog::default();
-        c.by_name.insert("date".into(), TypeOverride {
-            parse: "Spacetime".into(),
-            serialize: "Spacetime | Date | string".into(),
-        });
+        c.by_name.insert(
+            "date".into(),
+            TypeOverride {
+                parse: "Spacetime".into(),
+                serialize: "Spacetime | Date | string".into(),
+            },
+        );
         assert_eq!(c.render(&Type::DATE, Direction::Read), "Spacetime");
-        assert_eq!(c.render(&Type::DATE, Direction::Write), "Spacetime | Date | string");
+        assert_eq!(
+            c.render(&Type::DATE, Direction::Write),
+            "Spacetime | Date | string"
+        );
         // Arrays carry direction through.
         assert_eq!(c.render(&Type::DATE_ARRAY, Direction::Read), "Spacetime[]");
-        assert_eq!(c.render(&Type::DATE_ARRAY, Direction::Write), "(Spacetime | Date | string)[]");
+        assert_eq!(
+            c.render(&Type::DATE_ARRAY, Direction::Write),
+            "(Spacetime | Date | string)[]"
+        );
     }
 }

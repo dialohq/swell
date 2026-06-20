@@ -25,12 +25,17 @@ pub struct PlanWalk {
 pub async fn explain(client: &Client, sql: &str) -> Result<PlanWalk> {
     let stmt = format!("EXPLAIN (VERBOSE, FORMAT JSON, GENERIC_PLAN) {sql}");
     let msgs = client.simple_query(&stmt).await?;
-    let json_text = msgs.iter().find_map(|m| match m {
-        tokio_postgres::SimpleQueryMessage::Row(r) => r.get(0).map(str::to_string),
-        _ => None,
-    }).unwrap_or_default();
+    let json_text = msgs
+        .iter()
+        .find_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(r) => r.get(0).map(str::to_string),
+            _ => None,
+        })
+        .unwrap_or_default();
     let plans: Vec<ExplainEntry> = serde_json::from_str(&json_text).unwrap_or_default();
-    let Some(entry) = plans.into_iter().next() else { return Ok(PlanWalk::default()) };
+    let Some(entry) = plans.into_iter().next() else {
+        return Ok(PlanWalk::default());
+    };
     let plan = entry.plan;
 
     // SQL AST decides which `unnest(...)` calls have literal args —
@@ -49,16 +54,17 @@ pub async fn explain(client: &Client, sql: &str) -> Result<PlanWalk> {
 
 fn walk_plan<F: FnMut(&PlanNode)>(node: &PlanNode, f: &mut F) {
     f(node);
-    for c in node.plans.iter().flatten() { walk_plan(c, f); }
+    for c in node.plans.iter().flatten() {
+        walk_plan(c, f);
+    }
 }
 
 fn collect_alias_to_table(node: &PlanNode) -> HashMap<String, (String, String)> {
     let mut out = HashMap::new();
     walk_plan(node, &mut |n| {
         if let (Some(alias), Some(rel)) = (&n.alias, &n.relation_name) {
-            out.entry(alias.clone()).or_insert((
-                n.schema.clone().unwrap_or_default(), rel.clone(),
-            ));
+            out.entry(alias.clone())
+                .or_insert((n.schema.clone().unwrap_or_default(), rel.clone()));
         }
     });
     out
@@ -69,9 +75,9 @@ fn collect_nullable_aliases(node: &PlanNode) -> HashSet<String> {
     let mut out = HashSet::new();
     walk_plan(node, &mut |n| {
         let null_side = match n.join_type.as_deref() {
-            Some("Left")  => Some("Inner"),
+            Some("Left") => Some("Inner"),
             Some("Right") => Some("Outer"),
-            Some("Full")  => None,
+            Some("Full") => None,
             _ => return,
         };
         for c in n.plans.iter().flatten() {
@@ -85,12 +91,17 @@ fn collect_nullable_aliases(node: &PlanNode) -> HashSet<String> {
 
 fn collect_subtree_aliases(node: &PlanNode) -> HashSet<String> {
     let mut set = HashSet::new();
-    walk_plan(node, &mut |n| { if let Some(a) = &n.alias { set.insert(a.clone()); } });
+    walk_plan(node, &mut |n| {
+        if let Some(a) = &n.alias {
+            set.insert(a.clone());
+        }
+    });
     set
 }
 
 fn collect_non_null_source_aliases(
-    node: &PlanNode, literal_unnest: &HashSet<String>,
+    node: &PlanNode,
+    literal_unnest: &HashSet<String>,
 ) -> HashSet<String> {
     let mut out = HashSet::new();
     collect_non_null_rec(node, literal_unnest, &mut out);
@@ -101,27 +112,41 @@ fn collect_non_null_source_aliases(
 /// non-null outputs. Also adds the node's alias to `out` in that case,
 /// so the user-written wrapper alias (`t` in `(VALUES …) AS t`) gets
 /// picked up even when the inner `Values Scan` is named `*VALUES*`.
-fn collect_non_null_rec(
-    node: &PlanNode, lit: &HashSet<String>, out: &mut HashSet<String>,
-) -> bool {
+fn collect_non_null_rec(node: &PlanNode, lit: &HashSet<String>, out: &mut HashSet<String>) -> bool {
     let is_source = match node.node_type.as_deref().unwrap_or("") {
         "Function Scan" => node.alias.as_deref().is_some_and(|a| lit.contains(a)),
         "Values Scan" => true,
         _ => false,
     };
     if is_source {
-        if let Some(a) = node.alias.as_deref() { out.insert(a.to_string()); }
+        if let Some(a) = node.alias.as_deref() {
+            out.insert(a.to_string());
+        }
     }
     let children = node.plans.as_deref().unwrap_or(&[]);
     let mut all_non_null = !children.is_empty();
     for c in children {
-        if !collect_non_null_rec(c, lit, out) { all_non_null = false; }
+        if !collect_non_null_rec(c, lit, out) {
+            all_non_null = false;
+        }
     }
-    let is_passthrough = matches!(node.node_type.as_deref(),
-        Some("Subquery Scan" | "Result" | "Sort" | "Incremental Sort"
-            | "Materialize" | "Limit" | "Unique" | "WindowAgg"));
+    let is_passthrough = matches!(
+        node.node_type.as_deref(),
+        Some(
+            "Subquery Scan"
+                | "Result"
+                | "Sort"
+                | "Incremental Sort"
+                | "Materialize"
+                | "Limit"
+                | "Unique"
+                | "WindowAgg"
+        )
+    );
     if is_passthrough && all_non_null {
-        if let Some(a) = node.alias.as_deref() { out.insert(a.to_string()); }
+        if let Some(a) = node.alias.as_deref() {
+            out.insert(a.to_string());
+        }
         return true;
     }
     is_source
@@ -144,15 +169,27 @@ fn detect_root_full_join(plan: &PlanNode) -> Option<(HashSet<String>, HashSet<St
             return (!left.is_empty() && !right.is_empty()).then_some((left, right));
         }
         let next = unwrap_passthrough(cur);
-        if std::ptr::eq(next, cur) { return None; }
+        if std::ptr::eq(next, cur) {
+            return None;
+        }
         cur = next;
     }
 }
 
 fn unwrap_passthrough(node: &PlanNode) -> &PlanNode {
-    let is_pass = matches!(node.node_type.as_deref(),
-        Some("Subquery Scan" | "Result" | "Sort" | "Incremental Sort"
-            | "Materialize" | "Limit" | "Unique" | "WindowAgg"));
+    let is_pass = matches!(
+        node.node_type.as_deref(),
+        Some(
+            "Subquery Scan"
+                | "Result"
+                | "Sort"
+                | "Incremental Sort"
+                | "Materialize"
+                | "Limit"
+                | "Unique"
+                | "WindowAgg"
+        )
+    );
     if is_pass {
         if let [child] = node.plans.as_deref().unwrap_or(&[]) {
             return unwrap_passthrough(child);
@@ -165,11 +202,16 @@ fn unwrap_passthrough(node: &PlanNode) -> &PlanNode {
 
 fn literal_unnest_aliases_from_sql(sql: &str) -> HashSet<String> {
     let mut out = HashSet::new();
-    let Ok(parsed) = pg_query::parse(sql) else { return out };
+    let Ok(parsed) = pg_query::parse(sql) else {
+        return out;
+    };
     for raw in &parsed.protobuf.stmts {
-        let Some(NB::SelectStmt(select)) = raw.stmt.as_deref().and_then(|s| s.node.as_ref())
-            else { continue };
-        for from in &select.from_clause { collect_unnest(from, &mut out); }
+        let Some(NB::SelectStmt(select)) = raw.stmt.as_deref().and_then(|s| s.node.as_ref()) else {
+            continue;
+        };
+        for from in &select.from_clause {
+            collect_unnest(from, &mut out);
+        }
     }
     out
 }
@@ -177,10 +219,18 @@ fn literal_unnest_aliases_from_sql(sql: &str) -> HashSet<String> {
 fn collect_unnest(node: &pg_query::protobuf::Node, out: &mut HashSet<String>) {
     match node.node.as_ref() {
         Some(NB::RangeFunction(rf)) => {
-            let alias = rf.alias.as_ref().map(|a| a.aliasname.clone()).unwrap_or_default();
-            if alias.is_empty() { return; }
+            let alias = rf
+                .alias
+                .as_ref()
+                .map(|a| a.aliasname.clone())
+                .unwrap_or_default();
+            if alias.is_empty() {
+                return;
+            }
             for outer in &rf.functions {
-                let Some(NB::List(l)) = outer.node.as_ref() else { continue };
+                let Some(NB::List(l)) = outer.node.as_ref() else {
+                    continue;
+                };
                 let fc = l.items.iter().find_map(|i| match i.node.as_ref()? {
                     NB::FuncCall(fc) => Some(fc.as_ref()),
                     _ => None,
@@ -192,8 +242,12 @@ fn collect_unnest(node: &pg_query::protobuf::Node, out: &mut HashSet<String>) {
             }
         }
         Some(NB::JoinExpr(je)) => {
-            if let Some(l) = je.larg.as_deref() { collect_unnest(l, out); }
-            if let Some(r) = je.rarg.as_deref() { collect_unnest(r, out); }
+            if let Some(l) = je.larg.as_deref() {
+                collect_unnest(l, out);
+            }
+            if let Some(r) = je.rarg.as_deref() {
+                collect_unnest(r, out);
+            }
         }
         _ => {}
     }
@@ -208,11 +262,15 @@ fn funcname_last(fc: &FuncCall) -> Option<&str> {
 }
 
 fn unnest_arg_is_literal(fc: &FuncCall) -> bool {
-    let Some(body) = fc.args.first().and_then(|a| a.node.as_ref()) else { return false };
+    let Some(body) = fc.args.first().and_then(|a| a.node.as_ref()) else {
+        return false;
+    };
     match body {
         NB::AArrayExpr(_) => true,
         NB::AConst(c) => matches!(&c.val, Some(pg_query::protobuf::a_const::Val::Sval(_))),
-        NB::TypeCast(tc) => tc.arg.as_deref()
+        NB::TypeCast(tc) => tc
+            .arg
+            .as_deref()
             .and_then(|a| a.node.as_ref())
             .is_some_and(|n| matches!(n, NB::AArrayExpr(_) | NB::AConst(_))),
         _ => false,
