@@ -27,13 +27,10 @@ pub async fn infer(client: &Client, sql: &str, n_params: usize) -> Vec<ParamInfo
     if n_params == 0 {
         return out;
     }
-
-    let parsed = match pg_query::parse(sql) {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::debug!("pg_query::parse failed for param nullability: {e}");
-            return out;
-        }
+    let Ok(parsed) =
+        pg_query::parse(sql).inspect_err(|e| tracing::debug!("parse failed for params: {e}"))
+    else {
+        return out;
     };
 
     let mut bindings: Vec<Binding> = Vec::new();
@@ -98,7 +95,7 @@ async fn resolve_attnotnull(
     let schemas: Vec<&str> = unique.iter().map(|(s, _, _)| s.as_str()).collect();
     let tables: Vec<&str> = unique.iter().map(|(_, t, _)| t.as_str()).collect();
     let columns: Vec<&str> = unique.iter().map(|(_, _, c)| c.as_str()).collect();
-    let rows = match client
+    let Ok(rows) = client
         .query(
             r#"
         WITH ask(schema, tbl, col) AS (
@@ -114,12 +111,9 @@ async fn resolve_attnotnull(
             &[&schemas, &tables, &columns],
         )
         .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::debug!("resolve_attnotnull: {e}");
-            return HashMap::new();
-        }
+        .inspect_err(|e| tracing::debug!("resolve_attnotnull: {e}"))
+    else {
+        return HashMap::new();
     };
     rows.iter()
         .map(|row| ((row.get(0), row.get(1), row.get(2)), row.get(3)))
@@ -153,10 +147,8 @@ fn collect_insert(ins: &InsertStmt, out: &mut Vec<Binding>) {
         return;
     }
 
-    let Some(select_box) = ins.select_stmt.as_ref() else {
-        return;
-    };
-    let Some(node::Node::SelectStmt(sel)) = select_box.node.as_ref() else {
+    let Some(node::Node::SelectStmt(sel)) = ins.select_stmt.as_ref().and_then(|s| s.node.as_ref())
+    else {
         return;
     };
 
