@@ -27,14 +27,14 @@ pub struct Override {
 ///   "label!"        → { name: "label!", force_nullable: Some(false) }
 ///   "label?"        → { name: "label?", force_nullable: Some(true) }
 pub fn parse(name: &str) -> Override {
-    let mut o = Override::default();
-    o.clean_name = name.to_string();
-    if name.ends_with('!') {
-        o.force_nullable = Some(false);
-    } else if name.ends_with('?') {
-        o.force_nullable = Some(true);
+    Override {
+        clean_name: name.to_string(),
+        force_nullable: match name.chars().last() {
+            Some('!') => Some(false),
+            Some('?') => Some(true),
+            _ => None,
+        },
     }
-    o
 }
 
 #[cfg(test)]

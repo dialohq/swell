@@ -1,17 +1,12 @@
 //! `pg_catalog` enrichment.
 //!
-//! Two passes:
-//! 1. **Per-connection bootstrap** (`load_type_catalog`): one round-trip
-//!    pulls every enum's labels, every domain's base type, and every
-//!    composite-type's field list for the schemas we care about. The result
-//!    is cached on the analyzer so subsequent query analysis is allocation-
-//!    only.
-//! 2. **Per-query nullability** (`fetch_attnotnull`): for each described
-//!    column with a real (table_oid, attnum), fetch `pg_attribute.attnotnull`
-//!    to refine the default-pessimistic nullability assumption.
+//! `load_type_catalog`: one round-trip pulls every enum's labels, every
+//! domain's base type, and every composite-type's field list for the
+//! schemas we care about. The result is cached on the analyzer so
+//! subsequent query analysis is allocation-only.
 
 use crate::ts_types::TypeCatalog;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use tokio_postgres::Client;
 
 /// Pull every enum / domain / composite definition the analyzer needs in
@@ -249,51 +244,6 @@ async fn load_safe_builtin_procs(client: &Client) -> anyhow::Result<BTreeMap<Str
     Ok(out)
 }
 
-/// Look up `attnotnull` for each (table_oid, attnum) pair we have. Returns a
-/// map keyed by (table_oid, attnum). Pairs we can't resolve are absent.
-pub async fn fetch_attnotnull(
-    client: &Client,
-    pairs: &[(u32, i16)],
-) -> anyhow::Result<HashMap<(u32, i16), bool>> {
-    if pairs.is_empty() {
-        return Ok(HashMap::new());
-    }
-    // Deduplicate to reduce round-trip size and let Postgres plan-cache help.
-    let unique: HashSet<&(u32, i16)> = pairs.iter().collect();
-    let mut tables: Vec<i64> = Vec::with_capacity(unique.len());
-    let mut attnums: Vec<i32> = Vec::with_capacity(unique.len());
-    for (t, a) in &unique {
-        tables.push(*t as i64);
-        attnums.push(*a as i32);
-    }
-
-    let rows = client
-        .query(
-            r#"
-            WITH ask(table_oid, attnum) AS (
-                SELECT * FROM unnest($1::bigint[], $2::int[])
-            )
-            SELECT a.attrelid::bigint, a.attnum, a.attnotnull
-            FROM ask
-            JOIN pg_attribute a
-              ON a.attrelid::bigint = ask.table_oid
-             AND a.attnum = ask.attnum::smallint
-            WHERE a.attnum > 0 AND NOT a.attisdropped
-            "#,
-            &[&tables, &attnums],
-        )
-        .await?;
-
-    let mut out = HashMap::with_capacity(rows.len());
-    for row in &rows {
-        let t: i64 = row.get(0);
-        let a: i16 = row.get(1);
-        let nn: bool = row.get(2);
-        out.insert((t as u32, a), nn);
-    }
-    Ok(out)
-}
-
 /// Sample the schema "version" — a cheap hash over `pg_class.xmin` for the
 /// configured schemas. Used to invalidate the cache when DDL has happened.
 pub async fn schema_fingerprint(client: &Client, schemas: &[String]) -> anyhow::Result<String> {
@@ -330,7 +280,3 @@ pub fn render_for_oid(
     }
     cat.render(ty, dir)
 }
-
-// Small helper for tests
-#[allow(dead_code)]
-pub fn _used_in_tests(c: BTreeMap<u32, Vec<String>>) -> usize { c.len() }

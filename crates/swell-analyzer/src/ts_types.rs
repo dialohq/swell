@@ -94,7 +94,7 @@ impl TypeCatalog {
                 {
                     self.render_oid(t.oid(), t.name(), dir)
                 } else {
-                    self.render_simple(t)
+                    simple_name_to_ts(t.name()).to_string()
                 }
             }
             Kind::Array(inner) => {
@@ -160,9 +160,6 @@ impl TypeCatalog {
         simple_name_to_ts(name).to_string()
     }
 
-    fn render_simple(&self, t: &Type) -> String {
-        simple_name_to_ts(t.name()).to_string()
-    }
 }
 
 fn simple_name_to_ts(name: &str) -> &'static str {
@@ -170,11 +167,11 @@ fn simple_name_to_ts(name: &str) -> &'static str {
     match name {
         "bool" => "boolean",
         "int2" | "int4" | "float4" | "float8" => "number",
-        "int8" | "numeric" => "string",
-        "text" | "varchar" | "bpchar" | "char" | "name" | "uuid" | "cidr" | "inet" | "macaddr" | "citext" => "string",
+        "int8" | "numeric" | "text" | "varchar" | "bpchar" | "char" | "name"
+            | "uuid" | "cidr" | "inet" | "macaddr" | "citext"
+            | "time" | "timetz" | "interval" => "string",
         "bytea" => "Uint8Array",
         "date" | "timestamp" | "timestamptz" => "Date",
-        "time" | "timetz" | "interval" => "string",
         "json" | "jsonb" => "Json",
         "void" => "void",
         // Vector / extension types we don't auto-detect

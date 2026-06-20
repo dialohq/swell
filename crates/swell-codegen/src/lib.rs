@@ -49,15 +49,29 @@ impl Default for CodegenOptions<'_> {
     }
 }
 
+/// Sort tables by (schema, table) and build the collision-resolved name map.
+fn sorted_with_names(tables: &[TableSchema]) -> (Vec<&TableSchema>, TableNameMap) {
+    let mut sorted: Vec<&TableSchema> = tables.iter().collect();
+    sorted.sort_by(|a, b| (a.schema.as_str(), a.table.as_str())
+        .cmp(&(b.schema.as_str(), b.table.as_str())));
+    let names = TableNameMap::from(&sorted);
+    (sorted, names)
+}
+
+fn render_row(q: &InferredQuery, names: &TableNameMap, tables: &[TableSchema]) -> String {
+    if q.row_variants.is_empty() {
+        render_row_type(&q.columns, names, tables)
+    } else {
+        render_row_with_variants(&q.columns, &q.row_variants, names, tables)
+    }
+}
+
 /// Render just the table interfaces — no auto-gen banner, no swell
 /// imports, no Registry. Used by the markdown-corpus runner for the
 /// `# Common types` block: shared interfaces appear once per file
 /// rather than being repeated in every test's expected output.
 pub fn render_table_interfaces(tables: &[TableSchema]) -> String {
-    let mut sorted: Vec<&TableSchema> = tables.iter().collect();
-    sorted.sort_by(|a, b| (a.schema.as_str(), a.table.as_str())
-        .cmp(&(b.schema.as_str(), b.table.as_str())));
-    let names = TableNameMap::from(&sorted);
+    let (sorted, names) = sorted_with_names(tables);
     let mut out = String::new();
     for t in &sorted {
         out.push_str(&render_table_interface(t, &names));
@@ -74,20 +88,12 @@ pub fn render_table_interfaces(tables: &[TableSchema]) -> String {
 ///   result: { id: Users["id"] }
 ///   ```
 pub fn render_query_compact(q: &InferredQuery, tables: &[TableSchema]) -> String {
-    let mut sorted: Vec<&TableSchema> = tables.iter().collect();
-    sorted.sort_by(|a, b| (a.schema.as_str(), a.table.as_str())
-        .cmp(&(b.schema.as_str(), b.table.as_str())));
-    let names = TableNameMap::from(&sorted);
+    let (_sorted, names) = sorted_with_names(tables);
     let mut out = String::new();
     for (i, p) in q.params.iter().enumerate() {
         out.push_str(&format!("${}: {}\n", i + 1, render_param_type(p, &names)));
     }
-    let row = if q.row_variants.is_empty() {
-        render_row_type(&q.columns, &names, tables)
-    } else {
-        render_row_with_variants(&q.columns, &q.row_variants, &names, tables)
-    };
-    out.push_str(&format!("result: {}\n", row));
+    out.push_str(&format!("result: {}\n", render_row(q, &names, tables)));
     out
 }
 
@@ -99,20 +105,13 @@ pub fn render(queries: &[InferredQuery], opts: CodegenOptions<'_>) -> String {
     // `SqlText` aliases available to column-override emitters.
     out.push_str(&format!("import {{ type Json, type SqlText }} from \"{}\";\n", opts.runtime_module));
     for (from, names) in opts.extra_imports {
-        if names.is_empty() {
-            continue;
-        }
+        if names.is_empty() { continue; }
         let typed: Vec<String> = names.iter().map(|n| format!("type {n}")).collect();
         out.push_str(&format!("import {{ {} }} from \"{}\";\n", typed.join(", "), from));
     }
     out.push('\n');
 
-    // Sort tables for stable output. Schema-qualified ordering.
-    let mut sorted_tables: Vec<&TableSchema> = opts.tables.iter().collect();
-    sorted_tables.sort_by(|a, b| (a.schema.as_str(), a.table.as_str())
-        .cmp(&(b.schema.as_str(), b.table.as_str())));
-
-    let names = TableNameMap::from(&sorted_tables);
+    let (sorted_tables, names) = sorted_with_names(opts.tables);
 
     for t in &sorted_tables {
         out.push_str(&render_table_interface(t, &names));
@@ -223,11 +222,7 @@ fn render_entry(
 ) -> String {
     let key = render_key(&q.sql);
     let params = render_params_tuple(q, names);
-    let row = if q.row_variants.is_empty() {
-        render_row_type(&q.columns, names, tables)
-    } else {
-        render_row_with_variants(&q.columns, &q.row_variants, names, tables)
-    };
+    let row = render_row(q, names, tables);
     format!("{indent}{key}: {{ params: {params}; row: {row} }};\n")
 }
 
