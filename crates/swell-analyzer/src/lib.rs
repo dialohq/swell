@@ -90,15 +90,36 @@ impl Analyzer {
             nullability::NullabilityHints::unknown(described.columns.len())
         });
 
+        // Pre-fetch attnotnull for every (schema, table) referenced
+        // by an EXPLAIN scan. Used by the post-pass refinements:
+        //   - `refine_coalesce_non_null`: coalesce arg is a NOT NULL col.
+        //   - `refine_via_attnotnull`:    bare column-ref expressions
+        //     (including all branches of a UNION/INTERSECT/EXCEPT)
+        //     classify as Unknown but are actually NOT NULL.
+        let scan_attnotnull = fetch_scan_attnotnull(
+            &self.client,
+            &null_hints.alias_to_table,
+        ).await;
+
         // Extra verdict refinement: a `COALESCE(...)` whose args include any
         // NOT-NULL base column is non-null. `classify` already handles the
         // trailing-literal case; this handles `COALESCE(nullable_col,
         // not_null_col)` by looking up attnotnull for each `<alias>.<col>`
         // arg using the plan's scan map.
-        let coalesce_refined = refine_coalesce_non_null(
-            &self.client,
+        let coalesce_refined = refine_coalesce_non_null_with(
             &null_hints,
-        ).await;
+            &scan_attnotnull,
+        );
+
+        // For each column, see if every branch's expression resolves to
+        // a NOT NULL base-column reference; if so, upgrade to
+        // NotNullable. Handles UNION/INTERSECT/EXCEPT non-null inference
+        // and plain `<alias>.<col>` references that classify can't
+        // resolve on its own.
+        let column_ref_refined = refine_via_attnotnull(
+            &null_hints,
+            &scan_attnotnull,
+        );
 
         let json_shapes = json_shape::infer_shapes(
             &self.client, &self.catalog, sql, described.columns.len(),
@@ -122,16 +143,26 @@ impl Analyzer {
 
         let columns = described.columns.iter().enumerate()
             .map(|(i, c)| {
-                let verdict = if coalesce_refined.get(i).copied().unwrap_or(false) {
-                    nullability::NullVerdict::NotNullable
-                } else {
-                    null_hints.by_column.get(i).copied()
-                        .unwrap_or(nullability::NullVerdict::Unknown)
-                };
+                let raw = null_hints.by_column.get(i).copied()
+                    .unwrap_or(nullability::NullVerdict::Unknown);
+                // Only upgrade an `Unknown` verdict — never override a
+                // Nullable verdict (e.g. an outer-join's RHS column).
+                let upgrade = matches!(raw, nullability::NullVerdict::Unknown) && (
+                    coalesce_refined.get(i).copied().unwrap_or(false)
+                    || column_ref_refined.get(i).copied().unwrap_or(false)
+                );
+                let verdict = if upgrade { nullability::NullVerdict::NotNullable } else { raw };
                 let inferred_nullable = decide_nullability(c, &attnotnull, verdict);
                 let oid_ts = catalog::render_for_oid(&self.catalog, c.type_.oid(), &c.type_, Direction::Read);
                 let json_ts = json_shapes.by_target.get(i).cloned().flatten();
-                let inferred_ts = json_ts.unwrap_or(oid_ts);
+                // Literal-type union across set-op branches: when every
+                // branch's expression is a bare literal (string / int /
+                // bool), the result column type is the deduped union of
+                // those literals — e.g. `UNION ALL SELECT 'paid'` and
+                // `'open'` becomes `"paid" | "open"`.
+                let setop_lit_ts = null_hints.branches.get(i)
+                    .and_then(|b| infer_setop_literal_union(b));
+                let inferred_ts = setop_lit_ts.or(json_ts).unwrap_or(oid_ts);
 
                 let ov = overrides::parse(&c.name);
                 let table_ref = column_meta.get(&(c.table_oid, c.attnum))
@@ -261,72 +292,22 @@ async fn resolve_column_meta(
     out
 }
 
-/// For each output column whose EXPLAIN expression is `COALESCE(...)`,
-/// check whether any arg is a NOT NULL base column reference and return
-/// `true` for that column index. The caller upgrades the column's
-/// verdict to `NotNullable` when this returns true.
-///
-/// `classify` already handles the trailing-literal case (e.g.
-/// `coalesce(x, 'lit')`); this picks up the cases where the non-null
-/// guarantor is a NOT NULL column.
-async fn refine_coalesce_non_null(
-    client: &Client,
-    hints: &nullability::NullabilityHints,
-) -> Vec<bool> {
-    use std::collections::{HashMap, HashSet};
-    let mut out = vec![false; hints.exprs.len()];
+type AttnotnullMap = std::collections::HashMap<(String, String, String), bool>;
 
-    // Collect every (schema, table) we need to know attnotnull for.
-    // Args may be `alias.col` or bare `col` (PG omits the alias when
-    // there's only one relation in scope). For the bare case we have
-    // to query the catalog for every scan table and figure out which
-    // one owns the column.
-    let mut needed: HashSet<(String, String)> = HashSet::new();
-    let mut per_column_args: Vec<Vec<String>> = vec![Vec::new(); hints.exprs.len()];
-    for (i, expr) in hints.exprs.iter().enumerate() {
-        let args = match coalesce_args(expr) {
-            Some(args) => args,
-            None => continue,
-        };
-        per_column_args[i] = args.clone();
-        for arg in &args {
-            match parse_column_ref(arg) {
-                ColumnRefShape::Qualified(alias, _) => {
-                    if let Some(table) = hints.alias_to_table.get(&alias) {
-                        needed.insert((table.0.clone(), table.1.clone()));
-                    }
-                }
-                ColumnRefShape::Bare(_) => {
-                    // Bare column — include every scan table; the lookup
-                    // disambiguates by which table actually has that column.
-                    for table in hints.alias_to_table.values() {
-                        needed.insert((table.0.clone(), table.1.clone()));
-                    }
-                }
-                ColumnRefShape::None => {}
-            }
-        }
-    }
-    if needed.is_empty() {
-        // No coalesce args reference a base column; only the literal
-        // path matters and `classify` already handled that.
-        // Still need to scan per-column args for pure literals (covered
-        // by classify, but be defensive).
-        for (i, args) in per_column_args.iter().enumerate() {
-            for arg in args {
-                if is_literal_token(arg) {
-                    out[i] = true;
-                    break;
-                }
-            }
-        }
+/// Bulk-fetch `attnotnull` for every column of every scan table in
+/// `alias_to_table`. Returned map is keyed by `(schema, table, col)`.
+async fn fetch_scan_attnotnull(
+    client: &Client,
+    alias_to_table: &std::collections::HashMap<String, (String, String)>,
+) -> AttnotnullMap {
+    use std::collections::HashSet;
+    let mut out: AttnotnullMap = std::collections::HashMap::new();
+    if alias_to_table.is_empty() {
         return out;
     }
-
-    // Bulk-query attnotnull for every (schema, table) once.
-    let schemas: Vec<String> = needed.iter().map(|p| p.0.clone()).collect();
-    let tables: Vec<String> = needed.iter().map(|p| p.1.clone()).collect();
-    let mut attnotnull: HashMap<(String, String, String), bool> = HashMap::new();
+    let pairs: HashSet<(String, String)> = alias_to_table.values().cloned().collect();
+    let schemas: Vec<String> = pairs.iter().map(|p| p.0.clone()).collect();
+    let tables: Vec<String> = pairs.iter().map(|p| p.1.clone()).collect();
     let rows_res = client.query(
         r#"
         WITH ask(schema, name) AS (SELECT * FROM unnest($1::text[], $2::text[]))
@@ -341,39 +322,36 @@ async fn refine_coalesce_non_null(
     ).await;
     if let Ok(rows) = rows_res {
         for row in &rows {
-            attnotnull.insert(
-                (row.get(0), row.get(1), row.get(2)),
-                row.get::<_, bool>(3),
-            );
+            out.insert((row.get(0), row.get(1), row.get(2)), row.get(3));
         }
     }
+    out
+}
 
-    for (i, args) in per_column_args.iter().enumerate() {
-        for arg in args {
+/// For each output column whose EXPLAIN expression is `COALESCE(...)`,
+/// check whether any arg is a NOT NULL base column reference and return
+/// `true` for that column index. The caller upgrades the column's
+/// verdict to `NotNullable` when this returns true.
+///
+/// `classify` already handles the trailing-literal case (e.g.
+/// `coalesce(x, 'lit')`); this picks up the cases where the non-null
+/// guarantor is a NOT NULL column.
+fn refine_coalesce_non_null_with(
+    hints: &nullability::NullabilityHints,
+    attnotnull: &AttnotnullMap,
+) -> Vec<bool> {
+    let mut out = vec![false; hints.exprs.len()];
+    for (i, expr) in hints.exprs.iter().enumerate() {
+        let args = match coalesce_args(expr) {
+            Some(args) => args,
+            None => continue,
+        };
+        for arg in &args {
             if is_literal_token(arg) {
                 out[i] = true;
                 break;
             }
-            let resolved = match parse_column_ref(arg) {
-                ColumnRefShape::Qualified(alias, col) => hints.alias_to_table.get(&alias)
-                    .map(|(s, t)| (s.clone(), t.clone(), col)),
-                ColumnRefShape::Bare(col) => {
-                    // Pick the unique table that has a column by this name;
-                    // if multiple tables have it, leave as unknown.
-                    let mut hit: Option<(String, String, String)> = None;
-                    let mut ambiguous = false;
-                    for (schema, table) in hints.alias_to_table.values() {
-                        let k = (schema.clone(), table.clone(), col.clone());
-                        if attnotnull.contains_key(&k) {
-                            if hit.is_some() { ambiguous = true; break; }
-                            hit = Some(k);
-                        }
-                    }
-                    if ambiguous { None } else { hit }
-                }
-                ColumnRefShape::None => None,
-            };
-            if let Some(k) = resolved {
+            if let Some(k) = resolve_arg(arg, &hints.alias_to_table, attnotnull) {
                 if attnotnull.get(&k).copied().unwrap_or(false) {
                     out[i] = true;
                     break;
@@ -382,6 +360,125 @@ async fn refine_coalesce_non_null(
         }
     }
     out
+}
+
+/// For each output column, if every branch's expression resolves to a
+/// NOT NULL base-column reference, mark the column NotNullable. This
+/// is what makes `SELECT id FROM users INTERSECT SELECT user_id …`
+/// produce `result: { id: string }` instead of `string | null` — the
+/// classifier alone can't see through an outer SetOp/Append to the
+/// underlying base columns.
+fn refine_via_attnotnull(
+    hints: &nullability::NullabilityHints,
+    attnotnull: &AttnotnullMap,
+) -> Vec<bool> {
+    let mut out = vec![false; hints.branches.len()];
+    for (i, branches) in hints.branches.iter().enumerate() {
+        if branches.is_empty() { continue; }
+        let all_non_null = branches.iter().all(|expr| {
+            // The refinement is for bare column references that
+            // classify can't resolve through a SetOp/Append wrapper.
+            // Casts (and other expression wrappers) are intentionally
+            // excluded — the analyzer treats `id::text` as nullable
+            // because the cast may not preserve NOT NULL semantics
+            // for user-defined types.
+            if expr.contains("::") { return false; }
+            resolve_arg(expr, &hints.alias_to_table, attnotnull)
+                .map(|k| attnotnull.get(&k).copied().unwrap_or(false))
+                .unwrap_or(false)
+        });
+        if all_non_null {
+            out[i] = true;
+        }
+    }
+    out
+}
+
+/// Resolve an EXPLAIN expression (possibly with `(…)::cast` wrapping)
+/// to a `(schema, table, col)` key. Handles qualified `<alias>.<col>`
+/// (looks up via `alias_to_table`) and bare `<col>` (picks the unique
+/// scan table that has a column by that name).
+fn resolve_arg(
+    arg: &str,
+    alias_to_table: &std::collections::HashMap<String, (String, String)>,
+    attnotnull: &AttnotnullMap,
+) -> Option<(String, String, String)> {
+    match parse_column_ref(arg) {
+        ColumnRefShape::Qualified(alias, col) => {
+            // Strip suffix digits from the alias — PG renames duplicate
+            // scan aliases as `users_1`, `users_2` in plans (e.g. for
+            // FULL JOIN). Try the literal alias first; fall back to
+            // the de-numbered form so the user's alias_to_table entry
+            // (which uses the literal alias) still resolves.
+            let key = alias_to_table.get(&alias)
+                .or_else(|| alias_to_table.get(&strip_suffix_digits(&alias)));
+            key.map(|(s, t)| (s.clone(), t.clone(), col))
+        }
+        ColumnRefShape::Bare(col) => {
+            let mut hit: Option<(String, String, String)> = None;
+            let mut ambiguous = false;
+            for (schema, table) in alias_to_table.values() {
+                let k = (schema.clone(), table.clone(), col.clone());
+                if attnotnull.contains_key(&k) {
+                    if hit.is_some() { ambiguous = true; break; }
+                    hit = Some(k);
+                }
+            }
+            if ambiguous { None } else { hit }
+        }
+        ColumnRefShape::None => None,
+    }
+}
+
+/// Across set-op branches, if every branch's expression is a bare
+/// literal, render the column type as a deduped TS literal union.
+fn infer_setop_literal_union(branches: &[String]) -> Option<String> {
+    if branches.len() < 2 { return None; }
+    let mut unique: Vec<String> = Vec::new();
+    for b in branches {
+        let lit = extract_ts_literal(b)?;
+        if !unique.contains(&lit) { unique.push(lit); }
+    }
+    if unique.is_empty() { return None; }
+    Some(unique.join(" | "))
+}
+
+/// If `expr` is a literal token (string / numeric / boolean), with an
+/// optional `::cast` and outer parens, return its TS-literal form.
+fn extract_ts_literal(expr: &str) -> Option<String> {
+    let mut s = expr.trim();
+    // Peel a single layer of balanced parens.
+    while s.starts_with('(') && s.ends_with(')') && is_balanced_paren_wrapper(s) {
+        s = &s[1..s.len() - 1].trim();
+    }
+    // Drop a `::cast` suffix.
+    let value = match s.split_once("::") {
+        Some((v, _)) => v.trim(),
+        None => s,
+    };
+    if value.is_empty() { return None; }
+    // String literal.
+    if value.starts_with('\'') && value.ends_with('\'') && value.len() >= 2 {
+        let inner = value[1..value.len() - 1].replace("''", "'");
+        return Some(format!("\"{}\"", inner.replace('\\', "\\\\").replace('"', "\\\"")));
+    }
+    // Boolean literal.
+    let lower = value.to_ascii_lowercase();
+    if lower == "true" || lower == "false" {
+        return Some(lower);
+    }
+    // Numeric literal.
+    if value.parse::<f64>().is_ok() {
+        return Some(value.to_string());
+    }
+    None
+}
+
+fn strip_suffix_digits(s: &str) -> String {
+    // `users_1` → `users`. PG appends `_N` to disambiguate duplicate
+    // scan aliases within a plan.
+    let trimmed = s.trim_end_matches(|c: char| c.is_ascii_digit());
+    trimmed.trim_end_matches('_').to_string()
 }
 
 enum ColumnRefShape {
