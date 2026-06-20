@@ -197,12 +197,10 @@ impl Analyzer {
             .await?;
         let mut grouped: BTreeMap<(String, String), Vec<TableSchemaColumn>> = BTreeMap::new();
         for row in &rows {
-            let schema: String = row.get(0);
-            let table: String = row.get(1);
             let oid: i64 = row.get(3);
             let typname: String = row.get(4);
             grouped
-                .entry((schema, table))
+                .entry((row.get(0), row.get(1)))
                 .or_default()
                 .push(TableSchemaColumn {
                     name: row.get(2),
@@ -264,21 +262,17 @@ pub async fn resolve_column_meta(client: &Client, pairs: &[(u32, i16)]) -> build
     };
     let mut out = HashMap::with_capacity(rows.len());
     for row in &rows {
-        let schema: String = row.get(0);
-        let table: String = row.get(1);
-        let column: String = row.get(2);
         let t: i64 = row.get(3);
         let a: i32 = row.get(4);
-        let not_null: bool = row.get(5);
         out.insert(
             (t as u32, a as i16),
             ResolvedBaseCol {
                 table_ref: TableColRef {
-                    schema,
-                    table,
-                    column,
+                    schema: row.get(0),
+                    table: row.get(1),
+                    column: row.get(2),
                 },
-                not_null,
+                not_null: row.get(5),
             },
         );
     }
