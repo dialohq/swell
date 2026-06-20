@@ -30,10 +30,14 @@ use tokio_postgres::{Client, Config, NoTls};
 pub struct Analyzer {
     pub client: Client,
     pub catalog: TypeCatalog,
-    /// Decided once at connect time via a `pg_cast` probe; threaded
-    /// through the lowering pass so `Cast` nodes' non-null verdict
-    /// matches reality for *this* database.
-    pub cast_policy: analyzed::CastPolicy,
+    /// `(source_typoid, target_typoid)` pairs that have a user-defined
+    /// `castmethod='f'` cast in this database. The lowering pass
+    /// checks the *specific* pair for each `Expr::Cast`; an
+    /// unrelated unsafe cast doesn't widen unrelated casts.
+    pub unsafe_casts: std::collections::HashSet<(u32, u32)>,
+    /// `pg_type.typname → oid` map used by `Cast` lowering to resolve
+    /// a target type name to its OID.
+    pub typname_to_oid: std::collections::HashMap<String, u32>,
 }
 
 pub struct AnalyzerOptions {
@@ -65,9 +69,10 @@ impl Analyzer {
             .context("loading pg_catalog")?;
         catalog.by_name = opts.type_overrides;
 
-        let cast_policy = catalog::detect_cast_policy(&client).await;
+        let unsafe_casts = catalog::fetch_unsafe_casts(&client).await;
+        let typname_to_oid = catalog::fetch_typname_to_oid(&client).await;
 
-        Ok(Self { client, catalog, cast_policy })
+        Ok(Self { client, catalog, unsafe_casts, typname_to_oid })
     }
 
     /// Cheap fingerprint over the relevant schemas — invalidates caches.
@@ -114,7 +119,8 @@ impl Analyzer {
         // tree this produces.
         let analyzed = build::build(
             &self.client, sql, &described, plan_walk.clone(),
-            &column_meta, &param_bindings, self.cast_policy,
+            &column_meta, &param_bindings,
+            self.unsafe_casts.clone(), self.typname_to_oid.clone(),
         ).await?;
 
         let json_shapes = json_shape::infer_shapes(
@@ -137,7 +143,7 @@ impl Analyzer {
                 let expr = analyzed.outputs.get(i)
                     .map(|o| &o.expr)
                     .unwrap_or(&analyzed::Expr::Unknown);
-                let verdict = build::verdict(expr, self.cast_policy);
+                let verdict = build::verdict(expr);
                 let inferred_nullable = decide_nullability(c, &column_meta, verdict);
                 let oid_ts = catalog::render_for_oid(&self.catalog, c.type_.oid(), &c.type_, Direction::Read);
                 let json_ts = json_shapes.by_target.get(i).cloned().flatten();
@@ -220,8 +226,10 @@ impl Analyzer {
 
 /// Resolve `(table_oid, attnum)` → `ResolvedBaseCol` in one round
 /// trip — populates `InferredColumn.table_ref` *and* provides the
-/// star-expansion fallback for `build::build`.
-async fn resolve_column_meta(
+/// star-expansion fallback for `build::build`. Public so that
+/// `build`'s view-recursion path can reuse it for the view's own
+/// SQL.
+pub async fn resolve_column_meta(
     client: &Client,
     pairs: &[(u32, i16)],
 ) -> build::ColumnMeta {

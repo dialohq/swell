@@ -187,6 +187,22 @@ SET search_path = billing, public AS $$
     WHERE i.status = 'open' AND i.due_at < now() + (window_days || ' days')::interval
     ORDER BY i.due_at
 $$;
+
+-- ---------- Views ----------
+-- Exercise swell's view-recursion: `pg_get_viewdef` + recursive build
+-- so the analyzer can see the underlying outer-join widening on
+-- `w.last_login_at`.
+CREATE OR REPLACE VIEW workspace_overview AS
+SELECT
+    w.id          AS workspace_id,
+    w.name        AS workspace_name,
+    u.email       AS owner_email,
+    u.last_login_at AS owner_last_login_at,
+    count(m.user_id)::bigint AS member_count
+FROM billing.workspaces w
+LEFT JOIN billing.memberships m ON m.workspace_id = w.id
+LEFT JOIN billing.users      u ON u.id = m.user_id AND m.role = 'owner'
+GROUP BY w.id, u.email, u.last_login_at;
 ```
 
 # Common types
@@ -260,6 +276,13 @@ export interface BillingUsers {
   created_at: Date;
   last_login_at: Date | null;
   metadata: Json;
+}
+export interface BillingWorkspaceOverview {
+  workspace_id: string | null;
+  workspace_name: string | null;
+  owner_email: string | null;
+  owner_last_login_at: Date | null;
+  member_count: string | null;
 }
 export interface BillingWorkspaces {
   id: string;
@@ -1200,4 +1223,80 @@ RETURNING i.id, i.status
 $1: string | null
 $2: string | null
 result: { id: BillingInvoices["id"]; status: BillingInvoices["status"] }
+```
+
+## Scalar sublink count is non-null
+
+```sql
+SELECT (SELECT count(*) FROM billing.users) AS n
+```
+
+```ts
+result: { n: string }
+```
+
+## Scalar sublink with non-aggregate body is nullable
+
+```sql
+SELECT (SELECT email FROM billing.users WHERE id = $1) AS e
+```
+
+```ts
+$1: string | null
+result: { e: string | null }
+```
+
+## Scalar sublink with nullable aggregate stays nullable
+
+```sql
+SELECT (SELECT max(amount_cents) FROM billing.invoices) AS top
+```
+
+```ts
+result: { top: string | null }
+```
+
+## Exists subquery is non-null boolean
+
+```sql
+SELECT EXISTS (SELECT 1 FROM billing.invoices WHERE status = 'paid') AS any_paid
+```
+
+```ts
+result: { any_paid: boolean }
+```
+
+## Array subquery is non-null array
+
+```sql
+SELECT ARRAY(SELECT id FROM billing.users WHERE email = $1) AS ids
+```
+
+```ts
+$1: string | null
+result: { ids: string[] }
+```
+
+## Select from view with outer-join widening underneath
+
+```sql
+SELECT v.workspace_id, v.workspace_name, v.owner_email, v.owner_last_login_at, v.member_count
+FROM billing.workspace_overview v
+WHERE v.workspace_id = $1
+```
+
+```ts
+$1: string | null
+result: BillingWorkspaceOverview
+```
+
+## Bare column ref against view picks up non-null aggregate
+
+```sql
+SELECT member_count FROM billing.workspace_overview WHERE workspace_id = $1
+```
+
+```ts
+$1: string | null
+result: { member_count: BillingWorkspaceOverview["member_count"] }
 ```

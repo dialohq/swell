@@ -5,29 +5,54 @@
 //! schemas we care about. The result is cached on the analyzer so
 //! subsequent query analysis is allocation-only.
 
-use crate::analyzed::CastPolicy;
 use crate::ts_types::TypeCatalog;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use tokio_postgres::Client;
 
-/// One round-trip probe of `pg_cast`. Returns `CastPolicy::Trust` iff
-/// the connected database has no user-defined function-based casts
-/// (`oid >= 16384` is `FirstNormalObjectId` — everything below ships
-/// with core). `castmethod = 'f'` is the only method whose result can
-/// be NULL on non-NULL input; `'b'` (binary) and `'i'` (I/O) are
-/// total. Built-in `'f'` casts (in `pg_catalog`, oid < 16384) live in
-/// `pg_proc` functions that don't return NULL on non-NULL input
-/// either — they `ERROR` instead.
-pub async fn detect_cast_policy(client: &Client) -> CastPolicy {
-    match client.query_one(
-        "SELECT EXISTS (SELECT 1 FROM pg_cast WHERE castmethod = 'f' AND oid >= 16384)",
+/// One round-trip probe of `pg_cast`. Returns the set of
+/// `(castsource, casttarget)` OID pairs for user-defined
+/// function-based casts — the only cast shape whose result can be
+/// NULL on non-NULL input. `'b'` (binary) and `'i'` (I/O) casts are
+/// total: they `ERROR` rather than return NULL. Built-in `'f'` casts
+/// (in `pg_catalog`, `oid < 16384`) call core functions that don't
+/// return NULL on non-NULL input either.
+///
+/// Per-cast policy: each `Expr::Cast` looks up its specific
+/// `(source_typoid, target_typoid)` pair against this set; an
+/// unrelated unsafe cast doesn't taint any other cast in the same
+/// query.
+pub async fn fetch_unsafe_casts(client: &Client) -> HashSet<(u32, u32)> {
+    match client.query(
+        "SELECT castsource::oid, casttarget::oid \
+         FROM pg_cast WHERE castmethod = 'f' AND oid >= 16384",
         &[],
     ).await {
-        Ok(row) if row.get::<_, bool>(0) => CastPolicy::Conservative,
-        Ok(_) => CastPolicy::Trust,
+        Ok(rows) => rows.iter()
+            .map(|r| (r.get::<_, u32>(0), r.get::<_, u32>(1)))
+            .collect(),
         Err(e) => {
-            tracing::debug!("detect_cast_policy: {e}; defaulting to Conservative");
-            CastPolicy::Conservative
+            tracing::debug!("fetch_unsafe_casts: {e}");
+            HashSet::new()
+        }
+    }
+}
+
+/// `pg_type.typname` (last name segment) → `pg_type.oid`. Pre-fetched
+/// once at connect time so the lowering pass can resolve a `TypeCast`'s
+/// target name to its OID without a round-trip per query. Falls back to
+/// an empty map on error — `Cast` lowering treats unresolved targets
+/// as "unknown type" (default-safe).
+pub async fn fetch_typname_to_oid(client: &Client) -> HashMap<String, u32> {
+    match client.query(
+        "SELECT typname, oid::oid FROM pg_type",
+        &[],
+    ).await {
+        Ok(rows) => rows.iter()
+            .map(|r| (r.get::<_, String>(0), r.get::<_, u32>(1)))
+            .collect(),
+        Err(e) => {
+            tracing::debug!("fetch_typname_to_oid: {e}");
+            HashMap::new()
         }
     }
 }
