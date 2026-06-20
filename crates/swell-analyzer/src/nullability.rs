@@ -45,6 +45,12 @@ pub struct NullabilityHints {
     /// per-expression checks (e.g. coalesce-with-non-null-arg) that
     /// need access to attnotnull beyond what `classify` sees.
     pub exprs: Vec<String>,
+    /// For set-op plans (UNION/INTERSECT/EXCEPT/UNION ALL), the
+    /// per-column expressions of every branch. Equal to
+    /// `vec![exprs[i].clone()]` for non-set-op plans. Lets the
+    /// analyzer reason "this column is non-null iff every branch is
+    /// non-null" with attnotnull-aware lookups.
+    pub branches: Vec<Vec<String>>,
     /// `alias → (schema, relation)` for every scan node in the plan.
     /// Lets the analyzer turn an EXPLAIN expression like
     /// `(users.email)` back into `(public, users, email)` so it can
@@ -57,6 +63,7 @@ impl NullabilityHints {
         Self {
             by_column: vec![NullVerdict::Unknown; n],
             exprs: vec![String::new(); n],
+            branches: vec![Vec::new(); n],
             alias_to_table: std::collections::HashMap::new(),
         }
     }
@@ -85,19 +92,106 @@ pub async fn explain_nullability(
 
     // Bottom-up: compute the set of aliases that can be NULL on this plan.
     let nullable_aliases = collect_nullable_aliases(&plan);
-    // Topmost Output list aligned with RowDescription.
-    let outputs = collect_topmost_output(&plan).unwrap_or_default();
     // `alias → (schema, relation)` from every scan node; used by the
     // caller to resolve EXPLAIN's `<alias>.<col>` back to a table column.
     let alias_to_table = collect_alias_to_table(&plan);
 
+    // Combined verdicts and the canonical Output expression per column.
+    // For a plain SELECT this is the topmost node's Output. For an
+    // Append / SetOp (UNION/INTERSECT/EXCEPT) the top node has no
+    // Output of its own — we merge each subplan's per-column Output by
+    // classifying each and taking the conservative result.
     let mut by_column = vec![NullVerdict::Unknown; n_columns];
     let mut exprs = vec![String::new(); n_columns];
-    for (i, expr) in outputs.iter().take(n_columns).enumerate() {
-        by_column[i] = classify(expr, &nullable_aliases);
-        exprs[i] = expr.clone();
+    let mut branches: Vec<Vec<String>> = vec![Vec::new(); n_columns];
+
+    if is_setop_node(&plan) {
+        let branch_outputs = collect_setop_branches(&plan);
+        for (branch_idx, outputs) in branch_outputs.iter().enumerate() {
+            for (i, expr) in outputs.iter().take(n_columns).enumerate() {
+                let v = classify(expr, &nullable_aliases);
+                by_column[i] = combine_setop(by_column[i], v, branch_idx > 0);
+                if branch_idx == 0 {
+                    exprs[i] = expr.clone();
+                }
+                branches[i].push(expr.clone());
+            }
+        }
+    } else {
+        let outputs = collect_topmost_output(&plan).unwrap_or_default();
+        for (i, expr) in outputs.iter().take(n_columns).enumerate() {
+            by_column[i] = classify(expr, &nullable_aliases);
+            exprs[i] = expr.clone();
+            branches[i] = vec![expr.clone()];
+        }
     }
-    Ok(NullabilityHints { by_column, exprs, alias_to_table })
+    Ok(NullabilityHints { by_column, exprs, branches, alias_to_table })
+}
+
+fn is_setop_node(plan: &PlanNode) -> bool {
+    matches!(
+        plan.node_type.as_deref(),
+        Some("Append" | "MergeAppend" | "SetOp" | "HashSetOp" | "Recursive Union"),
+    )
+}
+
+/// Walk through nested Append / SetOp wrappers and return the
+/// `Output` of every underlying branch in source order.
+fn collect_setop_branches(node: &PlanNode) -> Vec<Vec<String>> {
+    if is_setop_node(node) {
+        let mut out = Vec::new();
+        if let Some(children) = &node.plans {
+            for c in children {
+                out.extend(collect_setop_branches(c));
+            }
+        }
+        return out;
+    }
+    // Leaf: the closest Output below this node. For Subquery Scan
+    // wrappers (which PG emits around each UNION/INTERSECT/EXCEPT
+    // branch), the wrapper's own Output uses synthetic aliases like
+    // `"*SELECT* 1".id`; we need the *child's* Output, which has the
+    // real base-column references (`users.id`).
+    let unwrapped = unwrap_passthrough(node);
+    match collect_topmost_output(unwrapped) {
+        Some(o) => vec![o],
+        None => Vec::new(),
+    }
+}
+
+/// Step through known passthrough plan nodes (Subquery Scan, Sort,
+/// Materialize, Limit, …) to find the first node that emits the real
+/// underlying expressions. The passthrough wrapper's Output uses
+/// synthetic identifiers that don't resolve back to base columns.
+fn unwrap_passthrough(node: &PlanNode) -> &PlanNode {
+    let nt = node.node_type.as_deref().unwrap_or("");
+    let is_passthrough = matches!(
+        nt,
+        "Subquery Scan" | "Result" | "Sort" | "Incremental Sort" | "Materialize"
+            | "Limit" | "Unique" | "WindowAgg"
+    );
+    if is_passthrough {
+        if let Some(children) = &node.plans {
+            if children.len() == 1 {
+                return unwrap_passthrough(&children[0]);
+            }
+        }
+    }
+    node
+}
+
+/// Merge two verdicts for the same column across set-op branches.
+/// `already_seen` indicates whether `accum` was set by a previous
+/// branch (false → first branch, just take `next`).
+fn combine_setop(accum: NullVerdict, next: NullVerdict, already_seen: bool) -> NullVerdict {
+    if !already_seen {
+        return next;
+    }
+    match (accum, next) {
+        (NullVerdict::Nullable, _) | (_, NullVerdict::Nullable) => NullVerdict::Nullable,
+        (NullVerdict::NotNullable, NullVerdict::NotNullable) => NullVerdict::NotNullable,
+        _ => NullVerdict::Unknown,
+    }
 }
 
 /// Walk every Scan node and record its `(alias, schema, relation_name)`
@@ -239,6 +333,12 @@ pub(crate) fn classify(expr: &str, nullable_aliases: &HashSet<String>) -> NullVe
         return NullVerdict::Nullable;
     }
 
+    // Bare scalar literals (with optional `::cast` and outer parens):
+    // string `'foo'`, numeric `42`, boolean `true`/`false`.
+    if is_bare_literal(trimmed) {
+        return NullVerdict::NotNullable;
+    }
+
     let lower = trimmed.to_ascii_lowercase();
 
     if lower.starts_with("count(") {
@@ -352,6 +452,51 @@ fn leading_alias(expr: &str) -> Option<&str> {
     } else {
         None
     }
+}
+
+/// True if `expr` is a bare scalar literal: `'foo'`, `'foo'::text`,
+/// `42`, `42.5::numeric`, `true`, `false`, optionally wrapped in
+/// balanced parens.
+fn is_bare_literal(expr: &str) -> bool {
+    let mut s = expr.trim();
+    while s.starts_with('(') && s.ends_with(')') {
+        let inner = &s[1..s.len() - 1];
+        // Only peel if the inner has balanced parens (`(a)::b` would be unsafe).
+        if !is_paren_balanced(inner) { break; }
+        s = inner.trim();
+    }
+    let value = match s.split_once("::") {
+        Some((v, _)) => v.trim(),
+        None => s,
+    };
+    if value.is_empty() { return false; }
+    if value.starts_with('\'') && value.ends_with('\'') && value.len() >= 2 {
+        return true;
+    }
+    let lower = value.to_ascii_lowercase();
+    if lower == "true" || lower == "false" { return true; }
+    value.parse::<f64>().is_ok()
+}
+
+fn is_paren_balanced(s: &str) -> bool {
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' if !in_string => { in_string = true; }
+            b'\'' if in_string => {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' { i += 1; }
+                else { in_string = false; }
+            }
+            b'(' if !in_string => depth += 1,
+            b')' if !in_string => { depth -= 1; if depth < 0 { return false; } }
+            _ => {}
+        }
+        i += 1;
+    }
+    depth == 0
 }
 
 fn has_trailing_non_null_literal(expr: &str) -> bool {
