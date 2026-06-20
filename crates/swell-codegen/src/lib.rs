@@ -622,15 +622,12 @@ mod tests {
 
     #[test]
     fn tables_render_as_exported_interfaces() {
-        let tables = vec![ts(
-            "scheduler",
-            "campaigns",
-            vec![
-                ("id", "number", true),
-                ("name", "string", true),
-                ("owner_id", "string", false),
-            ],
-        )];
+        let cols = vec![
+            ("id", "number", true),
+            ("name", "string", true),
+            ("owner_id", "string", false),
+        ];
+        let tables = vec![ts("scheduler", "campaigns", cols)];
         let out = render(&[], with_tables(&tables));
         assert_has(&out, "export interface SchedulerCampaigns {\n");
         assert_has(&out, "  id: number;\n");
@@ -651,22 +648,17 @@ mod tests {
         // Partial selection (table has 3 cols, query picks 2) so the
         // SELECT-* short-circuit doesn't fire and we exercise the
         // indexed-access path.
-        let tables = vec![ts(
-            "scheduler",
-            "campaigns",
-            vec![
-                ("id", "number", true),
-                ("name", "string", true),
-                ("owner_id", "string", false),
-            ],
-        )];
+        let cols = vec![
+            ("id", "number", true),
+            ("name", "string", true),
+            ("owner_id", "string", false),
+        ];
+        let tables = vec![ts("scheduler", "campaigns", cols)];
+        let cf = |n, ts| col_from(n, ts, false, "scheduler", "campaigns");
         let out = render_one_with(
             "SELECT id, name FROM scheduler.campaigns WHERE id = $1",
             vec![p("number", true)],
-            vec![
-                col_from("id", "number", false, "scheduler", "campaigns"),
-                col_from("name", "string", false, "scheduler", "campaigns"),
-            ],
+            vec![cf("id", "number"), cf("name", "string")],
             &tables,
         );
         assert_has(
