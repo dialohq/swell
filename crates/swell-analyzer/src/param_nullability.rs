@@ -35,12 +35,8 @@ pub struct ParamInfo {
     pub table_ref: Option<TableColRef>,
 }
 
-impl ParamInfo {
-    fn nullable_default() -> Self { Self { nullable: true, table_ref: None } }
-}
-
 pub async fn infer(client: &Client, sql: &str, n_params: usize) -> Vec<ParamInfo> {
-    let mut out: Vec<ParamInfo> = (0..n_params).map(|_| ParamInfo::nullable_default()).collect();
+    let mut out: Vec<ParamInfo> = vec![ParamInfo { nullable: true, table_ref: None }; n_params];
     if n_params == 0 {
         return out;
     }

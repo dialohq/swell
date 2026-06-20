@@ -249,24 +249,16 @@ fn combine_setop(accum: NullVerdict, next: NullVerdict, already_seen: bool) -> N
 /// Walk every Scan node and record its `(alias, schema, relation_name)`
 /// so the caller can resolve EXPLAIN's column qualifications.
 fn collect_alias_to_table(node: &PlanNode) -> std::collections::HashMap<String, (String, String)> {
-    let mut out = std::collections::HashMap::new();
-    collect_alias_to_table_rec(node, &mut out);
-    out
-}
-
-fn collect_alias_to_table_rec(
-    node: &PlanNode,
-    out: &mut std::collections::HashMap<String, (String, String)>,
-) {
-    if let (Some(alias), Some(rel)) = (&node.alias, &node.relation_name) {
-        let schema = node.schema.clone().unwrap_or_default();
-        out.entry(alias.clone()).or_insert((schema, rel.clone()));
-    }
-    if let Some(children) = &node.plans {
-        for c in children {
-            collect_alias_to_table_rec(c, out);
+    fn rec(node: &PlanNode, out: &mut std::collections::HashMap<String, (String, String)>) {
+        if let (Some(alias), Some(rel)) = (&node.alias, &node.relation_name) {
+            let schema = node.schema.clone().unwrap_or_default();
+            out.entry(alias.clone()).or_insert((schema, rel.clone()));
         }
+        for c in node.plans.iter().flatten() { rec(c, out); }
     }
+    let mut out = std::collections::HashMap::new();
+    rec(node, &mut out);
+    out
 }
 
 /// Walk the plan and return scan aliases whose every output column is
@@ -279,59 +271,40 @@ fn collect_alias_to_table_rec(
 /// A `<alias>.<col>` reference for an alias in this set classifies as
 /// `NotNullable` even though PG doesn't carry attnotnull info for it.
 fn collect_non_null_source_aliases(node: &PlanNode) -> HashSet<String> {
-    let mut out = HashSet::new();
-    collect_non_null_source_aliases_rec(node, &mut out);
-    out
-}
-
-fn collect_non_null_source_aliases_rec(node: &PlanNode, out: &mut HashSet<String>) {
-    let nt = node.node_type.as_deref().unwrap_or("");
-    let alias = node.alias.as_deref();
-    if nt == "Function Scan" {
-        if let (Some(a), Some(name), Some(call)) = (
-            alias,
-            node.function_name.as_deref(),
-            node.function_call.as_deref(),
-        ) {
-            if name == "unnest" && unnest_call_is_literal_array(call) {
-                out.insert(a.to_string());
+    fn rec(node: &PlanNode, out: &mut HashSet<String>) {
+        let nt = node.node_type.as_deref().unwrap_or("");
+        let alias = node.alias.as_deref();
+        if nt == "Function Scan" {
+            if let (Some(a), Some(name), Some(call)) = (
+                alias,
+                node.function_name.as_deref(),
+                node.function_call.as_deref(),
+            ) {
+                if name == "unnest" && unnest_call_is_literal_array(call) {
+                    out.insert(a.to_string());
+                }
             }
-        }
-    } else if nt == "Values Scan" {
-        if let Some(a) = alias {
+        } else if nt == "Values Scan" {
             // PG doesn't put the literal values into the EXPLAIN
             // output, but every VALUES we recognise from the SQL is
             // a row of bare literals (the corpus shape). Be
             // optimistic: register the alias as a non-null source.
-            // The TS render still defaults to nullable; the caller
-            // gates this through `refine_via_attnotnull`-style logic.
-            out.insert(a.to_string());
+            if let Some(a) = alias { out.insert(a.to_string()); }
         }
+        for c in node.plans.iter().flatten() { rec(c, out); }
     }
-    if let Some(children) = &node.plans {
-        for c in children {
-            collect_non_null_source_aliases_rec(c, out);
-        }
-    }
+    let mut out = HashSet::new();
+    rec(node, &mut out);
+    out
 }
 
 /// Recognise `unnest(ARRAY[lit, lit, …])` or `unnest('{lit,lit}'::T[])`
 /// — the array argument is a bare literal so every yielded element is
 /// non-null.
 fn unnest_call_is_literal_array(call: &str) -> bool {
-    let inner = match call.strip_prefix("unnest(") {
-        Some(s) => s.trim_end_matches(')').trim(),
-        None => return false,
-    };
-    // `ARRAY[…]::T[]` or just `ARRAY[…]`
-    if inner.starts_with("ARRAY[") || inner.starts_with("array[") {
-        return true;
-    }
-    // PG's array-literal form `'{a,b,c}'::text[]`.
-    if inner.starts_with('\'') {
-        return true;
-    }
-    false
+    let Some(rest) = call.strip_prefix("unnest(") else { return false; };
+    let inner = rest.trim_end_matches(')').trim();
+    inner.starts_with("ARRAY[") || inner.starts_with("array[") || inner.starts_with('\'')
 }
 
 // ------------- Plan tree types -------------
@@ -373,17 +346,8 @@ struct PlanNode {
 }
 
 fn collect_topmost_output(node: &PlanNode) -> Option<Vec<String>> {
-    if let Some(out) = &node.output {
-        return Some(out.clone());
-    }
-    if let Some(children) = &node.plans {
-        for c in children {
-            if let Some(o) = collect_topmost_output(c) {
-                return Some(o);
-            }
-        }
-    }
-    None
+    if let Some(out) = &node.output { return Some(out.clone()); }
+    node.plans.iter().flatten().find_map(collect_topmost_output)
 }
 
 /// Walk the plan tree and return every `Alias` whose rows can be NULL due
@@ -396,54 +360,33 @@ fn collect_topmost_output(node: &PlanNode) -> Option<Vec<String>> {
 ///   - Right Join nodes mark the Outer-side aliases as nullable.
 ///   - Full Join nodes mark both sides as nullable.
 fn collect_nullable_aliases(node: &PlanNode) -> HashSet<String> {
-    let mut already_nullable = HashSet::new();
-    walk(node, &mut already_nullable);
-    already_nullable
-}
-
-fn walk(node: &PlanNode, nullable: &mut HashSet<String>) {
-    let join_type = node.join_type.as_deref();
-    let children = node.plans.as_deref().unwrap_or(&[]);
-
-    // First, descend into children — preserves anything they marked.
-    for c in children {
-        walk(c, nullable);
-    }
-
-    // Then apply the join-type rule at this node.
-    match join_type {
-        Some("Left") => {
-            for c in children {
-                if c.parent_relationship.as_deref() == Some("Inner") {
-                    nullable.extend(collect_subtree_aliases(c));
-                }
-            }
-        }
-        Some("Right") => {
-            for c in children {
-                if c.parent_relationship.as_deref() == Some("Outer") {
-                    nullable.extend(collect_subtree_aliases(c));
-                }
-            }
-        }
-        Some("Full") => {
-            for c in children {
+    fn walk(node: &PlanNode, nullable: &mut HashSet<String>) {
+        let children = node.plans.as_deref().unwrap_or(&[]);
+        for c in children { walk(c, nullable); }
+        // The Inner side of a LEFT join, Outer side of RIGHT, both for FULL —
+        // those scan aliases become nullable in the result.
+        let null_side = match node.join_type.as_deref() {
+            Some("Left")  => Some("Inner"),
+            Some("Right") => Some("Outer"),
+            Some("Full")  => None, // both sides
+            _ => return,
+        };
+        for c in children {
+            if null_side.is_none() || c.parent_relationship.as_deref() == null_side {
                 nullable.extend(collect_subtree_aliases(c));
             }
         }
-        _ => {} // Inner / Anti / Semi / no join → propagate child decisions only
     }
+    let mut out = HashSet::new();
+    walk(node, &mut out);
+    out
 }
 
 fn collect_subtree_aliases(node: &PlanNode) -> HashSet<String> {
     let mut set = HashSet::new();
-    if let Some(a) = &node.alias {
-        set.insert(a.clone());
-    }
-    if let Some(children) = &node.plans {
-        for c in children {
-            set.extend(collect_subtree_aliases(c));
-        }
+    if let Some(a) = &node.alias { set.insert(a.clone()); }
+    for c in node.plans.iter().flatten() {
+        set.extend(collect_subtree_aliases(c));
     }
     set
 }
@@ -629,27 +572,19 @@ fn classify_expr(
 fn collect_subplan_outputs(
     node: &PlanNode,
 ) -> std::collections::HashMap<String, Vec<String>> {
-    let mut out = std::collections::HashMap::new();
-    collect_subplan_outputs_rec(node, &mut out);
-    out
-}
-
-fn collect_subplan_outputs_rec(
-    node: &PlanNode,
-    out: &mut std::collections::HashMap<String, Vec<String>>,
-) {
-    if let Some(name) = &node.subplan_name {
-        if name.starts_with("SubPlan ") || name.starts_with("InitPlan ") {
-            if let Some(o) = collect_topmost_output(node) {
-                out.entry(name.clone()).or_insert(o);
+    fn rec(node: &PlanNode, out: &mut std::collections::HashMap<String, Vec<String>>) {
+        if let Some(name) = &node.subplan_name {
+            if name.starts_with("SubPlan ") || name.starts_with("InitPlan ") {
+                if let Some(o) = collect_topmost_output(node) {
+                    out.entry(name.clone()).or_insert(o);
+                }
             }
         }
+        for c in node.plans.iter().flatten() { rec(c, out); }
     }
-    if let Some(children) = &node.plans {
-        for c in children {
-            collect_subplan_outputs_rec(c, out);
-        }
-    }
+    let mut out = std::collections::HashMap::new();
+    rec(node, &mut out);
+    out
 }
 
 /// CTE name → base-case Output expressions. Recursive CTEs have two
@@ -660,46 +595,26 @@ fn collect_subplan_outputs_rec(
 fn collect_cte_base_outputs(
     node: &PlanNode,
 ) -> std::collections::HashMap<String, Vec<String>> {
-    let mut out = std::collections::HashMap::new();
-    collect_cte_base_outputs_rec(node, &mut out);
-    out
-}
-
-fn collect_cte_base_outputs_rec(
-    node: &PlanNode,
-    out: &mut std::collections::HashMap<String, Vec<String>>,
-) {
-    if node.node_type.as_deref() == Some("Recursive Union") {
-        if let Some(name) = node.subplan_name.as_deref() {
-            // Subplan name is `CTE <name>`.
-            if let Some(cte_name) = name.strip_prefix("CTE ") {
-                if let Some(children) = &node.plans {
-                    for c in children {
-                        if c.parent_relationship.as_deref() == Some("Outer") {
-                            if let Some(o) = collect_topmost_output(c) {
-                                out.entry(cte_name.to_string()).or_insert(o);
-                            }
+    fn rec(node: &PlanNode, out: &mut std::collections::HashMap<String, Vec<String>>) {
+        let is_recursive = node.node_type.as_deref() == Some("Recursive Union");
+        if let Some(cte_name) = node.subplan_name.as_deref().and_then(|n| n.strip_prefix("CTE ")) {
+            if is_recursive {
+                for c in node.plans.iter().flatten() {
+                    if c.parent_relationship.as_deref() == Some("Outer") {
+                        if let Some(o) = collect_topmost_output(c) {
+                            out.entry(cte_name.to_string()).or_insert(o);
                         }
                     }
                 }
+            } else if let Some(o) = collect_topmost_output(node) {
+                out.entry(cte_name.to_string()).or_insert(o);
             }
         }
+        for c in node.plans.iter().flatten() { rec(c, out); }
     }
-    // Non-recursive CTE — single child plan tagged with `CTE <name>`.
-    if let Some(name) = &node.subplan_name {
-        if let Some(cte_name) = name.strip_prefix("CTE ") {
-            if node.node_type.as_deref() != Some("Recursive Union") {
-                if let Some(o) = collect_topmost_output(node) {
-                    out.entry(cte_name.to_string()).or_insert(o);
-                }
-            }
-        }
-    }
-    if let Some(children) = &node.plans {
-        for c in children {
-            collect_cte_base_outputs_rec(c, out);
-        }
-    }
+    let mut out = std::collections::HashMap::new();
+    rec(node, &mut out);
+    out
 }
 
 fn is_simple_ident(s: &str) -> bool {

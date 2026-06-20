@@ -417,16 +417,12 @@ fn resolve_arg(
             key.map(|(s, t)| (s.clone(), t.clone(), col))
         }
         ColumnRefShape::Bare(col) => {
-            let mut hit: Option<(String, String, String)> = None;
-            let mut ambiguous = false;
-            for (schema, table) in alias_to_table.values() {
-                let k = (schema.clone(), table.clone(), col.clone());
-                if attnotnull.contains_key(&k) {
-                    if hit.is_some() { ambiguous = true; break; }
-                    hit = Some(k);
-                }
-            }
-            if ambiguous { None } else { hit }
+            let mut matches = alias_to_table.values().filter_map(|(s, t)| {
+                let k = (s.clone(), t.clone(), col.clone());
+                attnotnull.contains_key(&k).then_some(k)
+            });
+            let first = matches.next()?;
+            matches.next().is_none().then_some(first)
         }
         ColumnRefShape::None => None,
     }
@@ -508,43 +504,33 @@ fn build_full_join_variants(
 ) -> Option<Vec<RowVariant>> {
     let (left, right) = hints.root_full_join.as_ref()?;
     // Decide each column's source side via its EXPLAIN expression's
-    // leading alias. Columns whose source can't be determined are
-    // assumed present in all variants (no override).
-    use std::collections::BTreeMap;
-    let mut col_side: Vec<Option<bool>> = Vec::with_capacity(columns.len()); // Some(true) = left, Some(false) = right
-    for (i, c) in columns.iter().enumerate() {
+    // leading alias (Some(true) = left, Some(false) = right). Columns
+    // whose source can't be determined are present in every variant.
+    let side_of = |a: &str| {
+        if left.contains(a) { Some(true) }
+        else if right.contains(a) { Some(false) }
+        else { None }
+    };
+    let col_side: Vec<Option<bool>> = (0..columns.len()).map(|i| {
         let expr = hints.exprs.get(i).map(String::as_str).unwrap_or("");
         let alias = expr_leading_alias(expr);
         let stripped = alias.as_deref().map(strip_suffix_digits);
-        let side = match alias.as_deref() {
-            Some(a) if left.contains(a) => Some(true),
-            Some(a) if right.contains(a) => Some(false),
-            _ => match stripped.as_deref() {
-                Some(a) if left.contains(a) => Some(true),
-                Some(a) if right.contains(a) => Some(false),
-                _ => None,
-            },
-        };
-        let _ = c; // column itself isn't needed; side is from expr
-        col_side.push(side);
-    }
+        alias.as_deref().and_then(side_of)
+            .or_else(|| stripped.as_deref().and_then(side_of))
+    }).collect();
     // Three variants: only-left (right→null), only-right (left→null),
     // both (no overrides; falls back to base columns).
     let mk = |on_left_null: bool, on_right_null: bool| -> RowVariant {
-        let mut ov: BTreeMap<String, String> = BTreeMap::new();
-        for (i, c) in columns.iter().enumerate() {
-            match col_side[i] {
-                Some(true)  if on_left_null  => { ov.insert(c.name.clone(), "null".into()); }
-                Some(false) if on_right_null => { ov.insert(c.name.clone(), "null".into()); }
-                _ => {}
-            }
-        }
-        RowVariant { overrides: ov }
+        let overrides = columns.iter().enumerate()
+            .filter_map(|(i, c)| match col_side[i] {
+                Some(true)  if on_left_null  => Some((c.name.clone(), "null".into())),
+                Some(false) if on_right_null => Some((c.name.clone(), "null".into())),
+                _ => None,
+            })
+            .collect();
+        RowVariant { overrides }
     };
-    let only_left  = mk(false, true);
-    let only_right = mk(true,  false);
-    let both       = mk(false, false);
-    Some(vec![only_left, only_right, both])
+    Some(vec![mk(false, true), mk(true, false), mk(false, false)])
 }
 
 /// Pick the column name out of a `ColumnRef` node inside a GROUPING
@@ -671,81 +657,47 @@ enum ColumnRefShape {
 /// balanced parens until we find the `coalesce` head.
 fn coalesce_args(expr: &str) -> Option<Vec<String>> {
     let mut s = expr.trim();
-    // Peel one balanced `(...)` wrapper at a time.
-    loop {
-        if !s.starts_with('(') || !s.ends_with(')') { break; }
-        if !is_balanced_paren_wrapper(s) { break; }
-        s = &s[1..s.len() - 1];
-        s = s.trim();
+    while s.starts_with('(') && s.ends_with(')') && is_balanced_paren_wrapper(s) {
+        s = s[1..s.len() - 1].trim();
     }
-    let lower = s.to_ascii_lowercase();
-    if !lower.starts_with("coalesce(") {
-        return None;
-    }
-    let body_start = "coalesce(".len();
-    let bytes = s.as_bytes();
-    let mut depth = 1;
-    let mut i = body_start;
-    let mut in_string = false;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if in_string {
-            if b == b'\'' {
-                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' { i += 2; continue; }
-                in_string = false;
-            }
-        } else {
-            match b {
-                b'\'' => in_string = true,
-                b'(' => depth += 1,
-                b')' => {
-                    depth -= 1;
-                    if depth == 0 { break; }
-                }
-                _ => {}
-            }
-        }
-        i += 1;
-    }
-    if depth != 0 || i >= bytes.len() {
-        return None;
-    }
-    Some(split_top_level_args(&s[body_start..i]))
+    if !s.to_ascii_lowercase().starts_with("coalesce(") { return None; }
+    let open = "coalesce".len();
+    let close = find_matching_close(s.as_bytes(), open)?;
+    Some(split_top_level_args(&s[open + 1..close]))
 }
 
 /// True iff the leading `(` of `s` is closed by the very last `)` of
 /// `s` — i.e. the whole string is wrapped in one balanced pair.
 fn is_balanced_paren_wrapper(s: &str) -> bool {
-    let bytes = s.as_bytes();
-    if bytes.is_empty() || bytes[0] != b'(' || *bytes.last().unwrap() != b')' {
-        return false;
-    }
-    let mut depth = 0;
+    s.starts_with('(') && find_matching_close(s.as_bytes(), 0) == Some(s.len() - 1)
+}
+
+/// Find the byte index of the `)` matching the `(` at byte `open`,
+/// skipping single-quoted string contents. Returns None if unbalanced
+/// or if `bytes[open]` isn't `(`.
+fn find_matching_close(bytes: &[u8], open: usize) -> Option<usize> {
+    if bytes.get(open) != Some(&b'(') { return None; }
+    let mut depth = 1;
     let mut in_string = false;
-    let mut i = 0;
+    let mut i = open + 1;
     while i < bytes.len() {
         let b = bytes[i];
         if in_string {
             if b == b'\'' {
-                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' { i += 2; continue; }
+                if bytes.get(i + 1) == Some(&b'\'') { i += 2; continue; }
                 in_string = false;
             }
         } else {
             match b {
                 b'\'' => in_string = true,
                 b'(' => depth += 1,
-                b')' => {
-                    depth -= 1;
-                    if depth == 0 && i != bytes.len() - 1 {
-                        return false;
-                    }
-                }
+                b')' => { depth -= 1; if depth == 0 { return Some(i); } }
                 _ => {}
             }
         }
         i += 1;
     }
-    depth == 0
+    None
 }
 
 fn split_top_level_args(body: &str) -> Vec<String> {

@@ -77,14 +77,10 @@ pub async fn infer_shapes(
 // ----- AST helpers -----
 
 fn find_top_select(p: &pg_query::protobuf::ParseResult) -> Option<&SelectStmt> {
-    for raw in &p.stmts {
-        if let Some(stmt) = &raw.stmt {
-            if let Some(node::Node::SelectStmt(s)) = &stmt.node {
-                return Some(s);
-            }
-        }
-    }
-    None
+    p.stmts.iter().find_map(|raw| match &raw.stmt.as_ref()?.node {
+        Some(node::Node::SelectStmt(s)) => Some(s.as_ref()),
+        _ => None,
+    })
 }
 
 /// Walk from_clause + JoinExpr trees, returning a map of alias → relation.
@@ -122,11 +118,10 @@ async fn resolve_alias_oids(
 ) -> HashMap<String, u32> {
     let mut out = HashMap::new();
     if alias_map.is_empty() { return out; }
+    let schema_of = |s: &String| if s.is_empty() { "public".to_string() } else { s.clone() };
+    let schemas: Vec<String> = alias_map.values().map(|(s, _)| schema_of(s)).collect();
     let names: Vec<String> = alias_map.values().map(|(_, n)| n.clone()).collect();
-    let schemas: Vec<String> = alias_map.values()
-        .map(|(s, _)| if s.is_empty() { "public".to_string() } else { s.clone() })
-        .collect();
-    let rows_result = client.query(
+    let Ok(rows) = client.query(
         r#"
         WITH ask(schema, name) AS (SELECT * FROM unnest($1::text[], $2::text[]))
         SELECT n.nspname, c.relname, c.oid::bigint
@@ -135,19 +130,13 @@ async fn resolve_alias_oids(
         JOIN pg_class c     ON c.relnamespace = n.oid AND c.relname = ask.name
         "#,
         &[&schemas, &names],
-    ).await;
-    let rows = match rows_result { Ok(r) => r, Err(_) => return out };
-    let mut by_relname: HashMap<(String, String), u32> = HashMap::new();
-    for row in &rows {
-        let s: &str = row.get(0);
-        let n: &str = row.get(1);
-        let oid: i64 = row.get(2);
-        by_relname.insert((s.to_string(), n.to_string()), oid as u32);
-    }
+    ).await else { return out };
+    let by_relname: HashMap<(String, String), u32> = rows.iter()
+        .map(|row| ((row.get::<_, String>(0), row.get::<_, String>(1)), row.get::<_, i64>(2) as u32))
+        .collect();
     for (alias, (s, n)) in alias_map {
-        let schema = if s.is_empty() { "public".to_string() } else { s.clone() };
-        if let Some(oid) = by_relname.get(&(schema, n.clone())) {
-            out.insert(alias.clone(), *oid);
+        if let Some(&oid) = by_relname.get(&(schema_of(s), n.clone())) {
+            out.insert(alias.clone(), oid);
         }
     }
     out
@@ -254,32 +243,20 @@ async fn infer_user_func_return(
     // matches by name (and schema, if qualified). Good enough for the
     // structural shape — the runtime PARSE/DESCRIBE step already
     // resolved the right overload for the outer column anyway.
-    let rows_res = if let Some(schema) = schema {
-        client.query(
-            r#"
-            SELECT t.oid::oid, t.typname
-            FROM pg_proc p
-            JOIN pg_type t ON t.oid = p.prorettype
-            JOIN pg_namespace n ON n.oid = p.pronamespace
-            WHERE p.proname = $1 AND n.nspname = $2
-            LIMIT 1
-            "#,
-            &[&name, &schema],
-        ).await
-    } else {
-        client.query(
-            r#"
-            SELECT t.oid::oid, t.typname
-            FROM pg_proc p
-            JOIN pg_type t ON t.oid = p.prorettype
-            WHERE p.proname = $1
-              AND p.pronamespace = ANY(current_schemas(true)::regnamespace[])
-            LIMIT 1
-            "#,
-            &[&name],
-        ).await
-    };
-    let row = rows_res.ok()?.into_iter().next()?;
+    let row = client.query_opt(
+        r#"
+        SELECT t.oid::oid, t.typname
+        FROM pg_proc p
+        JOIN pg_type t ON t.oid = p.prorettype
+        WHERE p.proname = $1
+          AND ($2::text IS NOT NULL
+               OR p.pronamespace = ANY(current_schemas(true)::regnamespace[]))
+          AND ($2::text IS NULL
+               OR p.pronamespace = (SELECT oid FROM pg_namespace WHERE nspname = $2))
+        LIMIT 1
+        "#,
+        &[&name, &schema],
+    ).await.ok()??;
     let oid: u32 = row.get(0);
     let typname: String = row.get(1);
     let base = catalog.render_oid(oid, &typname, crate::ts_types::Direction::Read);
