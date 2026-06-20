@@ -7,10 +7,10 @@
 
 pub mod describe;
 pub mod catalog;
+pub mod explain_expr;
 pub mod nullability;
 pub mod param_nullability;
 pub mod json_shape;
-pub mod overrides;
 pub mod ts_types;
 pub mod query;
 
@@ -102,25 +102,15 @@ impl Analyzer {
             &null_hints.alias_to_table,
         ).await;
 
-        // Extra verdict refinement: a `COALESCE(...)` whose args include any
-        // NOT-NULL base column is non-null. `classify` already handles the
-        // trailing-literal case; this handles `COALESCE(nullable_col,
-        // not_null_col)` by looking up attnotnull for each `<alias>.<col>`
-        // arg using the plan's scan map.
-        let coalesce_refined = refine_coalesce_non_null_with(
-            &null_hints,
-            &scan_attnotnull,
-        );
-
-        // For each column, see if every branch's expression resolves to
-        // a NOT NULL base-column reference; if so, upgrade to
-        // NotNullable. Handles UNION/INTERSECT/EXCEPT non-null inference
-        // and plain `<alias>.<col>` references that classify can't
-        // resolve on its own.
-        let column_ref_refined = refine_via_attnotnull(
-            &null_hints,
-            &scan_attnotnull,
-        );
+        // Per-column NOT NULL refinement, two sources combined into one
+        // bitmask:
+        //   - `COALESCE(...)` whose any arg is a NOT NULL base column.
+        //     classify already handles `coalesce(x, 'lit')`; this picks
+        //     up `coalesce(nullable, not_null_col)` via attnotnull.
+        //   - SET-OP branches whose every branch is a NOT NULL base
+        //     column ref. Handles UNION/INTERSECT/EXCEPT cases that the
+        //     classifier can't see through.
+        let refine_upgrade = refine_to_not_null(&null_hints, &scan_attnotnull);
 
         let json_shapes = json_shape::infer_shapes(
             &self.client, &self.catalog, sql, described.columns.len(),
@@ -148,10 +138,8 @@ impl Analyzer {
                     .unwrap_or(nullability::NullVerdict::Unknown);
                 // Only upgrade an `Unknown` verdict — never override a
                 // Nullable verdict (e.g. an outer-join's RHS column).
-                let upgrade = matches!(raw, nullability::NullVerdict::Unknown) && (
-                    coalesce_refined.get(i).copied().unwrap_or(false)
-                    || column_ref_refined.get(i).copied().unwrap_or(false)
-                );
+                let upgrade = matches!(raw, nullability::NullVerdict::Unknown)
+                    && refine_upgrade.get(i).copied().unwrap_or(false);
                 let verdict = if upgrade { nullability::NullVerdict::NotNullable } else { raw };
                 let inferred_nullable = decide_nullability(c, &attnotnull, verdict);
                 let oid_ts = catalog::render_for_oid(&self.catalog, c.type_.oid(), &c.type_, Direction::Read);
@@ -165,13 +153,22 @@ impl Analyzer {
                     .and_then(|b| infer_setop_literal_union(b));
                 let inferred_ts = setop_lit_ts.or(json_ts).unwrap_or(oid_ts);
 
-                let ov = overrides::parse(&c.name);
+                // SQLx-style alias suffix overrides: `as "col!"` /
+                // `as "col?"`. Postgres surfaces the marker in the
+                // RowDescription name; the marker stays on the column
+                // name end-to-end so the row type matches the SQL the
+                // user wrote.
+                let force_nullable = match c.name.chars().last() {
+                    Some('!') => Some(false),
+                    Some('?') => Some(true),
+                    _ => None,
+                };
                 let table_ref = column_meta.get(&(c.table_oid, c.attnum))
                     .map(|m| m.table_ref.clone());
                 InferredColumn {
-                    name: ov.clean_name,
+                    name: c.name.clone(),
                     oid: c.type_.oid(),
-                    nullable: ov.force_nullable.unwrap_or(inferred_nullable),
+                    nullable: force_nullable.unwrap_or(inferred_nullable),
                     ts_type: inferred_ts,
                     table_ref,
                 }
@@ -330,67 +327,41 @@ async fn fetch_scan_attnotnull(
     out
 }
 
-/// For each output column whose EXPLAIN expression is `COALESCE(...)`,
-/// check whether any arg is a NOT NULL base column reference and return
-/// `true` for that column index. The caller upgrades the column's
-/// verdict to `NotNullable` when this returns true.
-///
-/// `classify` already handles the trailing-literal case (e.g.
-/// `coalesce(x, 'lit')`); this picks up the cases where the non-null
-/// guarantor is a NOT NULL column.
-fn refine_coalesce_non_null_with(
+/// Per-column NOT NULL refinement combining two evidence sources:
+///   - `COALESCE(...)` where any arg is a NOT NULL base column or a
+///     non-null literal.
+///   - Every SET-OP branch is a NOT NULL base column reference.
+fn refine_to_not_null(
     hints: &nullability::NullabilityHints,
     attnotnull: &AttnotnullMap,
 ) -> Vec<bool> {
-    let mut out = vec![false; hints.exprs.len()];
-    for (i, expr) in hints.exprs.iter().enumerate() {
-        let args = match coalesce_args(expr) {
-            Some(args) => args,
-            None => continue,
-        };
-        for arg in &args {
-            if is_literal_token(arg) {
-                out[i] = true;
-                break;
-            }
-            if let Some(k) = resolve_arg(arg, &hints.alias_to_table, attnotnull) {
-                if attnotnull.get(&k).copied().unwrap_or(false) {
-                    out[i] = true;
-                    break;
-                }
+    let n = hints.exprs.len().max(hints.branches.len());
+    let mut out = vec![false; n];
+    for i in 0..n {
+        // Coalesce: any arg is a non-null literal or NOT NULL column.
+        if let Some(expr) = hints.exprs.get(i) {
+            if let Some(args) = explain_expr::parse_call_args(expr, "coalesce") {
+                let non_null = args.iter().any(|a| {
+                    explain_expr::is_literal_non_null(a)
+                    || resolve_arg(a, &hints.alias_to_table, attnotnull)
+                        .map(|k| attnotnull.get(&k).copied().unwrap_or(false))
+                        .unwrap_or(false)
+                });
+                if non_null { out[i] = true; continue; }
             }
         }
-    }
-    out
-}
-
-/// For each output column, if every branch's expression resolves to a
-/// NOT NULL base-column reference, mark the column NotNullable. This
-/// is what makes `SELECT id FROM users INTERSECT SELECT user_id …`
-/// produce `result: { id: string }` instead of `string | null` — the
-/// classifier alone can't see through an outer SetOp/Append to the
-/// underlying base columns.
-fn refine_via_attnotnull(
-    hints: &nullability::NullabilityHints,
-    attnotnull: &AttnotnullMap,
-) -> Vec<bool> {
-    let mut out = vec![false; hints.branches.len()];
-    for (i, branches) in hints.branches.iter().enumerate() {
-        if branches.is_empty() { continue; }
-        let all_non_null = branches.iter().all(|expr| {
-            // The refinement is for bare column references that
-            // classify can't resolve through a SetOp/Append wrapper.
-            // Casts (and other expression wrappers) are intentionally
-            // excluded — the analyzer treats `id::text` as nullable
-            // because the cast may not preserve NOT NULL semantics
-            // for user-defined types.
-            if expr.contains("::") { return false; }
-            resolve_arg(expr, &hints.alias_to_table, attnotnull)
-                .map(|k| attnotnull.get(&k).copied().unwrap_or(false))
-                .unwrap_or(false)
-        });
-        if all_non_null {
-            out[i] = true;
+        // Set-op branches: every branch is a bare NOT NULL column. Casts
+        // are excluded — `id::text` isn't guaranteed to preserve NOT NULL
+        // semantics for user-defined types.
+        if let Some(branches) = hints.branches.get(i) {
+            if !branches.is_empty() && branches.iter().all(|expr| {
+                if expr.contains("::") { return false; }
+                resolve_arg(expr, &hints.alias_to_table, attnotnull)
+                    .map(|k| attnotnull.get(&k).copied().unwrap_or(false))
+                    .unwrap_or(false)
+            }) {
+                out[i] = true;
+            }
         }
     }
     out
@@ -405,26 +376,24 @@ fn resolve_arg(
     alias_to_table: &std::collections::HashMap<String, (String, String)>,
     attnotnull: &AttnotnullMap,
 ) -> Option<(String, String, String)> {
-    match parse_column_ref(arg) {
-        ColumnRefShape::Qualified(alias, col) => {
-            // Strip suffix digits from the alias — PG renames duplicate
-            // scan aliases as `users_1`, `users_2` in plans (e.g. for
-            // FULL JOIN). Try the literal alias first; fall back to
-            // the de-numbered form so the user's alias_to_table entry
-            // (which uses the literal alias) still resolves.
-            let key = alias_to_table.get(&alias)
-                .or_else(|| alias_to_table.get(&strip_suffix_digits(&alias)));
-            key.map(|(s, t)| (s.clone(), t.clone(), col))
+    match explain_expr::parse_ref(arg)? {
+        explain_expr::Ref::Qualified { alias, col } => {
+            // PG renames duplicate scan aliases as `users_1`, `users_2`
+            // in plans (e.g. for FULL JOIN). Try the literal alias
+            // first; fall back to the de-numbered form so the user's
+            // `alias_to_table` entry still resolves.
+            let key = alias_to_table.get(alias)
+                .or_else(|| alias_to_table.get(explain_expr::strip_suffix_digits(alias)));
+            key.map(|(s, t)| (s.clone(), t.clone(), col.to_string()))
         }
-        ColumnRefShape::Bare(col) => {
+        explain_expr::Ref::Bare(col) => {
             let mut matches = alias_to_table.values().filter_map(|(s, t)| {
-                let k = (s.clone(), t.clone(), col.clone());
+                let k = (s.clone(), t.clone(), col.to_string());
                 attnotnull.contains_key(&k).then_some(k)
             });
             let first = matches.next()?;
             matches.next().is_none().then_some(first)
         }
-        ColumnRefShape::None => None,
     }
 }
 
@@ -434,42 +403,10 @@ fn infer_setop_literal_union(branches: &[String]) -> Option<String> {
     if branches.len() < 2 { return None; }
     let mut unique: Vec<String> = Vec::new();
     for b in branches {
-        let lit = extract_ts_literal(b)?;
+        let lit = explain_expr::parse_literal_ts(b)?;
         if !unique.contains(&lit) { unique.push(lit); }
     }
-    if unique.is_empty() { return None; }
-    Some(unique.join(" | "))
-}
-
-/// If `expr` is a literal token (string / numeric / boolean), with an
-/// optional `::cast` and outer parens, return its TS-literal form.
-fn extract_ts_literal(expr: &str) -> Option<String> {
-    let mut s = expr.trim();
-    // Peel a single layer of balanced parens.
-    while s.starts_with('(') && s.ends_with(')') && is_balanced_paren_wrapper(s) {
-        s = &s[1..s.len() - 1].trim();
-    }
-    // Drop a `::cast` suffix.
-    let value = match s.split_once("::") {
-        Some((v, _)) => v.trim(),
-        None => s,
-    };
-    if value.is_empty() { return None; }
-    // String literal.
-    if value.starts_with('\'') && value.ends_with('\'') && value.len() >= 2 {
-        let inner = value[1..value.len() - 1].replace("''", "'");
-        return Some(format!("\"{}\"", inner.replace('\\', "\\\\").replace('"', "\\\"")));
-    }
-    // Boolean literal.
-    let lower = value.to_ascii_lowercase();
-    if lower == "true" || lower == "false" {
-        return Some(lower);
-    }
-    // Numeric literal.
-    if value.parse::<f64>().is_ok() {
-        return Some(value.to_string());
-    }
-    None
+    (!unique.is_empty()).then(|| unique.join(" | "))
 }
 
 /// Build row-level variants for queries that produce a discriminated
@@ -513,10 +450,9 @@ fn build_full_join_variants(
     };
     let col_side: Vec<Option<bool>> = (0..columns.len()).map(|i| {
         let expr = hints.exprs.get(i).map(String::as_str).unwrap_or("");
-        let alias = expr_leading_alias(expr);
-        let stripped = alias.as_deref().map(strip_suffix_digits);
-        alias.as_deref().and_then(side_of)
-            .or_else(|| stripped.as_deref().and_then(side_of))
+        let alias = explain_expr::leading_alias(expr);
+        alias.and_then(side_of)
+            .or_else(|| alias.and_then(|a| side_of(explain_expr::strip_suffix_digits(a))))
     }).collect();
     // Three variants: only-left (right→null), only-right (left→null),
     // both (no overrides; falls back to base columns).
@@ -546,20 +482,6 @@ fn column_ref_name_in_grouping(node: &pg_query::protobuf::Node) -> Option<String
         NodeBody::String(s) => Some(s.sval.clone()),
         _ => None,
     }
-}
-
-/// Extract `alias` from `expr`'s leading `<alias>.<col>` reference.
-fn expr_leading_alias(expr: &str) -> Option<String> {
-    let trimmed = expr.trim().trim_start_matches('(').trim_end_matches(')').trim();
-    let dot = trimmed.find('.')?;
-    let prefix = &trimmed[..dot];
-    let s = if prefix.starts_with('"') && prefix.ends_with('"') && prefix.len() >= 2 {
-        &prefix[1..prefix.len() - 1]
-    } else {
-        prefix
-    };
-    if s.is_empty() { return None; }
-    Some(s.to_string())
 }
 
 /// Detect `GROUP BY GROUPING SETS (...)` in the SQL and build one
@@ -636,145 +558,6 @@ fn build_grouping_sets_variants(
         variants.push(RowVariant { overrides: ov });
     }
     Some(variants)
-}
-
-fn strip_suffix_digits(s: &str) -> String {
-    // `users_1` → `users`. PG appends `_N` to disambiguate duplicate
-    // scan aliases within a plan.
-    let trimmed = s.trim_end_matches(|c: char| c.is_ascii_digit());
-    trimmed.trim_end_matches('_').to_string()
-}
-
-enum ColumnRefShape {
-    Qualified(String, String),
-    Bare(String),
-    None,
-}
-
-/// Return the args of a top-level `coalesce(...)` expression in
-/// EXPLAIN-VERBOSE form. EXPLAIN sometimes wraps the whole expression
-/// in extra parens (`(coalesce(a, b))`); we step inward through
-/// balanced parens until we find the `coalesce` head.
-fn coalesce_args(expr: &str) -> Option<Vec<String>> {
-    let mut s = expr.trim();
-    while s.starts_with('(') && s.ends_with(')') && is_balanced_paren_wrapper(s) {
-        s = s[1..s.len() - 1].trim();
-    }
-    if !s.to_ascii_lowercase().starts_with("coalesce(") { return None; }
-    let open = "coalesce".len();
-    let close = find_matching_close(s.as_bytes(), open)?;
-    Some(split_top_level_args(&s[open + 1..close]))
-}
-
-/// True iff the leading `(` of `s` is closed by the very last `)` of
-/// `s` — i.e. the whole string is wrapped in one balanced pair.
-fn is_balanced_paren_wrapper(s: &str) -> bool {
-    s.starts_with('(') && find_matching_close(s.as_bytes(), 0) == Some(s.len() - 1)
-}
-
-/// Find the byte index of the `)` matching the `(` at byte `open`,
-/// skipping single-quoted string contents. Returns None if unbalanced
-/// or if `bytes[open]` isn't `(`.
-fn find_matching_close(bytes: &[u8], open: usize) -> Option<usize> {
-    if bytes.get(open) != Some(&b'(') { return None; }
-    let mut depth = 1;
-    let mut in_string = false;
-    let mut i = open + 1;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if in_string {
-            if b == b'\'' {
-                if bytes.get(i + 1) == Some(&b'\'') { i += 2; continue; }
-                in_string = false;
-            }
-        } else {
-            match b {
-                b'\'' => in_string = true,
-                b'(' => depth += 1,
-                b')' => { depth -= 1; if depth == 0 { return Some(i); } }
-                _ => {}
-            }
-        }
-        i += 1;
-    }
-    None
-}
-
-fn split_top_level_args(body: &str) -> Vec<String> {
-    let mut args = Vec::new();
-    let mut cur = String::new();
-    let bytes = body.as_bytes();
-    let mut depth: i32 = 0;
-    let mut in_string = false;
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if in_string {
-            cur.push(b as char);
-            if b == b'\'' {
-                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
-                    cur.push('\''); i += 2; continue;
-                }
-                in_string = false;
-            }
-        } else {
-            match b {
-                b'\'' => { in_string = true; cur.push('\''); }
-                b'(' => { depth += 1; cur.push('('); }
-                b')' => { depth -= 1; cur.push(')'); }
-                b',' if depth == 0 => {
-                    args.push(cur.trim().to_string());
-                    cur.clear();
-                }
-                c => cur.push(c as char),
-            }
-        }
-        i += 1;
-    }
-    if !cur.trim().is_empty() {
-        args.push(cur.trim().to_string());
-    }
-    args
-}
-
-/// Recognise a non-null literal token: quoted string, signed number,
-/// or `true` / `false`. Peels off a trailing `::cast` if any.
-fn is_literal_token(arg: &str) -> bool {
-    let s = arg.split("::").next().unwrap_or(arg).trim();
-    if s.is_empty() { return false; }
-    if s.starts_with('\'') { return true; }
-    let first = s.chars().next().unwrap();
-    if first == '-' || first == '+' || first.is_ascii_digit() {
-        return s.chars().skip(1).all(|c| c.is_ascii_digit() || c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-');
-    }
-    matches!(s.to_ascii_lowercase().as_str(), "true" | "false")
-}
-
-/// Parse a column reference, peeling off any `::cast` and bracketing
-/// parens. Returns whether it's a qualified `<alias>.<col>` or a bare
-/// `<col>` reference (PG omits the alias in EXPLAIN when there's only
-/// one relation in scope).
-fn parse_column_ref(arg: &str) -> ColumnRefShape {
-    let s = arg.split("::").next().unwrap_or(arg).trim();
-    let s = s.trim_start_matches('(').trim_end_matches(')').trim();
-    let is_ident = |s: &str| {
-        !s.is_empty()
-            && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-            && !s.chars().next().unwrap().is_ascii_digit()
-    };
-    if let Some(dot) = s.find('.') {
-        let alias = &s[..dot];
-        let col = &s[dot + 1..];
-        if is_ident(alias) && is_ident(col) {
-            return ColumnRefShape::Qualified(alias.to_string(), col.to_string());
-        }
-        return ColumnRefShape::None;
-    }
-    if is_ident(s) {
-        ColumnRefShape::Bare(s.to_string())
-    } else {
-        ColumnRefShape::None
-    }
 }
 
 /// Combine attnotnull and EXPLAIN evidence into a final nullable verdict.

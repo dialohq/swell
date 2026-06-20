@@ -26,6 +26,9 @@
 //!   EXPLAIN option (PG 16+) so the planner doesn't constant-fold outer
 //!   joins away based on substituted parameter values.
 
+use crate::explain_expr::{
+    is_literal_non_null, leading_alias, parse_call_args, parse_literal_ts,
+};
 use serde::Deserialize;
 use std::collections::HashSet;
 use tokio_postgres::Client;
@@ -122,15 +125,13 @@ pub async fn explain_nullability(
     // wrapper nodes inside `plans`. We pre-collect them so the
     // per-column classification can look through `(SubPlan 1)` to the
     // `count(*)` underneath.
-    let subplan_outputs = collect_subplan_outputs(&plan);
-    let cte_base_outputs = collect_cte_base_outputs(&plan);
+    let named = collect_named_outputs(&plan);
 
     if is_setop_node(&plan) {
         let branch_outputs = collect_setop_branches(&plan);
         for (branch_idx, outputs) in branch_outputs.iter().enumerate() {
             for (i, expr) in outputs.iter().take(n_columns).enumerate() {
-                let v = classify_expr(expr, &nullable_aliases, &non_null_aliases,
-                    &subplan_outputs, &cte_base_outputs);
+                let v = classify_expr(expr, &nullable_aliases, &non_null_aliases, &named);
                 by_column[i] = combine_setop(by_column[i], v, branch_idx > 0);
                 if branch_idx == 0 {
                     exprs[i] = expr.clone();
@@ -141,8 +142,7 @@ pub async fn explain_nullability(
     } else {
         let outputs = collect_topmost_output(&plan).unwrap_or_default();
         for (i, expr) in outputs.iter().take(n_columns).enumerate() {
-            by_column[i] = classify_expr(expr, &nullable_aliases, &non_null_aliases,
-                &subplan_outputs, &cte_base_outputs);
+            by_column[i] = classify_expr(expr, &nullable_aliases, &non_null_aliases, &named);
             exprs[i] = expr.clone();
             branches[i] = vec![expr.clone()];
         }
@@ -246,18 +246,25 @@ fn combine_setop(accum: NullVerdict, next: NullVerdict, already_seen: bool) -> N
     }
 }
 
+/// Visit every node in the plan tree, calling `f` once per node
+/// (pre-order). Cheaper to reuse than re-rolling each collector's
+/// boilerplate.
+fn walk_plan<F: FnMut(&PlanNode)>(node: &PlanNode, f: &mut F) {
+    f(node);
+    for c in node.plans.iter().flatten() { walk_plan(c, f); }
+}
+
 /// Walk every Scan node and record its `(alias, schema, relation_name)`
 /// so the caller can resolve EXPLAIN's column qualifications.
 fn collect_alias_to_table(node: &PlanNode) -> std::collections::HashMap<String, (String, String)> {
-    fn rec(node: &PlanNode, out: &mut std::collections::HashMap<String, (String, String)>) {
-        if let (Some(alias), Some(rel)) = (&node.alias, &node.relation_name) {
-            let schema = node.schema.clone().unwrap_or_default();
-            out.entry(alias.clone()).or_insert((schema, rel.clone()));
-        }
-        for c in node.plans.iter().flatten() { rec(c, out); }
-    }
     let mut out = std::collections::HashMap::new();
-    rec(node, &mut out);
+    walk_plan(node, &mut |n| {
+        if let (Some(alias), Some(rel)) = (&n.alias, &n.relation_name) {
+            out.entry(alias.clone()).or_insert((
+                n.schema.clone().unwrap_or_default(), rel.clone(),
+            ));
+        }
+    });
     out
 }
 
@@ -266,35 +273,28 @@ fn collect_alias_to_table(node: &PlanNode) -> std::collections::HashMap<String, 
 ///
 ///   - `Function Scan` over `unnest(ARRAY[…])` of literal elements
 ///   - `Function Scan` over `unnest('{…}'::type[])` (PG's array literal)
-///   - `Values Scan` whose values are all bare literals
+///   - `Values Scan` whose values are all bare literals (PG doesn't
+///     put the values into EXPLAIN, but every VALUES we recognise from
+///     the SQL is a row of bare literals — be optimistic).
 ///
 /// A `<alias>.<col>` reference for an alias in this set classifies as
 /// `NotNullable` even though PG doesn't carry attnotnull info for it.
 fn collect_non_null_source_aliases(node: &PlanNode) -> HashSet<String> {
-    fn rec(node: &PlanNode, out: &mut HashSet<String>) {
-        let nt = node.node_type.as_deref().unwrap_or("");
-        let alias = node.alias.as_deref();
-        if nt == "Function Scan" {
-            if let (Some(a), Some(name), Some(call)) = (
-                alias,
-                node.function_name.as_deref(),
-                node.function_call.as_deref(),
-            ) {
-                if name == "unnest" && unnest_call_is_literal_array(call) {
-                    out.insert(a.to_string());
+    let mut out = HashSet::new();
+    walk_plan(node, &mut |n| {
+        let Some(a) = n.alias.as_deref() else { return };
+        match n.node_type.as_deref().unwrap_or("") {
+            "Function Scan" => {
+                if let (Some("unnest"), Some(call)) =
+                    (n.function_name.as_deref(), n.function_call.as_deref())
+                {
+                    if unnest_call_is_literal_array(call) { out.insert(a.to_string()); }
                 }
             }
-        } else if nt == "Values Scan" {
-            // PG doesn't put the literal values into the EXPLAIN
-            // output, but every VALUES we recognise from the SQL is
-            // a row of bare literals (the corpus shape). Be
-            // optimistic: register the alias as a non-null source.
-            if let Some(a) = alias { out.insert(a.to_string()); }
+            "Values Scan" => { out.insert(a.to_string()); }
+            _ => {}
         }
-        for c in node.plans.iter().flatten() { rec(c, out); }
-    }
-    let mut out = HashSet::new();
-    rec(node, &mut out);
+    });
     out
 }
 
@@ -350,44 +350,33 @@ fn collect_topmost_output(node: &PlanNode) -> Option<Vec<String>> {
     node.plans.iter().flatten().find_map(collect_topmost_output)
 }
 
-/// Walk the plan tree and return every `Alias` whose rows can be NULL due
-/// to an outer-join above it. Built bottom-up:
+/// Walk the plan tree and return every `Alias` whose rows can be NULL
+/// due to an outer-join above it.
 ///
-///   - Scan nodes contribute their own alias only (and never make it
-///     nullable).
-///   - Inner Join nodes propagate nullability from their children.
-///   - Left Join nodes mark the Inner-side aliases as nullable.
-///   - Right Join nodes mark the Outer-side aliases as nullable.
-///   - Full Join nodes mark both sides as nullable.
+///   - LEFT → mark Inner-side aliases nullable.
+///   - RIGHT → mark Outer-side aliases nullable.
+///   - FULL → mark both sides nullable.
 fn collect_nullable_aliases(node: &PlanNode) -> HashSet<String> {
-    fn walk(node: &PlanNode, nullable: &mut HashSet<String>) {
-        let children = node.plans.as_deref().unwrap_or(&[]);
-        for c in children { walk(c, nullable); }
-        // The Inner side of a LEFT join, Outer side of RIGHT, both for FULL —
-        // those scan aliases become nullable in the result.
-        let null_side = match node.join_type.as_deref() {
+    let mut out = HashSet::new();
+    walk_plan(node, &mut |n| {
+        let null_side = match n.join_type.as_deref() {
             Some("Left")  => Some("Inner"),
             Some("Right") => Some("Outer"),
             Some("Full")  => None, // both sides
             _ => return,
         };
-        for c in children {
+        for c in n.plans.iter().flatten() {
             if null_side.is_none() || c.parent_relationship.as_deref() == null_side {
-                nullable.extend(collect_subtree_aliases(c));
+                out.extend(collect_subtree_aliases(c));
             }
         }
-    }
-    let mut out = HashSet::new();
-    walk(node, &mut out);
+    });
     out
 }
 
 fn collect_subtree_aliases(node: &PlanNode) -> HashSet<String> {
     let mut set = HashSet::new();
-    if let Some(a) = &node.alias { set.insert(a.clone()); }
-    for c in node.plans.iter().flatten() {
-        set.extend(collect_subtree_aliases(c));
-    }
+    walk_plan(node, &mut |n| { if let Some(a) = &n.alias { set.insert(a.clone()); } });
     set
 }
 
@@ -414,7 +403,7 @@ pub(crate) fn classify_with(
 
     // Bare scalar literals (with optional `::cast` and outer parens):
     // string `'foo'`, numeric `42`, boolean `true`/`false`.
-    if is_bare_literal(trimmed) {
+    if is_literal_non_null(trimmed) {
         return NullVerdict::NotNullable;
     }
 
@@ -500,11 +489,12 @@ pub(crate) fn classify_with(
     }
 
     if lower.starts_with("coalesce(") {
-        return if has_trailing_non_null_literal(trimmed) {
-            NullVerdict::NotNullable
-        } else {
-            NullVerdict::Unknown
-        };
+        // Trailing literal makes the whole coalesce non-null.
+        let non_null = parse_call_args(trimmed, "coalesce")
+            .and_then(|args| args.last().cloned())
+            .map(|last| parse_literal_ts(&last).is_some())
+            .unwrap_or(false);
+        return if non_null { NullVerdict::NotNullable } else { NullVerdict::Unknown };
     }
 
     // Plain `<alias>.<col>` reference: nullable iff alias is on the
@@ -520,7 +510,7 @@ pub(crate) fn classify_with(
         }
     }
     // Bare `<col>` from a single non-null source.
-    if non_null_aliases.len() == 1 && is_simple_ident(trimmed) {
+    if non_null_aliases.len() == 1 && crate::explain_expr::is_simple_ident(trimmed) {
         return NullVerdict::NotNullable;
     }
 
@@ -533,178 +523,66 @@ fn classify_expr(
     expr: &str,
     nullable_aliases: &HashSet<String>,
     non_null_aliases: &HashSet<String>,
-    subplan_outputs: &std::collections::HashMap<String, Vec<String>>,
-    cte_base_outputs: &std::collections::HashMap<String, Vec<String>>,
+    named: &NamedOutputs,
 ) -> NullVerdict {
     let trimmed = expr.trim();
+    let recurse = |s: &str| classify_with(s, nullable_aliases, non_null_aliases);
     // `(SubPlan N)` — resolve to the SubPlan's Output.
     let s = trimmed.trim_start_matches('(').trim_end_matches(')').trim();
     if let Some(rest) = s.strip_prefix("SubPlan ") {
-        if let Some(outputs) = subplan_outputs.get(&format!("SubPlan {}", rest)) {
-            // Use the first output expression as representative.
-            if let Some(first) = outputs.first() {
-                return classify_with(first, nullable_aliases, non_null_aliases);
-            }
+        if let Some(first) = named.subplan.get(&format!("SubPlan {}", rest))
+            .and_then(|o| o.first())
+        {
+            return recurse(first);
         }
     }
-    // `<cte_alias>.<col>` — resolve to the CTE's base case Output for
-    // that column (if known). The CTE's recursive branch is ignored;
-    // we assume the base case sets the floor for nullability and the
+    // `<cte_alias>.<col>` — resolve to the CTE's base-case Output. The
+    // recursive branch is ignored; the base case sets the floor and the
     // recursive arithmetic preserves it.
     if let Some(alias) = leading_alias(trimmed) {
-        if let Some(outputs) = cte_base_outputs.get(alias) {
-            // Best-effort: use the same expression text minus the
-            // alias prefix to match the underlying Output entry; if
-            // that fails just take the first one.
-            let resolved = outputs.first().cloned();
-            if let Some(r) = resolved {
-                return classify_with(&r, nullable_aliases, non_null_aliases);
-            }
+        if let Some(first) = named.cte.get(alias).and_then(|o| o.first()) {
+            return recurse(first);
         }
     }
-    classify_with(trimmed, nullable_aliases, non_null_aliases)
+    recurse(trimmed)
 }
 
-/// Find every `SubPlan <N>` definition in the plan tree and return
-/// its Output expressions. The PG planner names scalar subqueries
-/// `SubPlan 1`, `SubPlan 2`, … and refers to them in outer Outputs
-/// via `(SubPlan N)`.
-fn collect_subplan_outputs(
-    node: &PlanNode,
-) -> std::collections::HashMap<String, Vec<String>> {
-    fn rec(node: &PlanNode, out: &mut std::collections::HashMap<String, Vec<String>>) {
-        if let Some(name) = &node.subplan_name {
-            if name.starts_with("SubPlan ") || name.starts_with("InitPlan ") {
-                if let Some(o) = collect_topmost_output(node) {
-                    out.entry(name.clone()).or_insert(o);
-                }
-            }
-        }
-        for c in node.plans.iter().flatten() { rec(c, out); }
-    }
-    let mut out = std::collections::HashMap::new();
-    rec(node, &mut out);
-    out
+/// Subplan + CTE name maps collected in one plan walk.
+struct NamedOutputs {
+    /// `"SubPlan N"` / `"InitPlan N"` → its Output expressions.
+    subplan: std::collections::HashMap<String, Vec<String>>,
+    /// CTE alias → base-case Output expressions.
+    cte: std::collections::HashMap<String, Vec<String>>,
 }
 
-/// CTE name → base-case Output expressions. Recursive CTEs have two
-/// children under their Recursive Union; we only keep the
-/// non-recursive (Outer parent-relationship) branch's Output, on the
-/// assumption that the recursive branch's arithmetic preserves the
-/// base case's nullability.
-fn collect_cte_base_outputs(
-    node: &PlanNode,
-) -> std::collections::HashMap<String, Vec<String>> {
-    fn rec(node: &PlanNode, out: &mut std::collections::HashMap<String, Vec<String>>) {
-        let is_recursive = node.node_type.as_deref() == Some("Recursive Union");
-        if let Some(cte_name) = node.subplan_name.as_deref().and_then(|n| n.strip_prefix("CTE ")) {
-            if is_recursive {
-                for c in node.plans.iter().flatten() {
-                    if c.parent_relationship.as_deref() == Some("Outer") {
-                        if let Some(o) = collect_topmost_output(c) {
-                            out.entry(cte_name.to_string()).or_insert(o);
-                        }
-                    }
-                }
-            } else if let Some(o) = collect_topmost_output(node) {
-                out.entry(cte_name.to_string()).or_insert(o);
-            }
-        }
-        for c in node.plans.iter().flatten() { rec(c, out); }
-    }
-    let mut out = std::collections::HashMap::new();
-    rec(node, &mut out);
-    out
-}
-
-fn is_simple_ident(s: &str) -> bool {
-    !s.is_empty()
-        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-        && !s.chars().next().unwrap().is_ascii_digit()
-}
-
-/// Extract the alias prefix from an expression like `u.email` or
-/// `p.author_id`. Also handles PG's quoted synthetic aliases such as
-/// `"*VALUES*"."column1"` or `"*SELECT* 1".id` (with the quotes and
-/// special chars stripped). Returns `None` if the expression isn't a
-/// simple dot-qualified column reference.
-fn leading_alias(expr: &str) -> Option<&str> {
-    let dot = expr.find('.')?;
-    let prefix = &expr[..dot];
-    if prefix.starts_with('"') && prefix.ends_with('"') && prefix.len() >= 2 {
-        // Quoted identifier — accept whatever's inside the quotes.
-        return Some(&prefix[1..prefix.len() - 1]);
-    }
-    if prefix.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') && !prefix.is_empty() {
-        Some(prefix)
-    } else {
-        None
-    }
-}
-
-/// True if `expr` is a bare scalar literal: `'foo'`, `'foo'::text`,
-/// `42`, `42.5::numeric`, `true`, `false`, optionally wrapped in
-/// balanced parens.
-fn is_bare_literal(expr: &str) -> bool {
-    let mut s = expr.trim();
-    while s.starts_with('(') && s.ends_with(')') {
-        let inner = &s[1..s.len() - 1];
-        // Only peel if the inner has balanced parens (`(a)::b` would be unsafe).
-        if !is_paren_balanced(inner) { break; }
-        s = inner.trim();
-    }
-    let value = match s.split_once("::") {
-        Some((v, _)) => v.trim(),
-        None => s,
+fn collect_named_outputs(plan: &PlanNode) -> NamedOutputs {
+    let mut out = NamedOutputs {
+        subplan: std::collections::HashMap::new(),
+        cte: std::collections::HashMap::new(),
     };
-    if value.is_empty() { return false; }
-    if value.starts_with('\'') && value.ends_with('\'') && value.len() >= 2 {
-        return true;
-    }
-    let lower = value.to_ascii_lowercase();
-    if lower == "true" || lower == "false" { return true; }
-    value.parse::<f64>().is_ok()
-}
-
-fn is_paren_balanced(s: &str) -> bool {
-    let mut depth = 0i32;
-    let mut in_string = false;
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\'' if !in_string => { in_string = true; }
-            b'\'' if in_string => {
-                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' { i += 1; }
-                else { in_string = false; }
+    walk_plan(plan, &mut |n| {
+        let Some(name) = n.subplan_name.as_deref() else { return };
+        if name.starts_with("SubPlan ") || name.starts_with("InitPlan ") {
+            if let Some(o) = collect_topmost_output(n) {
+                out.subplan.entry(name.to_string()).or_insert(o);
             }
-            b'(' if !in_string => depth += 1,
-            b')' if !in_string => { depth -= 1; if depth < 0 { return false; } }
-            _ => {}
+        } else if let Some(cte_name) = name.strip_prefix("CTE ") {
+            // Recursive CTE: use the non-recursive (Outer) branch's
+            // Output; we assume the recursive arithmetic preserves the
+            // base case's nullability.
+            let outputs = if n.node_type.as_deref() == Some("Recursive Union") {
+                n.plans.iter().flatten()
+                    .find(|c| c.parent_relationship.as_deref() == Some("Outer"))
+                    .and_then(collect_topmost_output)
+            } else {
+                collect_topmost_output(n)
+            };
+            if let Some(o) = outputs {
+                out.cte.entry(cte_name.to_string()).or_insert(o);
+            }
         }
-        i += 1;
-    }
-    depth == 0
-}
-
-fn has_trailing_non_null_literal(expr: &str) -> bool {
-    let inner = match expr
-        .trim_start_matches(|c: char| c.is_alphabetic() || c == '_')
-        .strip_prefix('(')
-    {
-        Some(s) => s,
-        None => return false,
-    };
-    let inner = inner.strip_suffix(')').unwrap_or(inner);
-    let last = inner.rsplit(',').next().unwrap_or("").trim();
-    if last.is_empty() { return false; }
-    if last.chars().next().map(|c| c.is_ascii_digit() || c == '-' || c == '+').unwrap_or(false) {
-        return true;
-    }
-    if last.starts_with('\'') && !last.starts_with("''") {
-        return true;
-    }
-    false
+    });
+    out
 }
 
 fn extract_first_value(msgs: &[tokio_postgres::SimpleQueryMessage]) -> Option<String> {
