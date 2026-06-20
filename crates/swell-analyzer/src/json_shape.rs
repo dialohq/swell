@@ -379,27 +379,18 @@ async fn fetch_attrs(
     col: Option<&str>,
 ) -> Vec<(String, u32, bool, String)> {
     let oid = table_oid as i64;
+    const BASE: &str = "SELECT a.attname, a.atttypid::bigint, a.attnotnull, t.typname \
+        FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid \
+        WHERE a.attrelid::bigint = $1 AND a.attnum > 0 AND NOT a.attisdropped";
     let rows = match col {
         Some(c) => {
             client
-                .query(
-                    r#"SELECT a.attname, a.atttypid::bigint, a.attnotnull, t.typname
-               FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid
-               WHERE a.attrelid::bigint = $1 AND a.attname = $2
-                 AND a.attnum > 0 AND NOT a.attisdropped"#,
-                    &[&oid, &c],
-                )
+                .query(&format!("{BASE} AND a.attname = $2"), &[&oid, &c])
                 .await
         }
         None => {
             client
-                .query(
-                    r#"SELECT a.attname, a.atttypid::bigint, a.attnotnull, t.typname
-               FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid
-               WHERE a.attrelid::bigint = $1 AND a.attnum > 0 AND NOT a.attisdropped
-               ORDER BY a.attnum"#,
-                    &[&oid],
-                )
+                .query(&format!("{BASE} ORDER BY a.attnum"), &[&oid])
                 .await
         }
     };

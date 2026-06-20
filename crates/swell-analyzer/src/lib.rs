@@ -54,27 +54,21 @@ impl Analyzer {
             .parse()
             .with_context(|| format!("invalid DATABASE_URL: {}", opts.database_url))?;
         cfg.options("-c plan_cache_mode=force_generic_plan");
-
         let (client, connection) = cfg.connect(NoTls).await.context("connecting to Postgres")?;
         tokio::spawn(async move {
             if let Err(e) = connection.await {
                 tracing::warn!("postgres connection error: {e}");
             }
         });
-
         let mut catalog = catalog::load_type_catalog(&client, &opts.schemas)
             .await
             .context("loading pg_catalog")?;
         catalog.by_name = opts.type_overrides;
-
-        let unsafe_casts = catalog::fetch_unsafe_casts(&client).await;
-        let typname_to_oid = catalog::fetch_typname_to_oid(&client).await;
-
         Ok(Self {
-            client,
+            unsafe_casts: catalog::fetch_unsafe_casts(&client).await,
+            typname_to_oid: catalog::fetch_typname_to_oid(&client).await,
             catalog,
-            unsafe_casts,
-            typname_to_oid,
+            client,
         })
     }
 
@@ -84,14 +78,7 @@ impl Analyzer {
 
     pub async fn analyze(&self, sql: &str) -> Result<InferredQuery> {
         let described = describe::describe(&self.client, sql).await?;
-
-        let pairs: Vec<(u32, i16)> = described
-            .columns
-            .iter()
-            .filter(|c| c.table_oid != 0 && c.attnum > 0)
-            .map(|c| (c.table_oid, c.attnum))
-            .collect();
-        let column_meta = resolve_column_meta(&self.client, &pairs).await;
+        let column_meta = resolve_column_meta(&self.client, &column_pairs(&described)).await;
 
         let plan_walk = plan::explain(&self.client, sql).await.unwrap_or_else(|e| {
             tracing::debug!("EXPLAIN failed for `{sql}`: {e}");
@@ -144,8 +131,7 @@ impl Analyzer {
                 let expr = analyzed
                     .outputs
                     .get(i)
-                    .map(|o| &o.expr)
-                    .unwrap_or(&analyzed::Expr::Unknown);
+                    .map_or(&analyzed::Expr::Unknown, |o| &o.expr);
                 let inferred_nullable = decide_nullability(c, &column_meta, build::verdict(expr));
                 let oid_ts = catalog::render_for_oid(
                     &self.catalog,
@@ -153,26 +139,24 @@ impl Analyzer {
                     &c.type_,
                     Direction::Read,
                 );
-                let json_ts = json_shapes.by_target.get(i).cloned().flatten();
-                let setop_lit_ts = infer_setop_literal_union(expr);
-                let inferred_ts = setop_lit_ts.or(json_ts).unwrap_or(oid_ts);
+                let inferred_ts = infer_setop_literal_union(expr)
+                    .or_else(|| json_shapes.by_target.get(i).cloned().flatten())
+                    .unwrap_or(oid_ts);
 
                 // SQLx-style override markers in the alias: `col!`
-                // forces NOT NULL, `col?` forces nullable. The marker
-                // stays on the column name end-to-end.
+                // forces NOT NULL, `col?` forces nullable.
                 let force_nullable = match c.name.chars().last() {
                     Some('!') => Some(false),
                     Some('?') => Some(true),
                     _ => None,
                 };
-                let table_ref = column_meta
-                    .get(&(c.table_oid, c.attnum))
-                    .map(|m| m.table_ref.clone());
                 InferredColumn {
                     name: c.name.clone(),
                     nullable: force_nullable.unwrap_or(inferred_nullable),
                     ts_type: inferred_ts,
-                    table_ref,
+                    table_ref: column_meta
+                        .get(&(c.table_oid, c.attnum))
+                        .map(|m| m.table_ref.clone()),
                 }
             })
             .collect();
@@ -239,6 +223,17 @@ impl Analyzer {
             })
             .collect())
     }
+}
+
+/// All `(table_oid, attnum)` pairs in a described query, suitable to
+/// pass to `resolve_column_meta`. Filters out non-base columns.
+pub fn column_pairs(described: &describe::DescribedQuery) -> Vec<(u32, i16)> {
+    described
+        .columns
+        .iter()
+        .filter(|c| c.table_oid != 0 && c.attnum > 0)
+        .map(|c| (c.table_oid, c.attnum))
+        .collect()
 }
 
 /// `(table_oid, attnum) → ResolvedBaseCol` in one round trip. Public

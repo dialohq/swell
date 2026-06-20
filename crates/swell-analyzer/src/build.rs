@@ -257,13 +257,8 @@ fn analyze_view_refs<'a>(
             let plan_walk = crate::plan::explain(client, &view_sql)
                 .await
                 .unwrap_or_default();
-            let pairs: Vec<(u32, i16)> = described
-                .columns
-                .iter()
-                .filter(|c| c.table_oid != 0 && c.attnum > 0)
-                .map(|c| (c.table_oid, c.attnum))
-                .collect();
-            let column_meta = crate::resolve_column_meta(client, &pairs).await;
+            let column_meta =
+                crate::resolve_column_meta(client, &crate::column_pairs(&described)).await;
             let mut next_visited = visited.clone();
             next_visited.insert(oid);
             let analyzed = build(

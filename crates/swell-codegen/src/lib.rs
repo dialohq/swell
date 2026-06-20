@@ -33,7 +33,7 @@ fn sorted_with_names(tables: &[TableSchema]) -> (Vec<&TableSchema>, TableNameMap
     sorted.sort_by(|a, b| {
         (a.schema.as_str(), a.table.as_str()).cmp(&(b.schema.as_str(), b.table.as_str()))
     });
-    let names = TableNameMap::from(&sorted);
+    let names = build_name_map(&sorted);
     (sorted, names)
 }
 
@@ -141,41 +141,36 @@ fn pascal_case(s: &str) -> String {
 
 /// `(schema, table)` → TS identifier with collisions resolved by
 /// reinstating the schema prefix on conflicting entries.
-struct TableNameMap {
-    by_pair: BTreeMap<(String, String), String>,
+type TableNameMap = BTreeMap<(String, String), String>;
+
+fn build_name_map(tables: &[&TableSchema]) -> TableNameMap {
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for t in tables {
+        *counts.entry(type_name(&t.schema, &t.table)).or_default() += 1;
+    }
+    let mut out = BTreeMap::new();
+    for t in tables {
+        let pretty = type_name(&t.schema, &t.table);
+        let name = if counts.get(&pretty).copied().unwrap_or(0) > 1 {
+            format!("{}{}", pascal_case(&t.schema), pascal_case(&t.table))
+        } else {
+            pretty
+        };
+        out.insert((t.schema.clone(), t.table.clone()), name);
+    }
+    out
 }
 
-impl TableNameMap {
-    fn from(tables: &[&TableSchema]) -> Self {
-        let mut counts: BTreeMap<String, usize> = BTreeMap::new();
-        for t in tables {
-            *counts.entry(type_name(&t.schema, &t.table)).or_default() += 1;
-        }
-        let mut by_pair = BTreeMap::new();
-        for t in tables {
-            let pretty = type_name(&t.schema, &t.table);
-            let name = if counts.get(&pretty).copied().unwrap_or(0) > 1 {
-                format!("{}{}", pascal_case(&t.schema), pascal_case(&t.table))
-            } else {
-                pretty
-            };
-            by_pair.insert((t.schema.clone(), t.table.clone()), name);
-        }
-        Self { by_pair }
-    }
-
-    fn lookup(&self, schema: &str, table: &str) -> Option<&str> {
-        self.by_pair
-            .get(&(schema.to_string(), table.to_string()))
-            .map(|s| s.as_str())
-    }
+fn name_lookup<'a>(names: &'a TableNameMap, schema: &str, table: &str) -> Option<&'a str> {
+    names
+        .get(&(schema.to_string(), table.to_string()))
+        .map(|s| s.as_str())
 }
 
 fn render_table_interface(t: &TableSchema, names: &TableNameMap) -> String {
     // names is built from the same slice; every (schema, table) must
     // be present.
-    let name = names
-        .lookup(&t.schema, &t.table)
+    let name = name_lookup(names, &t.schema, &t.table)
         .unwrap_or_else(|| panic!("TableNameMap missing entry for {}.{}", t.schema, t.table));
     let mut out = String::new();
     out.push_str(&format!("export interface {name} {{\n"));
@@ -324,7 +319,7 @@ fn detect_star_prefix(
             return None;
         }
     }
-    let name = names.lookup(&table.schema, &table.table)?;
+    let name = name_lookup(names, &table.schema, &table.table)?;
     Some((name.to_string(), table.columns.len()))
 }
 
@@ -360,7 +355,7 @@ fn render_typed(
 }
 
 fn indexed_table_ref(r: &TableColRef, names: &TableNameMap) -> Option<String> {
-    let name = names.lookup(&r.schema, &r.table)?;
+    let name = name_lookup(names, &r.schema, &r.table)?;
     Some(format!("{}[\"{}\"]", name, escape_ts_string(&r.column)))
 }
 
@@ -434,16 +429,18 @@ mod tests {
         }
     }
 
+    fn tref(schema: &str, table: &str, column: &str) -> TableColRef {
+        TableColRef {
+            schema: schema.into(),
+            table: table.into(),
+            column: column.into(),
+        }
+    }
+
     fn col_from(name: &str, ts: &str, nullable: bool, schema: &str, table: &str) -> InferredColumn {
         InferredColumn {
-            name: name.into(),
-            nullable,
-            ts_type: ts.into(),
-            table_ref: Some(TableColRef {
-                schema: schema.into(),
-                table: table.into(),
-                column: name.into(),
-            }),
+            table_ref: Some(tref(schema, table, name)),
+            ..col(name, ts, nullable)
         }
     }
 
@@ -457,13 +454,8 @@ mod tests {
 
     fn p_from(ts: &str, nullable: bool, schema: &str, table: &str, column: &str) -> InferredParam {
         InferredParam {
-            ts_type: ts.into(),
-            nullable,
-            table_ref: Some(TableColRef {
-                schema: schema.into(),
-                table: table.into(),
-                column: column.into(),
-            }),
+            table_ref: Some(tref(schema, table, column)),
+            ..p(ts, nullable)
         }
     }
 

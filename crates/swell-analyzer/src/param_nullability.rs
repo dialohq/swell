@@ -19,13 +19,11 @@ pub struct ParamInfo {
 }
 
 pub async fn infer(client: &Client, sql: &str, n_params: usize) -> Vec<ParamInfo> {
-    let mut out: Vec<ParamInfo> = vec![
-        ParamInfo {
-            nullable: true,
-            table_ref: None
-        };
-        n_params
-    ];
+    let nullable = ParamInfo {
+        nullable: true,
+        table_ref: None,
+    };
+    let mut out = vec![nullable; n_params];
     if n_params == 0 {
         return out;
     }
