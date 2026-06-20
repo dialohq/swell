@@ -50,23 +50,16 @@ fn classify_func(name: &str) -> FuncKind {
 }
 
 pub fn lower(node: &Node, scope: &Scope) -> Expr {
-    let Some(body) = node.node.as_ref() else {
-        return Expr::Unknown;
-    };
-    match body {
-        NB::AConst(c) => {
-            if c.isnull {
-                return Expr::Null;
-            }
-            match c.val.as_ref() {
-                Some(Val::Sval(s)) => Expr::Literal(Lit::Str(s.sval.clone())),
-                Some(Val::Ival(i)) => Expr::Literal(Lit::Num(i.ival.to_string())),
-                Some(Val::Fval(f)) => Expr::Literal(Lit::Num(f.fval.clone())),
-                Some(Val::Boolval(b)) => Expr::Literal(Lit::Bool(b.boolval)),
-                _ => Expr::Unknown,
-            }
-        }
-        NB::TypeCast(tc) => {
+    match node.node.as_ref() {
+        Some(NB::AConst(c)) if c.isnull => Expr::Null,
+        Some(NB::AConst(c)) => match c.val.as_ref() {
+            Some(Val::Sval(s)) => Expr::Literal(Lit::Str(s.sval.clone())),
+            Some(Val::Ival(i)) => Expr::Literal(Lit::Num(i.ival.to_string())),
+            Some(Val::Fval(f)) => Expr::Literal(Lit::Num(f.fval.clone())),
+            Some(Val::Boolval(b)) => Expr::Literal(Lit::Bool(b.boolval)),
+            _ => Expr::Unknown,
+        },
+        Some(NB::TypeCast(tc)) => {
             let inner = tc.arg.as_deref().map_or(Expr::Unknown, |a| lower(a, scope));
             let target_oid = tc
                 .type_name
@@ -81,33 +74,34 @@ pub fn lower(node: &Node, scope: &Scope) -> Expr {
                 is_unsafe,
             }
         }
-        NB::AArrayExpr(_) => Expr::ArrayConstructor,
+        Some(NB::AArrayExpr(_)) => Expr::ArrayConstructor,
         // Parse-time COALESCE comes through as FuncCall — CoalesceExpr is
         // post-analysis. We handle both.
-        NB::CoalesceExpr(ce) => Expr::Coalesce(lower_args(&ce.args, scope)),
-        NB::CaseExpr(ce) => Expr::Case {
+        Some(NB::CoalesceExpr(ce)) => Expr::Coalesce(lower_args(&ce.args, scope)),
+        Some(NB::CaseExpr(ce)) => Expr::Case {
             has_else_non_null: ce
                 .defresult
                 .as_deref()
                 .is_some_and(|d| is_non_null(&lower(d, scope))),
         },
-        NB::FuncCall(fc) => {
+        Some(NB::FuncCall(fc)) => {
             let Some(name) = funcname_last(fc) else {
                 return Expr::Unknown;
             };
             let args = lower_args(&fc.args, scope);
             if name == "coalesce" {
-                return Expr::Coalesce(args);
-            }
-            Expr::Func {
-                kind: classify_func(name),
-                args,
+                Expr::Coalesce(args)
+            } else {
+                Expr::Func {
+                    kind: classify_func(name),
+                    args,
+                }
             }
         }
-        NB::ColumnRef(cr) => lower_column_ref(cr, scope)
+        Some(NB::ColumnRef(cr)) => lower_column_ref(cr, scope)
             .map(Expr::Column)
             .unwrap_or(Expr::Unknown),
-        NB::SubLink(sl) => lower_sublink(sl, scope),
+        Some(NB::SubLink(sl)) => lower_sublink(sl, scope),
         _ => Expr::Unknown,
     }
 }
