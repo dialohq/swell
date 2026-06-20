@@ -69,28 +69,25 @@ pub fn render_query_compact(q: &InferredQuery, tables: &[TableSchema]) -> String
 }
 
 pub fn render(queries: &[InferredQuery], opts: CodegenOptions<'_>) -> String {
+    use std::fmt::Write;
     let mut out = String::new();
     out.push_str(HEADER);
     // Side-effect import keeps swell in the graph so `declare module`
     // resolves; the type aliases stay available for override emitters.
-    out.push_str(&format!(
-        "import {{ type Json, type SqlText }} from \"{RUNTIME_MODULE}\";\n"
-    ));
+    let _ = writeln!(
+        out,
+        "import {{ type Json, type SqlText }} from \"{RUNTIME_MODULE}\";"
+    );
     for (from, names) in opts.extra_imports {
         if names.is_empty() {
             continue;
         }
         let typed: Vec<String> = names.iter().map(|n| format!("type {n}")).collect();
-        out.push_str(&format!(
-            "import {{ {} }} from \"{}\";\n",
-            typed.join(", "),
-            from
-        ));
+        let _ = writeln!(out, "import {{ {} }} from \"{from}\";", typed.join(", "));
     }
     out.push('\n');
 
     let (sorted_tables, names) = sorted_with_names(opts.tables);
-
     for t in &sorted_tables {
         out.push_str(&render_table_interface(t, &names));
     }
@@ -98,7 +95,7 @@ pub fn render(queries: &[InferredQuery], opts: CodegenOptions<'_>) -> String {
         out.push('\n');
     }
 
-    out.push_str(&format!("declare module \"{RUNTIME_MODULE}\" {{\n"));
+    let _ = writeln!(out, "declare module \"{RUNTIME_MODULE}\" {{");
     if queries.is_empty() {
         out.push_str("  interface Registry {}\n");
     } else {
@@ -168,20 +165,16 @@ fn name_lookup<'a>(names: &'a TableNameMap, schema: &str, table: &str) -> Option
 }
 
 fn render_table_interface(t: &TableSchema, names: &TableNameMap) -> String {
+    use std::fmt::Write;
     // names is built from the same slice; every (schema, table) must
     // be present.
     let name = name_lookup(names, &t.schema, &t.table)
         .unwrap_or_else(|| panic!("TableNameMap missing entry for {}.{}", t.schema, t.table));
     let mut out = String::new();
-    out.push_str(&format!("export interface {name} {{\n"));
+    let _ = writeln!(out, "export interface {name} {{");
     for col in &t.columns {
-        let nullable = if col.not_null { "" } else { " | null" };
-        out.push_str(&format!(
-            "  {}: {}{};\n",
-            quote_ident(&col.name),
-            col.ts_type,
-            nullable,
-        ));
+        let nn = if col.not_null { "" } else { " | null" };
+        let _ = writeln!(out, "  {}: {}{nn};", quote_ident(&col.name), col.ts_type);
     }
     out.push_str("}\n");
     out

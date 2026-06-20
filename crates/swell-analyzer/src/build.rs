@@ -4,6 +4,7 @@
 use crate::analyzed::{Analyzed, Expr, Output, Param, ResolvedCol};
 use crate::describe::DescribedQuery;
 use crate::lowering::{self, lower};
+use crate::pg_util::{norm_schema, range_var_alias, select_stmts, string_parts, walk_from_tree};
 use crate::plan::PlanWalk;
 use crate::query::TableColRef;
 use crate::scope::{DerivedColumn, Scope};
@@ -292,12 +293,12 @@ fn find_rangevar_aliases(sql: &str) -> Vec<(String, String, String)> {
     let Ok(parsed) = pg_query::parse(sql) else {
         return out;
     };
-    for select in crate::pg_util::select_stmts(&parsed.protobuf) {
+    for select in select_stmts(&parsed.protobuf) {
         for from in &select.from_clause {
-            crate::pg_util::walk_from_tree(from, &mut |n| {
+            walk_from_tree(from, &mut |n| {
                 if let Some(NB::RangeVar(rv)) = n.node.as_ref() {
                     out.push((
-                        crate::pg_util::range_var_alias(rv),
+                        range_var_alias(rv),
                         rv.schemaname.clone(),
                         rv.relname.clone(),
                     ));
@@ -317,10 +318,7 @@ async fn fetch_view_oids(
     if candidates.is_empty() {
         return Vec::new();
     }
-    let schemas: Vec<&str> = candidates
-        .iter()
-        .map(|(_, s, _)| crate::pg_util::norm_schema(s))
-        .collect();
+    let schemas: Vec<&str> = candidates.iter().map(|(_, s, _)| norm_schema(s)).collect();
     let names: Vec<&str> = candidates.iter().map(|(_, _, n)| n.as_str()).collect();
     let rows = match client
         .query(
@@ -350,10 +348,7 @@ async fn fetch_view_oids(
         .iter()
         .filter_map(|(alias, schema, name)| {
             by_name
-                .get(&(
-                    crate::pg_util::norm_schema(schema).to_string(),
-                    name.clone(),
-                ))
+                .get(&(norm_schema(schema).to_string(), name.clone()))
                 .map(|oid| (alias.clone(), *oid))
         })
         .collect()
@@ -374,7 +369,7 @@ fn collect_derived(sql: &str, scope: &Scope) -> HashMap<String, Vec<DerivedColum
     let Ok(parsed) = pg_query::parse(sql) else {
         return out;
     };
-    for select in crate::pg_util::select_stmts(&parsed.protobuf) {
+    for select in select_stmts(&parsed.protobuf) {
         if let Some(wc) = &select.with_clause {
             for cte_node in &wc.ctes {
                 let Some(NB::CommonTableExpr(cte)) = cte_node.node.as_ref() else {
@@ -391,7 +386,7 @@ fn collect_derived(sql: &str, scope: &Scope) -> HashMap<String, Vec<DerivedColum
             }
         }
         for from in &select.from_clause {
-            crate::pg_util::walk_from_tree(from, &mut |n| {
+            walk_from_tree(from, &mut |n| {
                 let Some(NB::RangeSubselect(rs)) = n.node.as_ref() else {
                     return;
                 };
@@ -426,7 +421,7 @@ fn lower_select_columns(
     aliascolnames: &[Node],
     scope: &Scope,
 ) -> Option<Vec<DerivedColumn>> {
-    let alias_names = crate::pg_util::string_parts(aliascolnames);
+    let alias_names = string_parts(aliascolnames);
     let alias_at = |i: usize| alias_names.get(i).cloned().unwrap_or_default();
     // Set-op or recursive CTE: base case (`larg`) sets the floor.
     if select.op != SETOP_NONE {

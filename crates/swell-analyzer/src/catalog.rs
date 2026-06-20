@@ -10,35 +10,33 @@ use tokio_postgres::Client;
 /// `'f'` casts (oid < 16384) call core functions that don't return
 /// NULL either. Looked up per-Cast at lowering for `is_unsafe`.
 pub async fn fetch_unsafe_casts(client: &Client) -> HashSet<(u32, u32)> {
-    match client
-        .query(
-            "SELECT castsource::oid, casttarget::oid \
-         FROM pg_cast WHERE castmethod = 'f' AND oid >= 16384",
-            &[],
-        )
+    let sql = "SELECT castsource::oid, casttarget::oid \
+         FROM pg_cast WHERE castmethod = 'f' AND oid >= 16384";
+    client
+        .query(sql, &[])
         .await
-    {
-        Ok(rows) => rows.iter().map(|r| (r.get(0), r.get(1))).collect(),
-        Err(e) => {
+        .unwrap_or_else(|e| {
             tracing::debug!("fetch_unsafe_casts: {e}");
-            HashSet::new()
-        }
-    }
+            Vec::new()
+        })
+        .iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect()
 }
 
 /// `pg_type.typname → pg_type.oid` for resolving `TypeCast` targets
 /// without a per-query round-trip.
 pub async fn fetch_typname_to_oid(client: &Client) -> HashMap<String, u32> {
-    match client
+    client
         .query("SELECT typname, oid::oid FROM pg_type", &[])
         .await
-    {
-        Ok(rows) => rows.iter().map(|r| (r.get(0), r.get(1))).collect(),
-        Err(e) => {
+        .unwrap_or_else(|e| {
             tracing::debug!("fetch_typname_to_oid: {e}");
-            HashMap::new()
-        }
-    }
+            Vec::new()
+        })
+        .iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect()
 }
 
 /// Pull every enum / domain / composite / range / array definition the
@@ -188,15 +186,12 @@ pub async fn load_type_catalog(client: &Client, schemas: &[String]) -> anyhow::R
 /// JSON helpers `json_shape.rs` transforms at AST level. We accept the
 /// `pg_catalog` builtin only when no user-defined function in the
 /// current `search_path` shadows the name.
+#[rustfmt::skip]
 const SAFE_BUILTIN_CANDIDATES: &[&str] = &[
-    "jsonb_build_object",
-    "json_build_object",
-    "jsonb_agg",
-    "json_agg",
-    "to_jsonb",
-    "row_to_json",
-    "jsonb_object_agg",
-    "json_object_agg",
+    "jsonb_build_object", "json_build_object",
+    "jsonb_agg", "json_agg",
+    "to_jsonb", "row_to_json",
+    "jsonb_object_agg", "json_object_agg",
 ];
 
 async fn load_safe_builtin_procs(client: &Client) -> anyhow::Result<BTreeMap<String, u32>> {

@@ -141,20 +141,11 @@ fn collect_non_null_rec(node: &PlanNode, lit: &HashSet<String>, out: &mut HashSe
     is_source
 }
 
+#[rustfmt::skip]
 fn is_passthrough(node: &PlanNode) -> bool {
-    matches!(
-        node.node_type.as_deref(),
-        Some(
-            "Subquery Scan"
-                | "Result"
-                | "Sort"
-                | "Incremental Sort"
-                | "Materialize"
-                | "Limit"
-                | "Unique"
-                | "WindowAgg"
-        )
-    )
+    matches!(node.node_type.as_deref(), Some(
+        "Subquery Scan" | "Result" | "Sort" | "Incremental Sort"
+        | "Materialize" | "Limit" | "Unique" | "WindowAgg"))
 }
 
 fn detect_root_full_join(plan: &PlanNode) -> Option<(HashSet<String>, HashSet<String>)> {

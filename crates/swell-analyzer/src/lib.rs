@@ -318,13 +318,9 @@ fn build_row_variants(
     plan_walk: &plan::PlanWalk,
     columns: &[InferredColumn],
 ) -> Vec<RowVariant> {
-    if let Some(v) = build_full_join_variants(analyzed, plan_walk, columns) {
-        return v;
-    }
-    if let Some(v) = build_grouping_sets_variants(sql, columns) {
-        return v;
-    }
-    Vec::new()
+    build_full_join_variants(analyzed, plan_walk, columns)
+        .or_else(|| build_grouping_sets_variants(sql, columns))
+        .unwrap_or_default()
 }
 
 fn build_full_join_variants(
@@ -334,17 +330,14 @@ fn build_full_join_variants(
 ) -> Option<Vec<RowVariant>> {
     let (left, right) = plan_walk.root_full_join.as_ref()?;
     let strip_suffix = |s: &str| {
-        let t = s.trim_end_matches(|c: char| c.is_ascii_digit());
-        t.trim_end_matches('_').to_string()
+        s.trim_end_matches(|c: char| c.is_ascii_digit())
+            .trim_end_matches('_')
+            .to_string()
     };
-    let side_of = |a: &str| {
-        if left.contains(a) {
-            Some(true)
-        } else if right.contains(a) {
-            Some(false)
-        } else {
-            None
-        }
+    let side_of = |a: &str| match (left.contains(a), right.contains(a)) {
+        (true, _) => Some(true),
+        (_, true) => Some(false),
+        _ => None,
     };
     let col_side: Vec<Option<bool>> = (0..columns.len())
         .map(|i| {
@@ -356,17 +349,16 @@ fn build_full_join_variants(
             side_of(&alias).or_else(|| side_of(&strip_suffix(&alias)))
         })
         .collect();
-    let mk = |on_left_null: bool, on_right_null: bool| -> RowVariant {
-        let overrides = columns
+    let mk = |on_left_null: bool, on_right_null: bool| RowVariant {
+        overrides: columns
             .iter()
             .enumerate()
-            .filter_map(|(i, c)| match col_side[i] {
-                Some(true) if on_left_null => Some((c.name.clone(), "null".into())),
-                Some(false) if on_right_null => Some((c.name.clone(), "null".into())),
-                _ => None,
+            .filter_map(|(i, c)| {
+                let null = matches!(col_side[i], Some(true) if on_left_null)
+                    || matches!(col_side[i], Some(false) if on_right_null);
+                null.then(|| (c.name.clone(), "null".into()))
             })
-            .collect();
-        RowVariant { overrides }
+            .collect(),
     };
     Some(vec![mk(false, true), mk(true, false), mk(false, false)])
 }
