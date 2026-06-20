@@ -1,29 +1,11 @@
-//! Codegen: InferredQuery[] → .ts string.
+//! Codegen: `InferredQuery[]` → `.ts` string.
 //!
-//! Emits a per-package `swell.generated.ts` that:
+//! Emits a `swell.generated.ts` that
+//!   1. exports one `interface SchemaTable` per referenced base table, and
+//!   2. augments `Registry` via `declare module "@dialo/swell"`.
 //!
-//!   1. Exports one `interface SchemaTable` per base table referenced
-//!      by any registered query (column union across all queries).
-//!      Users import these everywhere — `SchedulerCampaigns["id"]`
-//!      becomes the single source of truth for an `id` column.
-//!   2. Augments swell's `Registry` interface via `declare module
-//!      "@dialo/swell"`. Query entries reference the table types
-//!      (`row: { id: SchedulerCampaigns["id"]; … }`) wherever the
-//!      column is a direct base-table ref. Computed / cast / aggregate
-//!      results inline the raw type — there's no table to point at.
-//!
-//! No runtime code: the file is pure type-level merging. `q` itself
-//! comes from `"@dialo/swell"`; its strict overload reads `keyof Registry`,
-//! which the augmentation populates.
-//!
-//! Usage:
-//!
-//!   import "./swell.generated";   // loaded automatically by tsconfig include
-//!   import { q } from "@dialo/swell";
-//!
-//!   const stmt = q("SELECT id, email FROM users WHERE id = $1");
-//!   const { rows } = await pool.query(stmt, [userId]);
-//!   //      ^? { id: Users["id"]; email: Users["email"] }[]
+//! Pure type-level merging — no runtime code. `q` lives in
+//! `@dialo/swell`; its strict overload reads `keyof Registry`.
 
 use std::collections::BTreeMap;
 use swell_analyzer::{InferredColumn, InferredParam, InferredQuery, RowVariant, TableColRef, TableSchema};
@@ -35,13 +17,11 @@ const RUNTIME_MODULE: &str = "@dialo/swell";
 
 #[derive(Default)]
 pub struct CodegenOptions<'a> {
-    /// Extra `import type { … } from "…"` lines to inject after swell's
-    /// own import. Used when per-column overrides reference user types.
+    /// Extra `import type { … } from "…"` lines (for per-column user
+    /// type overrides).
     pub extra_imports: &'a [(String, Vec<String>)],
-    /// Full schema of every base table referenced by any query.
-    /// Codegen emits one `export interface SchemaTable` per entry and
-    /// rewrites column references in the registry to `Table["col"]`.
-    /// Empty input = inline raw types (legacy behaviour).
+    /// Schema of every referenced base table. Empty = inline raw
+    /// types instead of `Table["col"]` rewriting.
     pub tables: &'a [TableSchema],
 }
 
@@ -62,10 +42,8 @@ fn render_row(q: &InferredQuery, names: &TableNameMap, tables: &[TableSchema]) -
     }
 }
 
-/// Render just the table interfaces — no auto-gen banner, no swell
-/// imports, no Registry. Used by the markdown-corpus runner for the
-/// `# Common types` block: shared interfaces appear once per file
-/// rather than being repeated in every test's expected output.
+/// Just the table interfaces — no banner / imports / Registry. Used
+/// by the markdown-corpus runner's `# Common types` block.
 pub fn render_table_interfaces(tables: &[TableSchema]) -> String {
     let (sorted, names) = sorted_with_names(tables);
     let mut out = String::new();
@@ -75,14 +53,8 @@ pub fn render_table_interfaces(tables: &[TableSchema]) -> String {
     out
 }
 
-/// Render a single query in compact form — one `$N: type` line per
-/// param, then a `result: …` line for the row. Used by the
-/// markdown-corpus runner so per-test expected blocks stay short:
-///
-///   ```ts
-///   $1: string | null
-///   result: { id: Users["id"] }
-///   ```
+/// One `$N: type` line per param plus a `result: …` line, for the
+/// markdown corpus runner's per-test expected blocks.
 pub fn render_query_compact(q: &InferredQuery, tables: &[TableSchema]) -> String {
     let (_, names) = sorted_with_names(tables);
     let mut out = String::new();
@@ -96,9 +68,8 @@ pub fn render_query_compact(q: &InferredQuery, tables: &[TableSchema]) -> String
 pub fn render(queries: &[InferredQuery], opts: CodegenOptions<'_>) -> String {
     let mut out = String::new();
     out.push_str(HEADER);
-    // Side-effect import keeps swell in the import graph so the
-    // `declare module` below resolves; the type imports keep `Json` /
-    // `SqlText` aliases available to column-override emitters.
+    // Side-effect import keeps swell in the graph so `declare module`
+    // resolves; the type aliases stay available for override emitters.
     out.push_str(&format!("import {{ type Json, type SqlText }} from \"{RUNTIME_MODULE}\";\n"));
     for (from, names) in opts.extra_imports {
         if names.is_empty() { continue; }
@@ -128,9 +99,8 @@ pub fn render(queries: &[InferredQuery], opts: CodegenOptions<'_>) -> String {
     out
 }
 
-/// Pretty-print a `SchemaTable` name from a `(schema, table)` pair.
-/// `scheduler.campaigns` → `SchedulerCampaigns`. `public.users` →
-/// `Users` (the default `public` schema is elided for ergonomics).
+/// `scheduler.campaigns` → `SchedulerCampaigns`; `public.users` →
+/// `Users` (public is elided).
 fn type_name(schema: &str, table: &str) -> String {
     let prefix = if schema == "public" { String::new() } else { pascal_case(schema) };
     format!("{prefix}{}", pascal_case(table))
@@ -152,11 +122,8 @@ fn pascal_case(s: &str) -> String {
     out
 }
 
-/// Maps (schema, table) → TS identifier, after collision-resolution.
-/// Two tables in different schemas sometimes produce the same default
-/// PascalCase name (`public.X` + `app.X` both collapse to `X` when we
-/// elide `public.`); when that happens, fall back to fully-qualified
-/// names for all conflicting entries.
+/// `(schema, table)` → TS identifier with collisions resolved by
+/// reinstating the schema prefix on conflicting entries.
 struct TableNameMap {
     by_pair: BTreeMap<(String, String), String>,
 }
@@ -171,7 +138,6 @@ impl TableNameMap {
         for t in tables {
             let pretty = type_name(&t.schema, &t.table);
             let name = if counts.get(&pretty).copied().unwrap_or(0) > 1 {
-                // Disambiguate by including the schema even if it's `public`.
                 format!("{}{}", pascal_case(&t.schema), pascal_case(&t.table))
             } else {
                 pretty
@@ -187,9 +153,8 @@ impl TableNameMap {
 }
 
 fn render_table_interface(t: &TableSchema, names: &TableNameMap) -> String {
-    // `names` was built from the same `&[TableSchema]` slice — every
-    // (schema, table) here MUST be present. Panic rather than emit a
-    // nameless `export interface {}` if that invariant ever breaks.
+    // names is built from the same slice; every (schema, table) must
+    // be present.
     let name = names.lookup(&t.schema, &t.table)
         .unwrap_or_else(|| panic!("TableNameMap missing entry for {}.{}", t.schema, t.table));
     let mut out = String::new();
@@ -216,11 +181,9 @@ fn render_entry(
     format!("{indent}{key}: {{ params: {params}; row: {row} }};\n")
 }
 
-/// Render a row as a discriminated union over `variants`. Each variant
-/// produces a complete row shape — columns not overridden are
-/// rendered as non-null (within a specific variant the column is
-/// known present, even though its across-all-variants `c.nullable`
-/// says true). Used for FULL OUTER JOIN and GROUPING SETS.
+/// Discriminated row union for FULL OUTER JOIN and GROUPING SETS.
+/// Non-overridden columns within a variant render as non-null —
+/// they're known present in that specific arm.
 fn render_row_with_variants(
     cols: &[InferredColumn],
     variants: &[RowVariant],
@@ -243,11 +206,8 @@ fn render_row_with_variants(
     alts.join(" | ")
 }
 
-/// Render the SQL string as a property key. Single-line SQL becomes a
-/// bare string-literal key (`"SELECT 1"`); multi-line SQL becomes a
-/// computed key with a template literal (`[\`...\`]`) so the SQL keeps
-/// its layout. Both forms produce identical string-literal key types
-/// for call-site narrowing.
+/// Single-line SQL → `"…"` key; multi-line → `[\`…\`]` computed key
+/// so the SQL keeps its layout. Both forms narrow identically.
 fn render_key(sql: &str) -> String {
     if sql.contains('\n') {
         format!("[`{}`]", escape_ts_template_literal(sql))
@@ -257,20 +217,13 @@ fn render_key(sql: &str) -> String {
 }
 
 fn render_params_tuple(q: &InferredQuery) -> String {
-    // Postgres's PARSE/DESCRIBE doesn't report param nullability — we
-    // infer it in `param_nullability.rs` by walking the SQL AST and
-    // checking whether `$N` binds directly to a NOT NULL column in
-    // INSERT VALUES or UPDATE SET. Anything else stays nullable so
-    // callers can pass null where Postgres tolerates it (WHERE,
-    // coalesce, etc.). `unknown` is already wide enough to admit null.
     let elems: Vec<String> = q.params.iter().map(render_param_type).collect();
     format!("[{}]", elems.join(", "))
 }
 
-/// Params skip the `Table["col"]` substitution columns get: the table
-/// interfaces are rendered for the read (parse) direction, but params
-/// take the write (serialize) shape. `p.ts_type` already carries the
-/// correct write-direction shape from the analyzer.
+/// Params skip the `Table["col"]` substitution columns get — the
+/// table interfaces are rendered for the read direction, but params
+/// take the write (serialize) shape carried by `p.ts_type`.
 fn render_param_type(p: &InferredParam) -> String {
     if p.nullable && p.ts_type != "unknown" {
         format!("{} | null", p.ts_type)
@@ -282,21 +235,17 @@ fn render_param_type(p: &InferredParam) -> String {
 fn render_row_type(
     cols: &[InferredColumn], names: &TableNameMap, tables: &[TableSchema],
 ) -> String {
-    if cols.is_empty() {
-        // `row: never` makes accidental use of a write-only statement's row
-        // shape visible — `one`/`maybe`/`many`/call all type as `never`.
-        return "never".to_string();
-    }
+    // `row: never` surfaces accidental use of write-only statements.
+    if cols.is_empty() { return "never".to_string(); }
     let fields_of = |slice: &[InferredColumn]| -> String {
         slice.iter()
             .map(|c| format!("{}: {}", quote_ident(&c.name),
                 render_typed(&c.ts_type, c.nullable, c.table_ref.as_ref(), names, tables)))
             .collect::<Vec<_>>().join("; ")
     };
-    // Recognise SELECT *-style expansions: a contiguous prefix of
-    // `cols` that matches a table's full column list (same names,
-    // same order, same nullability). Emit `BillingUsers` directly,
-    // with `& { rest: … }` for any trailing extras.
+    // SELECT *-style: contiguous prefix matches a table's full column
+    // list → emit `Table` (intersected with `{ rest }` for trailing
+    // extras).
     if let Some((table_name, used)) = detect_star_prefix(cols, tables, names) {
         let rest = &cols[used..];
         return if rest.is_empty() {
@@ -308,10 +257,9 @@ fn render_row_type(
     format!("{{ {} }}", fields_of(cols))
 }
 
-/// If `cols` begins with a contiguous run that matches a single
-/// table's full column list (same names in order, all with that
-/// table's `table_ref`, nullability matching the table interface),
-/// return the table's emitted name plus how many columns it consumed.
+/// Returns `(table_name, consumed)` when a contiguous prefix of `cols`
+/// matches a table's full column list (names, order, nullability all
+/// agree).
 fn detect_star_prefix(
     cols: &[InferredColumn],
     tables: &[TableSchema],
@@ -330,26 +278,18 @@ fn detect_star_prefix(
         if tref.schema != table.schema || tref.table != table.table || tref.column != tc.name {
             return None;
         }
-        // The column's nullability must match what `BillingUsers["col"]`
-        // would already encode — otherwise we'd lose the override info
-        // by switching to the interface form.
+        // Nullability must agree with the interface; an override would
+        // be lost by switching to the interface form.
         if c.nullable != !tc.not_null { return None; }
     }
     let name = names.lookup(&table.schema, &table.table)?;
     Some((name.to_string(), table.columns.len()))
 }
 
-/// Shared rendering for query columns and INSERT/UPDATE params: prefer
-/// `Table["col"]` whenever a base column is known, fall back to the
-/// inferred ts_type otherwise. `unknown` already admits null at the
-/// type level so we don't decorate it further.
-///
-/// When the column is a direct base-table reference, `Table["col"]`
-/// already encodes the column's natural nullability (via the table
-/// interface). Appending `| null` *only* when the rendered nullability
-/// diverges from the table's `attnotnull` — i.e. the override / outer-
-/// join inferences widened it — avoids `string | null | null` noise
-/// in the generated output.
+/// Prefer `Table["col"]` for known base columns, falling back to the
+/// inferred ts_type. Appends `| null` only when our verdict is wider
+/// than what the interface already encodes (outer-join / override
+/// widening) — avoids `T | null | null` noise.
 fn render_typed(
     ts_type: &str, nullable: bool,
     table_ref: Option<&TableColRef>,
@@ -358,12 +298,7 @@ fn render_typed(
     let base = table_ref
         .and_then(|r| indexed_table_ref(r, names))
         .unwrap_or_else(|| ts_type.to_string());
-    // `unknown` already admits null at the type level.
     if !nullable || base == "unknown" { return base; }
-    // For indexed-access refs the interface already encodes the
-    // column's natural nullability — only append `| null` when our
-    // verdict is wider than what the interface carries (outer-join /
-    // override widening).
     let interface_already_nullable = table_ref.is_some_and(|r| tables.iter()
         .find(|t| t.schema == r.schema && t.table == r.table)
         .and_then(|t| t.columns.iter().find(|c| c.name == r.column))
@@ -392,9 +327,8 @@ fn escape_ts_string(s: &str) -> String {
     out
 }
 
-/// Escape for a TS template literal (backtick-delimited). Newlines pass
-/// through verbatim — that's the whole point. Only backslash, backtick,
-/// and the `${` interpolation start need escaping.
+/// TS template literal escape — newlines pass through (that's the
+/// point); only `\\`, `` ` ``, and `${` need handling.
 fn escape_ts_template_literal(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();

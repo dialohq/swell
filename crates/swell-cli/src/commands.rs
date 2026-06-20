@@ -115,11 +115,9 @@ async fn run_pipeline(cfg: &Config, opts: RunOpts) -> Result<RunSummary> {
     let scanned = scan_project(cfg)?;
     info!("found {} sql() call sites", scanned.len());
 
-    let mut unique: BTreeMap<String, &ScannedQuery> = BTreeMap::new();
-    for q in &scanned {
-        let key = q.static_parts.first().cloned().unwrap_or_default();
-        unique.entry(key).or_insert(q);
-    }
+    let unique: BTreeMap<String, &ScannedQuery> = scanned.iter()
+        .map(|q| (q.static_parts.first().cloned().unwrap_or_default(), q))
+        .fold(BTreeMap::new(), |mut acc, (k, v)| { acc.entry(k).or_insert(v); acc });
     info!("{} unique queries", unique.len());
 
     let cache_dir = cfg.root.join(&cfg.cache.dir);
@@ -209,17 +207,11 @@ async fn run_pipeline(cfg: &Config, opts: RunOpts) -> Result<RunSummary> {
         }
     }
 
-    let extra_imports: Vec<(String, Vec<String>)> = cfg
-        .output
-        .imports
-        .iter()
-        .map(|i| (i.from.clone(), i.names.clone()))
-        .collect();
+    let extra_imports: Vec<(String, Vec<String>)> = cfg.output.imports.iter()
+        .map(|i| (i.from.clone(), i.names.clone())).collect();
 
-    // Collect distinct base tables referenced by any column or param,
-    // then fetch the full schema of each so codegen can emit
-    // `interface SchemaTable { … }`. Skipped offline — table types
-    // require the live catalog.
+    // Base tables referenced by any column / param. Offline: skipped
+    // (codegen falls back to inline types).
     let tables = match analyzer.as_ref() {
         Some(an) => fetch_referenced_tables(an, &inferred).await,
         None => Vec::new(),
@@ -244,12 +236,8 @@ async fn run_pipeline(cfg: &Config, opts: RunOpts) -> Result<RunSummary> {
     Ok(RunSummary { hits, errors })
 }
 
-/// Walk every column + param of every analysed query, collect the
-/// distinct `(schema, table)` pairs they reference, and fetch their
-/// full schemas in one round trip via `Analyzer::table_schemas`.
-/// Codegen emits one `interface SchemaTable` per result and rewrites
-/// column references as `Table["col"]`. Missing tables are skipped
-/// silently — caller falls back to inline types for their columns.
+/// Distinct `(schema, table)` pairs referenced by any analysed query
+/// → `TableSchema`s in one round trip. Missing tables are skipped.
 async fn fetch_referenced_tables(an: &Analyzer, queries: &[InferredQuery]) -> Vec<TableSchema> {
     let mut pairs: BTreeSet<(String, String)> = BTreeSet::new();
     for q in queries {

@@ -1,11 +1,6 @@
-//! AST walker that finds `q("…")` calls whose `q` was imported from a
-//! tracked module (the swell runtime, or any module that re-exports
-//! `q` — typically the per-package `swell.generated.ts`).
-//!
-//! The first argument must be a string literal (or a template literal
-//! with no interpolation). Anything else (concatenation, variable
-//! reference) is silently skipped — that's a runtime-only query the
-//! analyzer can't introspect without dynamic context.
+//! Find `q("…")` calls whose `q` was imported from a tracked module
+//! (`@dialo/swell` or a re-export). First arg must be a string literal
+//! or template literal with no interpolation; dynamic args are skipped.
 
 use crate::{ScanOptions, ScannedQuery};
 use std::collections::HashSet;
@@ -41,26 +36,19 @@ struct ImportBinders<'a> {
 impl<'a> Visit for ImportBinders<'a> {
     fn visit_import_decl(&mut self, n: &ImportDecl) {
         let raw = String::from_utf8_lossy(n.src.value.as_bytes());
-        // `q` ships from the swell runtime package and is also re-exported
-        // by each per-package `swell.generated.ts` (and any user-written
-        // `./db` re-exports the scan config picks up).
         let from_q_source = raw == "@dialo/swell"
             || self.opts.q_modules.iter().any(|m| *m == raw.as_ref());
-        if !from_q_source {
-            return;
-        }
+        if !from_q_source { return; }
         for spec in &n.specifiers {
-            if let ImportSpecifier::Named(named) = spec {
-                let imported_name = match &named.imported {
-                    Some(ModuleExportName::Ident(id)) => id.sym.to_string(),
-                    Some(ModuleExportName::Str(s)) => {
-                        String::from_utf8_lossy(s.value.as_bytes()).into_owned()
-                    }
-                    None => named.local.sym.to_string(),
-                };
-                if imported_name == "q" {
-                    self.locals.insert(named.local.sym.to_string());
-                }
+            let ImportSpecifier::Named(named) = spec else { continue };
+            let imported = match &named.imported {
+                Some(ModuleExportName::Ident(id)) => id.sym.to_string(),
+                Some(ModuleExportName::Str(s)) =>
+                    String::from_utf8_lossy(s.value.as_bytes()).into_owned(),
+                None => named.local.sym.to_string(),
+            };
+            if imported == "q" {
+                self.locals.insert(named.local.sym.to_string());
             }
         }
     }
@@ -96,24 +84,18 @@ impl<'a> Visit for CallCollector<'a> {
     }
 }
 
-/// Pull a static string out of a function argument. Accepts both string
-/// literals (`"…"`, `'…'`) and template literals with no interpolation
-/// (`` `…` ``). Anything else returns None.
 fn first_arg_as_static_string(arg: Option<&ExprOrSpread>) -> Option<String> {
     let arg = arg?;
-    if arg.spread.is_some() {
-        return None; // `q(...spread, ...)` — can't analyse
-    }
+    if arg.spread.is_some() { return None; }
     match &*arg.expr {
         Expr::Lit(Lit::Str(s)) => Some(String::from_utf8_lossy(s.value.as_bytes()).into_owned()),
         Expr::Tpl(t) if t.exprs.is_empty() && t.quasis.len() == 1 => {
             let q = &t.quasis[0];
-            let s = if let Some(c) = q.cooked.as_ref() {
-                String::from_utf8_lossy(c.as_bytes()).into_owned()
-            } else {
-                String::from_utf8_lossy(q.raw.as_bytes()).into_owned()
+            let bytes = match q.cooked.as_ref() {
+                Some(c) => c.as_bytes(),
+                None => q.raw.as_bytes(),
             };
-            Some(s)
+            Some(String::from_utf8_lossy(bytes).into_owned())
         }
         _ => None,
     }

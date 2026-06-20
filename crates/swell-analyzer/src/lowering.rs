@@ -1,43 +1,33 @@
-//! Lowering: pg_query parse tree → `Expr`.
-//!
-//! Single pass. Each visitor produces the verdict-ready node, with
-//! base column refs resolved against the active `Scope`, function
-//! calls categorised against the catalog short-name sets, and casts
-//! recursed through.
+//! pg_query parse tree → `Expr`. Single pass; each visitor produces
+//! a verdict-ready node.
 
 use crate::analyzed::{Expr, FuncKind, Lit, ResolvedCol};
 use crate::query::TableColRef;
 use crate::scope::Scope;
 use pg_query::protobuf::{a_const::Val, node::Node as NB, Node, SubLinkType, TypeName};
 
-/// Aggregate functions that return `NULL` over an empty input set.
+/// Aggregates that return `NULL` on empty input.
 const NULLABLE_AGGS: &[&str] = &[
     "sum", "avg", "min", "max",
     "array_agg", "json_agg", "jsonb_agg",
     "string_agg", "bool_and", "bool_or",
 ];
 
-/// Functions whose return value is guaranteed non-NULL by construction.
+/// Functions guaranteed non-NULL by construction.
 const NEVER_NULL_FUNCS: &[&str] = &[
     "count",
-    // Window funcs over a non-empty partition.
     "row_number", "rank", "dense_rank", "ntile", "cume_dist", "percent_rank",
-    // Session / time builtins.
     "now", "current_timestamp", "current_date", "current_time",
     "localtimestamp", "localtime",
     "current_user", "session_user", "current_database",
     "current_schema", "current_setting",
     "gen_random_uuid", "uuid_generate_v1", "uuid_generate_v4",
     "pg_advisory_lock", "pg_advisory_xact_lock",
-    // JSON / row builders — construct value from args, never short-circuit.
     "jsonb_build_object", "json_build_object",
     "jsonb_build_array", "json_build_array",
     "to_jsonb", "to_json", "row_to_json", "array_to_json",
 ];
 
-/// Lower a SQL expression node to `Expr`. Returns `Expr::Unknown` for
-/// shapes we don't categorise — caller defers to `attnotnull` or
-/// renders as nullable.
 pub fn lower(node: &Node, scope: &Scope) -> Expr {
     let Some(body) = node.node.as_ref() else { return Expr::Unknown };
     match body {
@@ -51,82 +41,49 @@ pub fn lower(node: &Node, scope: &Scope) -> Expr {
                 _ => Expr::Unknown,
             }
         }
-
-        // `<expr>::T` — recurse on the inner and check the specific
-        // `(source_oid, target_oid)` pair against this database's
-        // user-defined `castmethod='f'` set.
         NB::TypeCast(tc) => {
-            let inner = tc.arg.as_deref()
-                .map(|a| lower(a, scope))
-                .unwrap_or(Expr::Unknown);
+            let inner = tc.arg.as_deref().map(|a| lower(a, scope)).unwrap_or(Expr::Unknown);
             let target_oid = tc.type_name.as_ref()
                 .and_then(|tn| resolve_typename_oid(tn, scope))
                 .unwrap_or(0);
-            let source_oid = inner_type_oid(&inner);
-            let is_unsafe = match (source_oid, target_oid) {
+            let is_unsafe = match (inner_type_oid(&inner), target_oid) {
                 (Some(src), tgt) if tgt != 0 => scope.is_unsafe_cast(src, tgt),
                 _ => false,
             };
             Expr::Cast { inner: Box::new(inner), target_oid, is_unsafe }
         }
-
-        // `ARRAY[…]` — non-null regardless of elements.
         NB::AArrayExpr(_) => Expr::ArrayConstructor,
-
-        // Parse-time COALESCE comes through as a FuncCall; the
-        // CoalesceExpr variant exists in the protobuf but post-analysis.
+        // Parse-time COALESCE comes through as FuncCall — CoalesceExpr is
+        // post-analysis. We handle both.
         NB::CoalesceExpr(ce) => Expr::Coalesce(lower_args(&ce.args, scope)),
-
-        NB::CaseExpr(ce) => {
-            let has_else_non_null = ce.defresult.as_deref()
-                .map(|d| is_non_null(&lower(d, scope)))
-                .unwrap_or(false);
-            Expr::Case { has_else_non_null }
-        }
-
-        NB::FuncCall(fc) => {
-            let name = match fc.funcname.last().and_then(|n| n.node.as_ref()) {
-                Some(NB::String(s)) => s.sval.as_str(),
-                _ => return Expr::Unknown,
-            };
-            if name == "coalesce" {
-                Expr::Coalesce(lower_args(&fc.args, scope))
-            } else if NEVER_NULL_FUNCS.contains(&name) {
-                Expr::Func { kind: FuncKind::NeverNull, args: lower_args(&fc.args, scope) }
-            } else if NULLABLE_AGGS.contains(&name) {
-                Expr::Func { kind: FuncKind::NullableAgg, args: lower_args(&fc.args, scope) }
-            } else {
-                Expr::Func { kind: FuncKind::Other, args: lower_args(&fc.args, scope) }
-            }
-        }
-
-        NB::ColumnRef(cr) => match lower_column_ref(cr, scope) {
-            Some(rc) => Expr::Column(rc),
-            None => Expr::Unknown,
+        NB::CaseExpr(ce) => Expr::Case {
+            has_else_non_null: ce.defresult.as_deref()
+                .is_some_and(|d| is_non_null(&lower(d, scope))),
         },
-
+        NB::FuncCall(fc) => {
+            let Some(NB::String(s)) = fc.funcname.last().and_then(|n| n.node.as_ref())
+                else { return Expr::Unknown };
+            let name = s.sval.as_str();
+            let args = lower_args(&fc.args, scope);
+            if name == "coalesce" { Expr::Coalesce(args) }
+            else if NEVER_NULL_FUNCS.contains(&name) { Expr::Func { kind: FuncKind::NeverNull, args } }
+            else if NULLABLE_AGGS.contains(&name) { Expr::Func { kind: FuncKind::NullableAgg, args } }
+            else { Expr::Func { kind: FuncKind::Other, args } }
+        }
+        NB::ColumnRef(cr) => lower_column_ref(cr, scope)
+            .map(Expr::Column).unwrap_or(Expr::Unknown),
         NB::SubLink(sl) => lower_sublink(sl, scope),
-
         _ => Expr::Unknown,
     }
 }
 
-/// Type-aware SubLink lowering. The `SubLinkType` discriminator
-/// changes the result's nullability story:
-///
-///   - `EXISTS_SUBLINK`     — boolean, never NULL (true | false).
-///   - `ARRAY_SUBLINK`      — array, never NULL (`[]` for zero rows).
-///   - `EXPR_SUBLINK`       — scalar; returns NULL if the subquery has
-///     zero rows. Provably non-null only when the subquery is a
-///     single-row aggregate (target_list of `count`/`sum`/`max`/… and
-///     no GROUP BY) — in that case the verdict comes from the inner
-///     aggregate (count → non-null, sum/max → nullable).
-///   - `ANY_SUBLINK` / `ALL_SUBLINK` / `ROWCOMPARE_SUBLINK` — boolean
-///     comparison; result can be NULL if operands include NULL.
-///   - `MULTIEXPR_SUBLINK` / `CTE_SUBLINK` — rare; default to Unknown.
+/// SubLinkType drives the verdict:
+///   * EXISTS / ARRAY: never NULL.
+///   * scalar EXPR_SUBLINK: NULL on zero rows unless provably-one-row
+///     (aggregate-only target_list, no GROUP BY); then inner verdict.
+///   * ANY / ALL / ROWCOMPARE: NULL via operator semantics.
 fn lower_sublink(sl: &pg_query::protobuf::SubLink, scope: &Scope) -> Expr {
-    let kind = SubLinkType::try_from(sl.sub_link_type).unwrap_or(SubLinkType::Undefined);
-    match kind {
+    match SubLinkType::try_from(sl.sub_link_type).unwrap_or(SubLinkType::Undefined) {
         SubLinkType::ExistsSublink => Expr::Func {
             kind: FuncKind::NeverNull, args: Vec::new(),
         },
@@ -140,27 +97,14 @@ fn lower_sublink(sl: &pg_query::protobuf::SubLink, scope: &Scope) -> Expr {
                     NB::ResTarget(rt) => rt.val.as_deref(),
                     _ => None,
                 });
-            match first {
-                Some(node) => lower(node, scope),
-                None => Expr::Unknown,
-            }
+            first.map(|n| lower(n, scope)).unwrap_or(Expr::Unknown)
         }
-        // Boolean comparisons (= ANY, = ALL, row-compare) can carry
-        // NULL through the operator semantics.
-        SubLinkType::AnySublink
-        | SubLinkType::AllSublink
-        | SubLinkType::RowcompareSublink => Expr::Unknown,
         _ => Expr::Unknown,
     }
 }
 
-/// True iff the SELECT is guaranteed to return exactly one row — the
-/// only shape where the scalar form `(SELECT … )` can't yield NULL by
-/// the "zero rows" route. Aggregate-only target lists without a
-/// GROUP BY satisfy this; everything else admits zero rows.
 fn is_provably_one_row_select(s: &pg_query::protobuf::SelectStmt) -> bool {
-    if !s.group_clause.is_empty() { return false; }
-    if s.target_list.is_empty() { return false; }
+    if !s.group_clause.is_empty() || s.target_list.is_empty() { return false; }
     s.target_list.iter().all(|t| {
         let Some(NB::ResTarget(rt)) = t.node.as_ref() else { return false };
         let Some(val) = rt.val.as_deref() else { return false };
@@ -177,9 +121,6 @@ fn lower_args(args: &[Node], scope: &Scope) -> Vec<Expr> {
     args.iter().map(|a| lower(a, scope)).collect()
 }
 
-/// Resolve a `<alias>.<col>` (or bare `<col>` when unambiguous) to a
-/// `ResolvedCol` with `not_null` reflecting attnotnull AND outer-join
-/// widening AND any all-literal source override.
 fn lower_column_ref(cr: &pg_query::protobuf::ColumnRef, scope: &Scope) -> Option<ResolvedCol> {
     let parts: Vec<&str> = cr.fields.iter()
         .filter_map(|n| match n.node.as_ref()? {
@@ -189,66 +130,49 @@ fn lower_column_ref(cr: &pg_query::protobuf::ColumnRef, scope: &Scope) -> Option
         .collect();
     let (alias, col) = match parts.as_slice() {
         [col] => {
-            let resolved = scope.resolve_bare(col)?;
+            let r = scope.resolve_bare(col)?;
             return Some(ResolvedCol {
                 table_ref: TableColRef {
-                    schema: resolved.schema.clone(),
-                    table: resolved.table.clone(),
-                    column: (*col).to_string(),
+                    schema: r.schema.clone(), table: r.table.clone(), column: (*col).to_string(),
                 },
-                alias: resolved.alias,
-                not_null: resolved.not_null,
-                typoid: resolved.typoid,
+                alias: r.alias, not_null: r.not_null, typoid: r.typoid,
             });
         }
-        [alias, col] => (*alias, *col),
-        [_schema, alias, col] => (*alias, *col),
+        [alias, col] | [_, alias, col] => (*alias, *col),
         _ => return None,
     };
     if let Some(table) = scope.resolve_alias(alias) {
-        let base_not_null = table.col_not_null(col).unwrap_or(false);
+        let base_nn = table.col_not_null(col).unwrap_or(false);
         let widened = scope.is_nullable_alias(alias);
-        let force_non_null = scope.is_non_null_alias(alias);
-        let not_null = (base_not_null || force_non_null) && !widened;
+        let force_nn = scope.is_non_null_alias(alias);
         return Some(ResolvedCol {
             table_ref: TableColRef {
-                schema: table.schema.clone(),
-                table: table.name.clone(),
-                column: col.to_string(),
+                schema: table.schema.clone(), table: table.name.clone(), column: col.to_string(),
             },
             alias: alias.to_string(),
-            not_null,
+            not_null: (base_nn || force_nn) && !widened,
             typoid: table.col_typoid(col).unwrap_or(0),
         });
     }
-    // Derived-table alias (RangeSubselect / CTE) — find the column by
-    // name in the pre-lowered derived list and inherit its non-null
-    // verdict via `is_non_null(child_expr)`.
+    // Derived table / CTE alias — inherit non-null verdict from the
+    // pre-lowered child expression.
     if let Some(derived) = scope.derived(alias) {
         let child = derived.iter().find(|c| c.name == col)?;
         return Some(ResolvedCol {
             table_ref: TableColRef {
-                schema: String::new(),
-                table: alias.to_string(),
-                column: col.to_string(),
+                schema: String::new(), table: alias.to_string(), column: col.to_string(),
             },
             alias: alias.to_string(),
             not_null: is_non_null(&child.expr),
             typoid: 0,
         });
     }
-    // Alias isn't a real base table in the plan walk's `alias_to_table`.
-    // For literal-source aliases (VALUES, literal unnest) — the plan
-    // walk added them to `non_null` — we still want a `ResolvedCol`,
-    // since the verdict is "non-null by construction." We don't know
-    // the (schema, table) so leave them empty; codegen ignores
-    // `table_ref` for these because there's no surrounding interface.
+    // Literal source (VALUES, literal unnest): plan walk marked the
+    // alias non-null. No (schema, table) known.
     if scope.is_non_null_alias(alias) && !scope.is_nullable_alias(alias) {
         return Some(ResolvedCol {
             table_ref: TableColRef {
-                schema: String::new(),
-                table: alias.to_string(),
-                column: col.to_string(),
+                schema: String::new(), table: alias.to_string(), column: col.to_string(),
             },
             alias: alias.to_string(),
             not_null: true,
@@ -258,20 +182,15 @@ fn lower_column_ref(cr: &pg_query::protobuf::ColumnRef, scope: &Scope) -> Option
     None
 }
 
-/// True iff `e` represents a value provably non-NULL at runtime.
-/// Shared by `Coalesce`'s "any arg non-null" check and `Case`'s "ELSE
-/// branch non-null" check. For `SetOp`, every branch must be non-null.
+/// Provably non-NULL at runtime. Used by Coalesce arg checks, CASE
+/// ELSE checks, SetOp all-branches check.
 ///
-/// `Cast`: when `is_unsafe` is `false` (the typical case — built-in
-/// I/O / binary / `pg_catalog` function casts never return NULL on
-/// non-NULL input) we inherit the inner verdict. When `is_unsafe` is
-/// `true`, the specific `(source, target)` pair has a user-defined
-/// `castmethod='f'` in `pg_cast` that could return NULL even on
-/// non-null input — verdict drops to "not provably non-null."
+/// `Cast { is_unsafe }` blocks propagation — the specific
+/// `(source, target)` pair has a user-defined `castmethod='f'` that
+/// could return NULL on non-NULL input.
 pub fn is_non_null(e: &Expr) -> bool {
     match e {
-        Expr::Literal(_) => true,
-        Expr::ArrayConstructor => true,
+        Expr::Literal(_) | Expr::ArrayConstructor => true,
         Expr::Cast { inner, is_unsafe, .. } => !*is_unsafe && is_non_null(inner),
         Expr::Column(c) => c.not_null,
         Expr::Func { kind: FuncKind::NeverNull, .. } => true,
@@ -283,13 +202,8 @@ pub fn is_non_null(e: &Expr) -> bool {
     }
 }
 
-/// Strong "this column is nullable" verdict — used to override an
-/// otherwise-NOT-NULL base column when, e.g., an outer join widens it
-/// or a user-defined cast might return NULL.
-///
-/// `Cast { is_unsafe: true }` widens even a NOT NULL inner — the
-/// specific `(source, target)` pair has a user-defined `castmethod='f'`
-/// that could return NULL on non-null input.
+/// Strong nullable verdict — overrides attnotnull when, e.g., an outer
+/// join widens a NOT NULL column or a user-defined cast might return NULL.
 pub fn is_nullable(e: &Expr) -> bool {
     match e {
         Expr::Null => true,
@@ -302,8 +216,8 @@ pub fn is_nullable(e: &Expr) -> bool {
     }
 }
 
-/// Peel any `Cast` wrappers and return the underlying `Lit` iff the
-/// expression is structurally a single literal.
+/// Peel `Cast` wrappers and return the inner `Lit` if it's structurally
+/// a single literal.
 pub fn as_literal(e: &Expr) -> Option<&Lit> {
     match e {
         Expr::Literal(l) => Some(l),
@@ -312,10 +226,8 @@ pub fn as_literal(e: &Expr) -> Option<&Lit> {
     }
 }
 
-/// Peel any `Cast` wrappers and return the underlying base-column
-/// reference iff the expression is structurally a single column ref.
-/// Used by FULL JOIN row-variant building to know which side an
-/// output column came from via `ResolvedCol.alias`.
+/// Peel `Cast` wrappers and return the inner column ref. Used by FULL
+/// JOIN side detection to read `ResolvedCol.alias`.
 pub fn as_column(e: &Expr) -> Option<&ResolvedCol> {
     match e {
         Expr::Column(c) => Some(c),
@@ -324,29 +236,19 @@ pub fn as_column(e: &Expr) -> Option<&ResolvedCol> {
     }
 }
 
-/// Source-type OID of the expression PG would feed to a wrapping cast.
-/// Used to compute `Cast.is_unsafe` at lowering. Returns `None` for
-/// shapes whose type isn't trivially derivable from the lowered tree
-/// — caller treats unknown source as "default safe" (no widening).
+/// Source-type OID for the wrapping Cast's `is_unsafe` lookup. None
+/// for shapes whose type we don't carry on the lowered tree — caller
+/// treats unknown source as default-safe.
 fn inner_type_oid(e: &Expr) -> Option<u32> {
     match e {
         Expr::Column(c) => Some(c.typoid),
         Expr::Cast { target_oid, .. } => (*target_oid != 0).then_some(*target_oid),
-        // Literal / ArrayConstructor / Func / Coalesce / Case / SetOp /
-        // SubQuery have types we don't carry on the lowered tree;
-        // returning None defaults to safe.
         _ => None,
     }
 }
 
-/// Resolve a `TypeName` (e.g. `pg_catalog.text`, `mytype`,
-/// `myschema.mytype`) to its `pg_type.oid` via the scope's pre-fetched
-/// name → oid map. Returns `None` if the name isn't in the catalog.
 fn resolve_typename_oid(tn: &TypeName, scope: &Scope) -> Option<u32> {
     let last = tn.names.last()?;
-    let name = match last.node.as_ref()? {
-        NB::String(s) => s.sval.as_str(),
-        _ => return None,
-    };
-    scope.typname_oid(name)
+    let NB::String(s) = last.node.as_ref()? else { return None };
+    scope.typname_oid(&s.sval)
 }
