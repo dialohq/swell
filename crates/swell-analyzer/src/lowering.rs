@@ -5,10 +5,10 @@
 //! calls categorised against the catalog short-name sets, and casts
 //! recursed through.
 
-use crate::analyzed::{CastPolicy, Expr, FuncKind, Lit, ResolvedCol};
+use crate::analyzed::{Expr, FuncKind, Lit, ResolvedCol};
 use crate::query::TableColRef;
 use crate::scope::Scope;
-use pg_query::protobuf::{a_const::Val, node::Node as NB, Node};
+use pg_query::protobuf::{a_const::Val, node::Node as NB, Node, SubLinkType, TypeName};
 
 /// Aggregate functions that return `NULL` over an empty input set.
 const NULLABLE_AGGS: &[&str] = &[
@@ -52,13 +52,22 @@ pub fn lower(node: &Node, scope: &Scope) -> Expr {
             }
         }
 
-        // `<expr>::T` — recurse on the inner. NULL::T is the common
-        // case PG synthesises for outer-join padding.
+        // `<expr>::T` — recurse on the inner and check the specific
+        // `(source_oid, target_oid)` pair against this database's
+        // user-defined `castmethod='f'` set.
         NB::TypeCast(tc) => {
             let inner = tc.arg.as_deref()
                 .map(|a| lower(a, scope))
                 .unwrap_or(Expr::Unknown);
-            Expr::Cast { inner: Box::new(inner) }
+            let target_oid = tc.type_name.as_ref()
+                .and_then(|tn| resolve_typename_oid(tn, scope))
+                .unwrap_or(0);
+            let source_oid = inner_type_oid(&inner);
+            let is_unsafe = match (source_oid, target_oid) {
+                (Some(src), tgt) if tgt != 0 => scope.is_unsafe_cast(src, tgt),
+                _ => false,
+            };
+            Expr::Cast { inner: Box::new(inner), target_oid, is_unsafe }
         }
 
         // `ARRAY[…]` — non-null regardless of elements.
@@ -70,7 +79,7 @@ pub fn lower(node: &Node, scope: &Scope) -> Expr {
 
         NB::CaseExpr(ce) => {
             let has_else_non_null = ce.defresult.as_deref()
-                .map(|d| is_non_null(&lower(d, scope), scope.cast_policy()))
+                .map(|d| is_non_null(&lower(d, scope)))
                 .unwrap_or(false);
             Expr::Case { has_else_non_null }
         }
@@ -96,30 +105,72 @@ pub fn lower(node: &Node, scope: &Scope) -> Expr {
             None => Expr::Unknown,
         },
 
-        // Scalar subquery: classify by its first output.
-        NB::SubLink(sl) => match sl.subselect.as_deref() {
-            Some(sub) => {
-                // We can only descend if we recognise the subquery as a
-                // SelectStmt and its first target.
-                if let Some(NB::SelectStmt(s)) = sub.node.as_ref() {
-                    let first = s.target_list.first()
-                        .and_then(|t| match t.node.as_ref()? {
-                            NB::ResTarget(rt) => rt.val.as_deref(),
-                            _ => None,
-                        });
-                    match first {
-                        Some(node) => lower(node, scope),
-                        None => Expr::Unknown,
-                    }
-                } else {
-                    Expr::Unknown
-                }
-            }
-            None => Expr::Unknown,
-        },
+        NB::SubLink(sl) => lower_sublink(sl, scope),
 
         _ => Expr::Unknown,
     }
+}
+
+/// Type-aware SubLink lowering. The `SubLinkType` discriminator
+/// changes the result's nullability story:
+///
+///   - `EXISTS_SUBLINK`     — boolean, never NULL (true | false).
+///   - `ARRAY_SUBLINK`      — array, never NULL (`[]` for zero rows).
+///   - `EXPR_SUBLINK`       — scalar; returns NULL if the subquery has
+///     zero rows. Provably non-null only when the subquery is a
+///     single-row aggregate (target_list of `count`/`sum`/`max`/… and
+///     no GROUP BY) — in that case the verdict comes from the inner
+///     aggregate (count → non-null, sum/max → nullable).
+///   - `ANY_SUBLINK` / `ALL_SUBLINK` / `ROWCOMPARE_SUBLINK` — boolean
+///     comparison; result can be NULL if operands include NULL.
+///   - `MULTIEXPR_SUBLINK` / `CTE_SUBLINK` — rare; default to Unknown.
+fn lower_sublink(sl: &pg_query::protobuf::SubLink, scope: &Scope) -> Expr {
+    let kind = SubLinkType::try_from(sl.sub_link_type).unwrap_or(SubLinkType::Undefined);
+    match kind {
+        SubLinkType::ExistsSublink => Expr::Func {
+            kind: FuncKind::NeverNull, args: Vec::new(),
+        },
+        SubLinkType::ArraySublink => Expr::ArrayConstructor,
+        SubLinkType::ExprSublink => {
+            let Some(sub) = sl.subselect.as_deref() else { return Expr::Unknown };
+            let Some(NB::SelectStmt(s)) = sub.node.as_ref() else { return Expr::Unknown };
+            if !is_provably_one_row_select(s) { return Expr::Unknown; }
+            let first = s.target_list.first()
+                .and_then(|t| match t.node.as_ref()? {
+                    NB::ResTarget(rt) => rt.val.as_deref(),
+                    _ => None,
+                });
+            match first {
+                Some(node) => lower(node, scope),
+                None => Expr::Unknown,
+            }
+        }
+        // Boolean comparisons (= ANY, = ALL, row-compare) can carry
+        // NULL through the operator semantics.
+        SubLinkType::AnySublink
+        | SubLinkType::AllSublink
+        | SubLinkType::RowcompareSublink => Expr::Unknown,
+        _ => Expr::Unknown,
+    }
+}
+
+/// True iff the SELECT is guaranteed to return exactly one row — the
+/// only shape where the scalar form `(SELECT … )` can't yield NULL by
+/// the "zero rows" route. Aggregate-only target lists without a
+/// GROUP BY satisfy this; everything else admits zero rows.
+fn is_provably_one_row_select(s: &pg_query::protobuf::SelectStmt) -> bool {
+    if !s.group_clause.is_empty() { return false; }
+    if s.target_list.is_empty() { return false; }
+    s.target_list.iter().all(|t| {
+        let Some(NB::ResTarget(rt)) = t.node.as_ref() else { return false };
+        let Some(val) = rt.val.as_deref() else { return false };
+        let Some(NB::FuncCall(fc)) = val.node.as_ref() else { return false };
+        let name = fc.funcname.last().and_then(|n| match n.node.as_ref()? {
+            NB::String(s) => Some(s.sval.as_str()),
+            _ => None,
+        });
+        matches!(name, Some(n) if NEVER_NULL_FUNCS.contains(&n) || NULLABLE_AGGS.contains(&n))
+    })
 }
 
 fn lower_args(args: &[Node], scope: &Scope) -> Vec<Expr> {
@@ -147,6 +198,7 @@ fn lower_column_ref(cr: &pg_query::protobuf::ColumnRef, scope: &Scope) -> Option
                 },
                 alias: resolved.alias,
                 not_null: resolved.not_null,
+                typoid: resolved.typoid,
             });
         }
         [alias, col] => (*alias, *col),
@@ -166,11 +218,12 @@ fn lower_column_ref(cr: &pg_query::protobuf::ColumnRef, scope: &Scope) -> Option
             },
             alias: alias.to_string(),
             not_null,
+            typoid: table.col_typoid(col).unwrap_or(0),
         });
     }
     // Derived-table alias (RangeSubselect / CTE) — find the column by
     // name in the pre-lowered derived list and inherit its non-null
-    // verdict via `is_non_null(child_expr, scope.cast_policy())`.
+    // verdict via `is_non_null(child_expr)`.
     if let Some(derived) = scope.derived(alias) {
         let child = derived.iter().find(|c| c.name == col)?;
         return Some(ResolvedCol {
@@ -180,7 +233,8 @@ fn lower_column_ref(cr: &pg_query::protobuf::ColumnRef, scope: &Scope) -> Option
                 column: col.to_string(),
             },
             alias: alias.to_string(),
-            not_null: is_non_null(&child.expr, scope.cast_policy()),
+            not_null: is_non_null(&child.expr),
+            typoid: 0,
         });
     }
     // Alias isn't a real base table in the plan walk's `alias_to_table`.
@@ -198,6 +252,7 @@ fn lower_column_ref(cr: &pg_query::protobuf::ColumnRef, scope: &Scope) -> Option
             },
             alias: alias.to_string(),
             not_null: true,
+            typoid: 0,
         });
     }
     None
@@ -205,32 +260,25 @@ fn lower_column_ref(cr: &pg_query::protobuf::ColumnRef, scope: &Scope) -> Option
 
 /// True iff `e` represents a value provably non-NULL at runtime.
 /// Shared by `Coalesce`'s "any arg non-null" check and `Case`'s "ELSE
-/// branch non-null" check. For `SetOp`, every branch must be non-null
-/// (the union admits NULL if any branch can produce it).
+/// branch non-null" check. For `SetOp`, every branch must be non-null.
 ///
-/// Casts: `CastPolicy::Trust` inherits the inner verdict (built-in
+/// `Cast`: when `is_unsafe` is `false` (the typical case — built-in
 /// I/O / binary / `pg_catalog` function casts never return NULL on
-/// non-NULL input — they `ERROR` instead). `CastPolicy::Conservative`
-/// kicks in when the database has at least one user-defined
-/// `castmethod='f'` cast; in that mode only literal-class inner
-/// expressions (where the value is fabricated, not transformed from
-/// a column) propagate non-null.
-pub fn is_non_null(e: &Expr, policy: CastPolicy) -> bool {
+/// non-NULL input) we inherit the inner verdict. When `is_unsafe` is
+/// `true`, the specific `(source, target)` pair has a user-defined
+/// `castmethod='f'` in `pg_cast` that could return NULL even on
+/// non-null input — verdict drops to "not provably non-null."
+pub fn is_non_null(e: &Expr) -> bool {
     match e {
         Expr::Literal(_) => true,
         Expr::ArrayConstructor => true,
-        Expr::Cast { inner } => match policy {
-            CastPolicy::Trust => is_non_null(inner, policy),
-            CastPolicy::Conservative => matches!(inner.as_ref(),
-                Expr::Literal(_) | Expr::ArrayConstructor
-                | Expr::Func { kind: FuncKind::NeverNull, .. }),
-        },
+        Expr::Cast { inner, is_unsafe, .. } => !*is_unsafe && is_non_null(inner),
         Expr::Column(c) => c.not_null,
         Expr::Func { kind: FuncKind::NeverNull, .. } => true,
-        Expr::Coalesce(args) => args.iter().any(|a| is_non_null(a, policy)),
+        Expr::Coalesce(args) => args.iter().any(is_non_null),
         Expr::Case { has_else_non_null } => *has_else_non_null,
-        Expr::SubQuery(a) => a.outputs.first().is_some_and(|o| is_non_null(&o.expr, policy)),
-        Expr::SetOp(branches) => !branches.is_empty() && branches.iter().all(|b| is_non_null(b, policy)),
+        Expr::SubQuery(a) => a.outputs.first().is_some_and(|o| is_non_null(&o.expr)),
+        Expr::SetOp(branches) => !branches.is_empty() && branches.iter().all(is_non_null),
         _ => false,
     }
 }
@@ -239,26 +287,17 @@ pub fn is_non_null(e: &Expr, policy: CastPolicy) -> bool {
 /// otherwise-NOT-NULL base column when, e.g., an outer join widens it
 /// or a user-defined cast might return NULL.
 ///
-/// Under `CastPolicy::Conservative`, `<col>::T` is treated as
-/// potentially NULL even when `col` is NOT NULL — some `castfunc` in
-/// the database can return NULL, and without per-cast type info we
-/// can't tell which casts are safe. Literal-class inner expressions
-/// (`Literal`, `ArrayConstructor`, never-null funcs) stay safe because
-/// the value being cast is fabricated, not transformed from a column.
-pub fn is_nullable(e: &Expr, policy: CastPolicy) -> bool {
+/// `Cast { is_unsafe: true }` widens even a NOT NULL inner — the
+/// specific `(source, target)` pair has a user-defined `castmethod='f'`
+/// that could return NULL on non-null input.
+pub fn is_nullable(e: &Expr) -> bool {
     match e {
         Expr::Null => true,
-        Expr::Cast { inner } => {
-            if is_nullable(inner, policy) { return true; }
-            matches!(policy, CastPolicy::Conservative)
-                && !matches!(inner.as_ref(),
-                    Expr::Literal(_) | Expr::ArrayConstructor
-                    | Expr::Func { kind: FuncKind::NeverNull, .. })
-        }
+        Expr::Cast { inner, is_unsafe, .. } => is_nullable(inner) || *is_unsafe,
         Expr::Column(c) => !c.not_null,
         Expr::Func { kind: FuncKind::NullableAgg, .. } => true,
         Expr::Case { has_else_non_null: false } => true,
-        Expr::SetOp(branches) => branches.iter().any(|b| is_nullable(b, policy)),
+        Expr::SetOp(branches) => branches.iter().any(is_nullable),
         _ => false,
     }
 }
@@ -268,7 +307,7 @@ pub fn is_nullable(e: &Expr, policy: CastPolicy) -> bool {
 pub fn as_literal(e: &Expr) -> Option<&Lit> {
     match e {
         Expr::Literal(l) => Some(l),
-        Expr::Cast { inner } => as_literal(inner),
+        Expr::Cast { inner, .. } => as_literal(inner),
         _ => None,
     }
 }
@@ -280,7 +319,34 @@ pub fn as_literal(e: &Expr) -> Option<&Lit> {
 pub fn as_column(e: &Expr) -> Option<&ResolvedCol> {
     match e {
         Expr::Column(c) => Some(c),
-        Expr::Cast { inner } => as_column(inner),
+        Expr::Cast { inner, .. } => as_column(inner),
         _ => None,
     }
+}
+
+/// Source-type OID of the expression PG would feed to a wrapping cast.
+/// Used to compute `Cast.is_unsafe` at lowering. Returns `None` for
+/// shapes whose type isn't trivially derivable from the lowered tree
+/// — caller treats unknown source as "default safe" (no widening).
+fn inner_type_oid(e: &Expr) -> Option<u32> {
+    match e {
+        Expr::Column(c) => Some(c.typoid),
+        Expr::Cast { target_oid, .. } => (*target_oid != 0).then_some(*target_oid),
+        // Literal / ArrayConstructor / Func / Coalesce / Case / SetOp /
+        // SubQuery have types we don't carry on the lowered tree;
+        // returning None defaults to safe.
+        _ => None,
+    }
+}
+
+/// Resolve a `TypeName` (e.g. `pg_catalog.text`, `mytype`,
+/// `myschema.mytype`) to its `pg_type.oid` via the scope's pre-fetched
+/// name → oid map. Returns `None` if the name isn't in the catalog.
+fn resolve_typename_oid(tn: &TypeName, scope: &Scope) -> Option<u32> {
+    let last = tn.names.last()?;
+    let name = match last.node.as_ref()? {
+        NB::String(s) => s.sval.as_str(),
+        _ => return None,
+    };
+    scope.typname_oid(name)
 }

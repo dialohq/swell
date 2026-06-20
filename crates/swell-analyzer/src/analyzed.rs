@@ -61,10 +61,15 @@ pub enum Expr {
     Literal(Lit),
     /// `NULL`, `NULL::T` — always null.
     Null,
-    /// `<inner>::T`. We keep the cast around because codegen needs the
-    /// target type for json_shape, but for nullability it's
-    /// transparent — we recurse into `inner`.
-    Cast { inner: Box<Expr> },
+    /// `<inner>::T`. `target_oid` is `T`'s `pg_type.oid` resolved at
+    /// lowering so a nested `Cast` can use it as the source of the
+    /// outer cast. `is_unsafe` is `true` iff the specific
+    /// `(source_typoid, target_typoid)` pair matches a user-defined
+    /// `castmethod='f'` entry in this database's `pg_cast` — the only
+    /// cast shape that can return NULL on non-NULL input. The flag is
+    /// per-cast, not per-query: an unrelated unsafe cast (`mytype::text`)
+    /// doesn't taint the verdict for `id::text` in the same query.
+    Cast { inner: Box<Expr>, target_oid: u32, is_unsafe: bool },
     /// `ARRAY[…]` — never null, regardless of elements.
     ArrayConstructor,
     /// Resolved base-table column reference. `not_null` is already the
@@ -105,24 +110,9 @@ pub struct ResolvedCol {
     /// an outer join above this expression." False here means the
     /// column may be NULL in this output position.
     pub not_null: bool,
-}
-
-/// Whether `Cast` nodes propagate non-null from their inner
-/// expression. Decided once per `Analyzer` at connect time via a
-/// `pg_cast` probe: if the connected database has any user-defined
-/// function-based cast (`castmethod = 'f'` AND `oid >= 16384`),
-/// we stay conservative (some `castfunc` could return NULL on
-/// non-NULL input). Otherwise we trust — built-in casts are either
-/// binary, I/O (which throws rather than returns NULL), or use
-/// `pg_catalog` functions that never return NULL on non-NULL input.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CastPolicy {
-    /// No user-defined function casts in the database. `Cast { inner }`
-    /// inherits `inner`'s non-null verdict.
-    Trust,
-    /// At least one user-defined `castmethod='f'` cast exists. `Cast`
-    /// propagates non-null only over literal-class inner expressions.
-    Conservative,
+    /// `pg_attribute.atttypid` — used by Cast lowering to compute the
+    /// `(source, target)` pair against the database's unsafe-cast set.
+    pub typoid: u32,
 }
 
 /// Verdict-relevant classification of a function call. Computed once

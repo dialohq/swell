@@ -4,7 +4,7 @@
 //! the lowering pass to resolve `ColumnRef`s to `ResolvedCol` with the
 //! `not_null` bit already adjusted for outer-join widening.
 
-use crate::analyzed::{CastPolicy, Expr};
+use crate::analyzed::Expr;
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use tokio_postgres::Client;
@@ -19,10 +19,13 @@ pub struct Scope {
     derived: HashMap<String, Vec<DerivedColumn>>,
     nullable: HashSet<String>,
     non_null: HashSet<String>,
-    /// Per-analyzer cast policy — threaded through derived-column
-    /// resolution so the verdict for a CTE / derived column matches
-    /// what the top-level pass would produce.
-    cast_policy: CastPolicy,
+    /// `(source_typoid, target_typoid)` pairs with a user-defined
+    /// `castmethod='f'` cast — looked up per-Cast to compute its
+    /// `is_unsafe` flag at lowering time.
+    unsafe_casts: HashSet<(u32, u32)>,
+    /// `pg_type.typname → oid` for resolving a `TypeCast`'s target
+    /// type name to an OID.
+    typname_to_oid: HashMap<String, u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -35,13 +38,16 @@ pub struct DerivedColumn {
 pub struct ResolvedTable {
     pub schema: String,
     pub name: String,
-    /// column name → attnotnull
-    columns: HashMap<String, bool>,
+    /// column name → (attnotnull, atttypid)
+    columns: HashMap<String, (bool, u32)>,
 }
 
 impl ResolvedTable {
     pub fn col_not_null(&self, col: &str) -> Option<bool> {
-        self.columns.get(col).copied()
+        self.columns.get(col).map(|(nn, _)| *nn)
+    }
+    pub fn col_typoid(&self, col: &str) -> Option<u32> {
+        self.columns.get(col).map(|(_, oid)| *oid)
     }
 }
 
@@ -55,20 +61,35 @@ impl Scope {
         alias_to_table: HashMap<String, (String, String)>,
         nullable: HashSet<String>,
         non_null: HashSet<String>,
-        cast_policy: CastPolicy,
+        unsafe_casts: HashSet<(u32, u32)>,
+        typname_to_oid: HashMap<String, u32>,
     ) -> Result<Self> {
         let distinct: HashSet<(String, String)> = alias_to_table.values().cloned().collect();
-        let columns = fetch_attnotnull(client, &distinct).await?;
+        let columns = fetch_columns(client, &distinct).await?;
         let aliases = alias_to_table.into_iter()
             .filter_map(|(alias, (schema, name))| {
                 let cols = columns.get(&(schema.clone(), name.clone()))?.clone();
                 Some((alias, ResolvedTable { schema, name, columns: cols }))
             })
             .collect();
-        Ok(Self { aliases, derived: HashMap::new(), nullable, non_null, cast_policy })
+        Ok(Self {
+            aliases, derived: HashMap::new(), nullable, non_null,
+            unsafe_casts, typname_to_oid,
+        })
     }
 
-    pub fn cast_policy(&self) -> CastPolicy { self.cast_policy }
+    /// `pg_type.typname → oid`. Used by `Cast` lowering to resolve a
+    /// `TypeCast`'s target name to an OID.
+    pub fn typname_oid(&self, name: &str) -> Option<u32> {
+        self.typname_to_oid.get(name).copied()
+    }
+
+    /// True iff this `(source, target)` cast is user-defined
+    /// `castmethod='f'` — the only shape that can return NULL on
+    /// non-NULL input.
+    pub fn is_unsafe_cast(&self, source: u32, target: u32) -> bool {
+        self.unsafe_casts.contains(&(source, target))
+    }
 
     /// Attach derived-table aliases. Lowering pass calls this after
     /// `Scope::build` once it has the SQL parse tree — we can't do
@@ -122,6 +143,7 @@ impl Scope {
                 table: table.name.clone(),
                 alias: alias.clone(),
                 not_null: (base_not_null || force_non_null) && !widening,
+                typoid: table.col_typoid(col).unwrap_or(0),
             });
         }
         // Derived-table / CTE: bare `<col>` resolves if exactly one
@@ -135,7 +157,8 @@ impl Scope {
                 schema: String::new(),
                 table: alias.clone(),
                 alias: alias.clone(),
-                not_null: crate::lowering::is_non_null(&dcol.expr, self.cast_policy),
+                not_null: crate::lowering::is_non_null(&dcol.expr),
+                typoid: 0,
             });
         }
         if self.non_null.len() == 1 {
@@ -145,6 +168,7 @@ impl Scope {
                 table: String::new(),
                 alias,
                 not_null: true,
+                typoid: 0,
             });
         }
         None
@@ -177,6 +201,7 @@ pub struct BareResolved {
     pub table: String,
     pub alias: String,
     pub not_null: bool,
+    pub typoid: u32,
 }
 
 /// `users_1` → `users`. PG appends `_N` to disambiguate duplicate scan
@@ -186,17 +211,17 @@ fn strip_suffix_digits(s: &str) -> &str {
     t.trim_end_matches('_')
 }
 
-/// One round-trip: per (schema, table) → { column → attnotnull }.
-async fn fetch_attnotnull(
+/// One round-trip: per (schema, table) → { column → (attnotnull, atttypid) }.
+async fn fetch_columns(
     client: &Client, pairs: &HashSet<(String, String)>,
-) -> Result<HashMap<(String, String), HashMap<String, bool>>> {
+) -> Result<HashMap<(String, String), HashMap<String, (bool, u32)>>> {
     if pairs.is_empty() { return Ok(HashMap::new()); }
     let schemas: Vec<&str> = pairs.iter().map(|p| p.0.as_str()).collect();
     let tables: Vec<&str>  = pairs.iter().map(|p| p.1.as_str()).collect();
     let rows = client.query(
         r#"
         WITH ask(schema, name) AS (SELECT * FROM unnest($1::text[], $2::text[]))
-        SELECT n.nspname, c.relname, a.attname, a.attnotnull
+        SELECT n.nspname, c.relname, a.attname, a.attnotnull, a.atttypid::oid
         FROM ask
         JOIN pg_namespace n ON n.nspname = ask.schema
         JOIN pg_class c     ON c.relnamespace = n.oid AND c.relname = ask.name
@@ -205,13 +230,14 @@ async fn fetch_attnotnull(
         "#,
         &[&schemas, &tables],
     ).await?;
-    let mut out: HashMap<(String, String), HashMap<String, bool>> = HashMap::new();
+    let mut out: HashMap<(String, String), HashMap<String, (bool, u32)>> = HashMap::new();
     for row in &rows {
         let schema: String = row.get(0);
         let table: String  = row.get(1);
         let col: String    = row.get(2);
         let nn: bool       = row.get(3);
-        out.entry((schema, table)).or_default().insert(col, nn);
+        let oid: u32       = row.get(4);
+        out.entry((schema, table)).or_default().insert(col, (nn, oid));
     }
     Ok(out)
 }

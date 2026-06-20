@@ -4,7 +4,7 @@
 //! that produces a fully lowered `Analyzed`. No EXPLAIN-text reading
 //! downstream of this point.
 
-use crate::analyzed::{Analyzed, CastPolicy, Expr, Output, Param, ResolvedCol};
+use crate::analyzed::{Analyzed, Expr, Output, Param, ResolvedCol};
 use crate::describe::DescribedQuery;
 use crate::lowering::{self, lower};
 use crate::plan::PlanWalk;
@@ -12,7 +12,8 @@ use crate::query::TableColRef;
 use crate::scope::{DerivedColumn, Scope};
 use anyhow::Result;
 use pg_query::protobuf::{node::Node as NB, Node, SelectStmt};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::pin::Pin;
 use tokio_postgres::Client;
 
 const SETOP_NONE: i32 = pg_query::protobuf::SetOperation::SetopNone as i32;
@@ -34,7 +35,25 @@ pub async fn build(
     plan: PlanWalk,
     column_meta: &ColumnMeta,
     param_bindings: &HashMap<usize, TableColRef>,
-    cast_policy: CastPolicy,
+    unsafe_casts: HashSet<(u32, u32)>,
+    typname_to_oid: HashMap<String, u32>,
+) -> Result<Analyzed> {
+    build_inner(
+        client, sql, described, plan, column_meta, param_bindings,
+        unsafe_casts, typname_to_oid, &HashSet::new(),
+    ).await
+}
+
+async fn build_inner(
+    client: &Client,
+    sql: &str,
+    described: &DescribedQuery,
+    plan: PlanWalk,
+    column_meta: &ColumnMeta,
+    param_bindings: &HashMap<usize, TableColRef>,
+    unsafe_casts: HashSet<(u32, u32)>,
+    typname_to_oid: HashMap<String, u32>,
+    visited: &HashSet<u32>,
 ) -> Result<Analyzed> {
     // Scope is the alias-resolution + nullability environment shared
     // across the whole lowering pass for this statement.
@@ -43,13 +62,25 @@ pub async fn build(
         plan.alias_to_table.clone(),
         plan.nullable_aliases.clone(),
         plan.non_null_aliases.clone(),
-        cast_policy,
+        unsafe_casts.clone(),
+        typname_to_oid.clone(),
     ).await?;
 
-    // Derived tables (RangeSubselect in FROM) and CTEs lowered into
-    // per-column `Expr`s so `ColumnRef("<derived>", "col")` resolves
-    // structurally instead of bailing to `Unknown`.
-    scope.attach_derived(collect_derived(sql, &scope));
+    // View references: each `RangeVar` whose underlying `pg_class`
+    // row has `relkind = 'v'` gets its definition recursively
+    // analysed, with the resulting per-column `Expr`s slotted in as a
+    // derived alias.
+    let view_derived = analyze_view_refs(
+        client, sql, &unsafe_casts, &typname_to_oid, visited,
+    ).await?;
+    let mut derived: HashMap<String, Vec<DerivedColumn>> = view_derived;
+    // Attach views first so the SQL-AST derived collection can resolve
+    // CTE / subselect refs to views.
+    scope.attach_derived(derived.clone());
+    for (k, v) in collect_derived(sql, &scope) {
+        derived.entry(k).or_insert(v);
+    }
+    scope.attach_derived(derived);
 
     // Pull per-output AST nodes from the SQL once.
     let target_source = collect_target_source(sql);
@@ -70,7 +101,7 @@ pub async fn build(
                 .and_then(|a| scope.resolve_alias(a))
                 .and_then(|t| t.col_not_null(&table_ref.column))
                 .unwrap_or(false);
-            ResolvedCol { table_ref, alias: String::new(), not_null }
+            ResolvedCol { table_ref, alias: String::new(), not_null, typoid: 0 }
         });
         Param { binding, pg_type: t.clone() }
     }).collect();
@@ -104,10 +135,14 @@ fn lower_output(
             .unwrap_or("").to_string();
         let widened = !alias.is_empty() && scope.is_nullable_alias(&alias);
         let force_non_null = !alias.is_empty() && scope.is_non_null_alias(&alias);
+        let typoid = scope.resolve_alias(&alias)
+            .and_then(|t| t.col_typoid(&meta.table_ref.column))
+            .unwrap_or(0);
         return Expr::Column(ResolvedCol {
             table_ref: meta.table_ref.clone(),
             alias,
             not_null: (meta.not_null || force_non_null) && !widened,
+            typoid,
         });
     }
     Expr::Unknown
@@ -174,6 +209,143 @@ fn target_contains_star(n: &Node) -> bool {
     let Some(val) = rt.val.as_deref() else { return false };
     let Some(NB::ColumnRef(cr)) = val.node.as_ref() else { return false };
     cr.fields.iter().any(|f| matches!(f.node.as_ref(), Some(NB::AStar(_))))
+}
+
+// ---------- View recursion ----------
+
+/// Find every `RangeVar` in the SQL, check `pg_class` for which are
+/// views (`relkind = 'v'`), fetch each view's definition, and
+/// recursively analyse it — returning per-view alias → per-column
+/// `DerivedColumn`s. Cycles (a view that references itself or sits
+/// in a cyclic dependency) are detected via the `visited` OID set and
+/// short-circuited: any view OID currently on the analysis stack
+/// resolves to no derived columns, leaving the lookup to fall through
+/// to `attnotnull` like for an opaque table. Boxed because of async
+/// recursion.
+fn analyze_view_refs<'a>(
+    client: &'a Client,
+    sql: &'a str,
+    unsafe_casts: &'a HashSet<(u32, u32)>,
+    typname_to_oid: &'a HashMap<String, u32>,
+    visited: &'a HashSet<u32>,
+) -> Pin<Box<dyn std::future::Future<Output = Result<HashMap<String, Vec<DerivedColumn>>>> + Send + 'a>> {
+    Box::pin(async move {
+        let candidates = find_rangevar_aliases(sql);
+        if candidates.is_empty() { return Ok(HashMap::new()); }
+        let view_oids = fetch_view_oids(client, &candidates).await;
+        if view_oids.is_empty() { return Ok(HashMap::new()); }
+        let mut out = HashMap::new();
+        for (alias, oid) in view_oids {
+            if visited.contains(&oid) { continue; }
+            let view_sql = match fetch_view_def(client, oid).await {
+                Some(s) => s,
+                None => continue,
+            };
+            let described = match crate::describe::describe(client, &view_sql).await {
+                Ok(d) => d,
+                Err(e) => { tracing::debug!("describe view {oid}: {e}"); continue; }
+            };
+            let plan_walk = crate::plan::explain(client, &view_sql).await
+                .unwrap_or_default();
+            let pairs: Vec<(u32, i16)> = described.columns.iter()
+                .filter(|c| c.table_oid != 0 && c.attnum > 0)
+                .map(|c| (c.table_oid, c.attnum))
+                .collect();
+            let column_meta = crate::resolve_column_meta(client, &pairs).await;
+            let mut next_visited = visited.clone();
+            next_visited.insert(oid);
+            let analyzed = build_inner(
+                client, &view_sql, &described, plan_walk,
+                &column_meta, &HashMap::new(),
+                unsafe_casts.clone(), typname_to_oid.clone(),
+                &next_visited,
+            ).await?;
+            let cols: Vec<DerivedColumn> = analyzed.outputs.into_iter()
+                .map(|o| DerivedColumn { name: o.name, expr: o.expr })
+                .collect();
+            out.insert(alias, cols);
+        }
+        Ok(out)
+    })
+}
+
+/// `(alias_or_relname, schema, relname)` for every `RangeVar` in the
+/// SQL's top-level `from_clause`. We don't yet know which are views;
+/// `fetch_view_oids` filters via `pg_class`.
+fn find_rangevar_aliases(sql: &str) -> Vec<(String, String, String)> {
+    let mut out = Vec::new();
+    let Ok(parsed) = pg_query::parse(sql) else { return out };
+    for raw in &parsed.protobuf.stmts {
+        let Some(stmt) = raw.stmt.as_deref().and_then(|s| s.node.as_ref()) else { continue };
+        let select = match stmt {
+            NB::SelectStmt(s) => s,
+            _ => continue,
+        };
+        for from in &select.from_clause {
+            walk_rangevars(from, &mut out);
+        }
+    }
+    out
+}
+
+fn walk_rangevars(n: &Node, out: &mut Vec<(String, String, String)>) {
+    match n.node.as_ref() {
+        Some(NB::RangeVar(rv)) => {
+            let alias = rv.alias.as_ref().map(|a| a.aliasname.clone())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| rv.relname.clone());
+            let schema = rv.schemaname.clone();
+            out.push((alias, schema, rv.relname.clone()));
+        }
+        Some(NB::JoinExpr(je)) => {
+            if let Some(l) = je.larg.as_deref() { walk_rangevars(l, out); }
+            if let Some(r) = je.rarg.as_deref() { walk_rangevars(r, out); }
+        }
+        _ => {}
+    }
+}
+
+/// One round-trip filters the `RangeVar` candidates by
+/// `pg_class.relkind = 'v'`. Returns alias → view OID for each view
+/// candidate.
+async fn fetch_view_oids(
+    client: &Client, candidates: &[(String, String, String)],
+) -> Vec<(String, u32)> {
+    if candidates.is_empty() { return Vec::new() }
+    let schemas: Vec<&str> = candidates.iter()
+        .map(|(_, s, _)| if s.is_empty() { "public" } else { s.as_str() })
+        .collect();
+    let names: Vec<&str> = candidates.iter().map(|(_, _, n)| n.as_str()).collect();
+    let rows = match client.query(
+        r#"
+        WITH ask(schema, name) AS (SELECT * FROM unnest($1::text[], $2::text[]))
+        SELECT ask.schema, ask.name, c.oid::oid
+        FROM ask
+        JOIN pg_namespace n ON n.nspname = ask.schema
+        JOIN pg_class c     ON c.relnamespace = n.oid AND c.relname = ask.name
+        WHERE c.relkind = 'v'
+        "#,
+        &[&schemas, &names],
+    ).await {
+        Ok(r) => r,
+        Err(e) => { tracing::debug!("fetch_view_oids: {e}"); return Vec::new(); }
+    };
+    let mut by_name: HashMap<(String, String), u32> = HashMap::new();
+    for row in &rows {
+        let schema: String = row.get(0);
+        let name: String = row.get(1);
+        let oid: u32 = row.get(2);
+        by_name.insert((schema, name), oid);
+    }
+    candidates.iter().filter_map(|(alias, schema, name)| {
+        let s = if schema.is_empty() { "public".to_string() } else { schema.clone() };
+        by_name.get(&(s, name.clone())).map(|oid| (alias.clone(), *oid))
+    }).collect()
+}
+
+async fn fetch_view_def(client: &Client, oid: u32) -> Option<String> {
+    let row = client.query_one("SELECT pg_get_viewdef($1::oid)", &[&oid]).await.ok()?;
+    Some(row.get::<_, String>(0))
 }
 
 // ---------- Derived tables / CTEs ----------
@@ -290,9 +462,9 @@ fn lower_select_columns(
 /// Three-state verdict from a lowered `Expr`. The downstream
 /// `decide_nullability` function combines this with `attnotnull` from
 /// RowDescription's base-column refs.
-pub fn verdict(expr: &Expr, policy: CastPolicy) -> Verdict {
-    if lowering::is_nullable(expr, policy) { Verdict::Nullable }
-    else if lowering::is_non_null(expr, policy) { Verdict::NotNullable }
+pub fn verdict(expr: &Expr) -> Verdict {
+    if lowering::is_nullable(expr) { Verdict::Nullable }
+    else if lowering::is_non_null(expr) { Verdict::NotNullable }
     else { Verdict::Unknown }
 }
 
