@@ -690,11 +690,8 @@ mod tests {
         // Sanity: param rendering changes must not regress column
         // rendering. The extra column keeps the SELECT-* short-circuit
         // from firing.
-        let tables = vec![ts(
-            "public",
-            "events",
-            vec![("at", "Spacetime", true), ("kind", "string", true)],
-        )];
+        let cols = vec![("at", "Spacetime", true), ("kind", "string", true)];
+        let tables = vec![ts("public", "events", cols)];
         let out = render_one_with(
             "SELECT at FROM events",
             vec![],
