@@ -276,12 +276,61 @@ fn render_row_type(
         // shape visible — `one`/`maybe`/`many`/call all type as `never`.
         return "never".to_string();
     }
+    // Recognise SELECT *-style expansions: a contiguous prefix of
+    // `cols` that matches a table's full column list (same names,
+    // same order, all referencing the same table, nullability
+    // unchanged from the interface). Emit the table type directly
+    // (`BillingUsers`) — and if there are trailing extra columns,
+    // intersect (`BillingUsers & { role: … }`).
+    if let Some((table_name, used)) = detect_star_prefix(cols, tables, names) {
+        let rest = &cols[used..];
+        if rest.is_empty() {
+            return table_name;
+        }
+        let rest_fields: Vec<String> = rest
+            .iter()
+            .map(|c| format!("{}: {}", quote_ident(&c.name),
+                render_typed(&c.ts_type, c.nullable, c.table_ref.as_ref(), names, tables)))
+            .collect();
+        return format!("{} & {{ {} }}", table_name, rest_fields.join("; "));
+    }
     let fields: Vec<String> = cols
         .iter()
         .map(|c| format!("{}: {}", quote_ident(&c.name),
             render_typed(&c.ts_type, c.nullable, c.table_ref.as_ref(), names, tables)))
         .collect();
     format!("{{ {} }}", fields.join("; "))
+}
+
+/// If `cols` begins with a contiguous run that matches a single
+/// table's full column list (same names in order, all with that
+/// table's `table_ref`, nullability matching the table interface),
+/// return the table's emitted name plus how many columns it consumed.
+fn detect_star_prefix(
+    cols: &[InferredColumn],
+    tables: &[TableSchema],
+    names: &TableNameMap,
+) -> Option<(String, usize)> {
+    let first = cols.first()?;
+    let r = first.table_ref.as_ref()?;
+    let table = tables.iter().find(|t| t.schema == r.schema && t.table == r.table)?;
+    if cols.len() < table.columns.len() {
+        return None;
+    }
+    let candidate = &cols[..table.columns.len()];
+    for (c, tc) in candidate.iter().zip(table.columns.iter()) {
+        if c.name != tc.name { return None; }
+        let tref = c.table_ref.as_ref()?;
+        if tref.schema != table.schema || tref.table != table.table || tref.column != tc.name {
+            return None;
+        }
+        // The column's nullability must match what `BillingUsers["col"]`
+        // would already encode — otherwise we'd lose the override info
+        // by switching to the interface form.
+        if c.nullable != !tc.not_null { return None; }
+    }
+    let name = names.lookup(&table.schema, &table.table)?;
+    Some((name.to_string(), table.columns.len()))
 }
 
 /// Shared rendering for query columns and INSERT/UPDATE params: prefer
