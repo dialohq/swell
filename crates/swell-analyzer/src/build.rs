@@ -4,7 +4,9 @@
 use crate::analyzed::{Analyzed, Expr, Output, Param, ResolvedCol};
 use crate::describe::{self, DescribedQuery};
 use crate::lowering::{self, lower};
-use crate::pg_util::{norm_schema, range_var_alias, select_stmts, string_parts, walk_from_tree};
+use crate::pg_util::{
+    norm_schema, range_var_alias, restarget_val, select_stmts, string_parts, walk_from_tree,
+};
 use crate::plan::{self, PlanWalk};
 use crate::query::TableColRef;
 use crate::scope::{DerivedColumn, Scope};
@@ -200,20 +202,11 @@ fn collect_setop_branch(s: &SelectStmt, out: &mut Vec<Vec<Node>>) {
 }
 
 fn res_target_val(n: &Node) -> Option<Node> {
-    match n.node.as_ref()? {
-        NB::ResTarget(rt) => rt.val.as_deref().cloned(),
-        _ => None,
-    }
+    restarget_val(n).cloned()
 }
 
 fn target_contains_star(n: &Node) -> bool {
-    let Some(NB::ResTarget(rt)) = n.node.as_ref() else {
-        return false;
-    };
-    let Some(val) = rt.val.as_deref() else {
-        return false;
-    };
-    let Some(NB::ColumnRef(cr)) = val.node.as_ref() else {
+    let Some(NB::ColumnRef(cr)) = restarget_val(n).and_then(|v| v.node.as_ref()) else {
         return false;
     };
     cr.fields

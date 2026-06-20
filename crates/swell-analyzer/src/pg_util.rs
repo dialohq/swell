@@ -46,6 +46,15 @@ pub fn string_parts(nodes: &[Node]) -> Vec<String> {
         .collect()
 }
 
+/// `ResTarget.val` for a target-list entry. None when the entry isn't
+/// a ResTarget or doesn't carry a value.
+pub fn restarget_val(n: &Node) -> Option<&Node> {
+    let NB::ResTarget(rt) = n.node.as_ref()? else {
+        return None;
+    };
+    rt.val.as_deref()
+}
+
 /// User-written alias on a `RangeVar`, falling back to the relation
 /// name when no alias was given.
 pub fn range_var_alias(rv: &RangeVar) -> String {

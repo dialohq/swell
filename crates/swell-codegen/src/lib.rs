@@ -289,31 +289,30 @@ fn detect_star_prefix(
     tables: &[TableSchema],
     names: &TableNameMap,
 ) -> Option<(String, usize)> {
-    let first = cols.first()?;
-    let r = first.table_ref.as_ref()?;
+    let r = cols.first()?.table_ref.as_ref()?;
     let table = tables
         .iter()
         .find(|t| t.schema == r.schema && t.table == r.table)?;
-    if cols.len() < table.columns.len() {
+    let n = table.columns.len();
+    if cols.len() < n {
         return None;
     }
-    let candidate = &cols[..table.columns.len()];
-    for (c, tc) in candidate.iter().zip(table.columns.iter()) {
-        if c.name != tc.name {
-            return None;
-        }
-        let tref = c.table_ref.as_ref()?;
-        if tref.schema != table.schema || tref.table != table.table || tref.column != tc.name {
-            return None;
-        }
-        // Nullability must agree with the interface; an override would
-        // be lost by switching to the interface form.
-        if c.nullable != !tc.not_null {
-            return None;
-        }
+    // Nullability must agree with the interface; an override would
+    // be lost by switching to the interface form.
+    let matches = cols[..n].iter().zip(&table.columns).all(|(c, tc)| {
+        c.name == tc.name
+            && c.nullable == !tc.not_null
+            && c.table_ref.as_ref().is_some_and(|t| {
+                t.schema == table.schema && t.table == table.table && t.column == tc.name
+            })
+    });
+    if !matches {
+        return None;
     }
-    let name = name_lookup(names, &table.schema, &table.table)?;
-    Some((name.to_string(), table.columns.len()))
+    Some((
+        name_lookup(names, &table.schema, &table.table)?.to_string(),
+        n,
+    ))
 }
 
 /// Prefer `Table["col"]` for known base columns, falling back to the
