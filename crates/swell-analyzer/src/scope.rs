@@ -136,15 +136,13 @@ impl Scope {
             .derived
             .iter()
             .filter_map(|(a, cols)| cols.iter().find(|c| c.name == col).map(|c| (a, c)));
-        if let Some((alias, dcol)) = derived_matches.next() {
-            if derived_matches.next().is_none() {
-                return Some(BareResolved {
-                    table: alias.clone(),
-                    alias: alias.clone(),
-                    not_null: crate::lowering::is_non_null(&dcol.expr),
-                    ..Default::default()
-                });
-            }
+        if let (Some((alias, dcol)), None) = (derived_matches.next(), derived_matches.next()) {
+            return Some(BareResolved {
+                table: alias.clone(),
+                alias: alias.clone(),
+                not_null: crate::lowering::is_non_null(&dcol.expr),
+                ..Default::default()
+            });
         }
         if self.non_null.len() == 1 {
             return Some(BareResolved {
