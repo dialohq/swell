@@ -2,59 +2,52 @@
 //! a verdict-ready node.
 
 use crate::analyzed::{Expr, FuncKind, Lit, ResolvedCol};
-use crate::pg_util::{funcname_last, string_parts};
+use crate::pg_util::{funcname_last, restarget_val, string_parts};
 use crate::query::TableColRef;
 use crate::scope::Scope;
 use pg_query::protobuf::{a_const::Val, node::Node as NB, Node, SubLinkType, TypeName};
 
-/// Aggregates that return `NULL` on empty input.
-const NULLABLE_AGGS: &[&str] = &[
-    "sum",
-    "avg",
-    "min",
-    "max",
-    "array_agg",
-    "json_agg",
-    "jsonb_agg",
-    "string_agg",
-    "bool_and",
-    "bool_or",
-];
-
-/// Functions guaranteed non-NULL by construction.
-const NEVER_NULL_FUNCS: &[&str] = &[
-    "count",
-    "row_number",
-    "rank",
-    "dense_rank",
-    "ntile",
-    "cume_dist",
-    "percent_rank",
-    "now",
-    "current_timestamp",
-    "current_date",
-    "current_time",
-    "localtimestamp",
-    "localtime",
-    "current_user",
-    "session_user",
-    "current_database",
-    "current_schema",
-    "current_setting",
-    "gen_random_uuid",
-    "uuid_generate_v1",
-    "uuid_generate_v4",
-    "pg_advisory_lock",
-    "pg_advisory_xact_lock",
-    "jsonb_build_object",
-    "json_build_object",
-    "jsonb_build_array",
-    "json_build_array",
-    "to_jsonb",
-    "to_json",
-    "row_to_json",
-    "array_to_json",
-];
+/// Classify a function name. `NeverNull`: provably non-null by
+/// construction. `NullableAgg`: aggregate that returns NULL on empty
+/// input. `Other`: user-defined / unknown.
+fn classify_func(name: &str) -> FuncKind {
+    match name {
+        "count"
+        | "row_number"
+        | "rank"
+        | "dense_rank"
+        | "ntile"
+        | "cume_dist"
+        | "percent_rank"
+        | "now"
+        | "current_timestamp"
+        | "current_date"
+        | "current_time"
+        | "localtimestamp"
+        | "localtime"
+        | "current_user"
+        | "session_user"
+        | "current_database"
+        | "current_schema"
+        | "current_setting"
+        | "gen_random_uuid"
+        | "uuid_generate_v1"
+        | "uuid_generate_v4"
+        | "pg_advisory_lock"
+        | "pg_advisory_xact_lock"
+        | "jsonb_build_object"
+        | "json_build_object"
+        | "jsonb_build_array"
+        | "json_build_array"
+        | "to_jsonb"
+        | "to_json"
+        | "row_to_json"
+        | "array_to_json" => FuncKind::NeverNull,
+        "sum" | "avg" | "min" | "max" | "array_agg" | "json_agg" | "jsonb_agg" | "string_agg"
+        | "bool_and" | "bool_or" => FuncKind::NullableAgg,
+        _ => FuncKind::Other,
+    }
+}
 
 pub fn lower(node: &Node, scope: &Scope) -> Expr {
     let Some(body) = node.node.as_ref() else {
@@ -74,20 +67,14 @@ pub fn lower(node: &Node, scope: &Scope) -> Expr {
             }
         }
         NB::TypeCast(tc) => {
-            let inner = tc
-                .arg
-                .as_deref()
-                .map(|a| lower(a, scope))
-                .unwrap_or(Expr::Unknown);
+            let inner = tc.arg.as_deref().map_or(Expr::Unknown, |a| lower(a, scope));
             let target_oid = tc
                 .type_name
                 .as_ref()
                 .and_then(|tn| resolve_typename_oid(tn, scope))
                 .unwrap_or(0);
-            let is_unsafe = match (inner_type_oid(&inner), target_oid) {
-                (Some(src), tgt) if tgt != 0 => scope.is_unsafe_cast(src, tgt),
-                _ => false,
-            };
+            let is_unsafe = matches!((inner_type_oid(&inner), target_oid),
+                (Some(src), tgt) if tgt != 0 && scope.is_unsafe_cast(src, tgt));
             Expr::Cast {
                 inner: Box::new(inner),
                 target_oid,
@@ -112,14 +99,10 @@ pub fn lower(node: &Node, scope: &Scope) -> Expr {
             if name == "coalesce" {
                 return Expr::Coalesce(args);
             }
-            let kind = if NEVER_NULL_FUNCS.contains(&name) {
-                FuncKind::NeverNull
-            } else if NULLABLE_AGGS.contains(&name) {
-                FuncKind::NullableAgg
-            } else {
-                FuncKind::Other
-            };
-            Expr::Func { kind, args }
+            Expr::Func {
+                kind: classify_func(name),
+                args,
+            }
         }
         NB::ColumnRef(cr) => lower_column_ref(cr, scope)
             .map(Expr::Column)
@@ -141,22 +124,19 @@ fn lower_sublink(sl: &pg_query::protobuf::SubLink, scope: &Scope) -> Expr {
             args: Vec::new(),
         },
         SubLinkType::ArraySublink => Expr::ArrayConstructor,
-        SubLinkType::ExprSublink => {
-            let Some(sub) = sl.subselect.as_deref() else {
-                return Expr::Unknown;
-            };
-            let Some(NB::SelectStmt(s)) = sub.node.as_ref() else {
-                return Expr::Unknown;
-            };
-            if !is_provably_one_row_select(s) {
-                return Expr::Unknown;
-            }
-            let first = s.target_list.first().and_then(|t| match t.node.as_ref()? {
+        SubLinkType::ExprSublink => sl
+            .subselect
+            .as_deref()
+            .and_then(|sub| match sub.node.as_ref()? {
+                NB::SelectStmt(s) if is_provably_one_row_select(s) => s.target_list.first(),
+                _ => None,
+            })
+            .and_then(|t| match t.node.as_ref()? {
                 NB::ResTarget(rt) => rt.val.as_deref(),
                 _ => None,
-            });
-            first.map(|n| lower(n, scope)).unwrap_or(Expr::Unknown)
-        }
+            })
+            .map(|n| lower(n, scope))
+            .unwrap_or(Expr::Unknown),
         _ => Expr::Unknown,
     }
 }
@@ -166,17 +146,10 @@ fn is_provably_one_row_select(s: &pg_query::protobuf::SelectStmt) -> bool {
         return false;
     }
     s.target_list.iter().all(|t| {
-        let Some(NB::ResTarget(rt)) = t.node.as_ref() else {
+        let Some(NB::FuncCall(fc)) = restarget_val(t).and_then(|v| v.node.as_ref()) else {
             return false;
         };
-        let Some(val) = rt.val.as_deref() else {
-            return false;
-        };
-        let Some(NB::FuncCall(fc)) = val.node.as_ref() else {
-            return false;
-        };
-        matches!(funcname_last(fc),
-            Some(n) if NEVER_NULL_FUNCS.contains(&n) || NULLABLE_AGGS.contains(&n))
+        funcname_last(fc).is_some_and(|n| !matches!(classify_func(n), FuncKind::Other))
     })
 }
 
@@ -222,32 +195,29 @@ fn lower_column_ref(cr: &pg_query::protobuf::ColumnRef, scope: &Scope) -> Option
     // pre-lowered child expression.
     if let Some(derived) = scope.derived(alias) {
         let child = derived.iter().find(|c| c.name == col)?;
-        return Some(ResolvedCol {
-            table_ref: TableColRef {
-                schema: String::new(),
-                table: alias.to_string(),
-                column: col.to_string(),
-            },
-            alias: alias.to_string(),
-            not_null: is_non_null(&child.expr),
-            typoid: 0,
-        });
+        return Some(alias_only(alias, col, is_non_null(&child.expr)));
     }
     // Literal source (VALUES, literal unnest): plan walk marked the
     // alias non-null. No (schema, table) known.
     if scope.is_non_null_alias(alias) && !scope.is_nullable_alias(alias) {
-        return Some(ResolvedCol {
-            table_ref: TableColRef {
-                schema: String::new(),
-                table: alias.to_string(),
-                column: col.to_string(),
-            },
-            alias: alias.to_string(),
-            not_null: true,
-            typoid: 0,
-        });
+        return Some(alias_only(alias, col, true));
     }
     None
+}
+
+/// `ResolvedCol` for a derived / literal-source alias where we know
+/// the alias but not the originating `(schema, table)`.
+fn alias_only(alias: &str, col: &str, not_null: bool) -> ResolvedCol {
+    ResolvedCol {
+        table_ref: TableColRef {
+            schema: String::new(),
+            table: alias.to_string(),
+            column: col.to_string(),
+        },
+        alias: alias.to_string(),
+        not_null,
+        typoid: 0,
+    }
 }
 
 /// Provably non-NULL at runtime. Used by Coalesce arg checks, CASE
