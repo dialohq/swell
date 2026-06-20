@@ -9,7 +9,9 @@
 //! Anything else falls back to the OID-based mapping (`unknown` for
 //! opaque jsonb, overridable via config or `as "col: T"`).
 
-use crate::pg_util::{norm_schema, quote_field, range_var_alias, string_parts, walk_from_tree};
+use crate::pg_util::{
+    norm_schema, quote_field, range_var_alias, restarget_val, string_parts, walk_from_tree,
+};
 use crate::ts_types::{Direction, TypeCatalog};
 use pg_query::protobuf::{node, FuncCall};
 use std::collections::HashMap;
@@ -44,13 +46,9 @@ pub async fn infer_shapes(
     let alias_oids = resolve_alias_oids(client, &build_alias_map(&select.from_clause)).await;
 
     for (i, t) in select.target_list.iter().take(n_targets).enumerate() {
-        let Some(node::Node::ResTarget(res)) = t.node.as_ref() else {
-            continue;
-        };
-        let Some(val) = &res.val else { continue };
         // Only infer at the top level when the target IS a JSON-building
         // FuncCall. Bare column refs flow through the OID path in lib.rs.
-        let Some(node::Node::FuncCall(fc)) = val.node.as_ref() else {
+        let Some(node::Node::FuncCall(fc)) = restarget_val(t).and_then(|v| v.node.as_ref()) else {
             continue;
         };
         if let Some(ts) = infer_func(client, catalog, &alias_oids, fc).await {
