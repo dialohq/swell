@@ -15,7 +15,8 @@ pub mod ts_types;
 pub mod query;
 
 pub use query::{
-    InferredColumn, InferredParam, InferredQuery, TableColRef, TableSchema, TableSchemaColumn,
+    InferredColumn, InferredParam, InferredQuery, RowVariant, TableColRef, TableSchema,
+    TableSchemaColumn,
 };
 pub use ts_types::{Direction, TypeCatalog, TypeOverride};
 
@@ -141,7 +142,7 @@ impl Analyzer {
             })
             .collect();
 
-        let columns = described.columns.iter().enumerate()
+        let columns: Vec<InferredColumn> = described.columns.iter().enumerate()
             .map(|(i, c)| {
                 let raw = null_hints.by_column.get(i).copied()
                     .unwrap_or(nullability::NullVerdict::Unknown);
@@ -177,7 +178,8 @@ impl Analyzer {
             })
             .collect();
 
-        Ok(InferredQuery { sql: sql.to_string(), params, columns })
+        let row_variants = build_row_variants(sql, &null_hints, &columns);
+        Ok(InferredQuery { sql: sql.to_string(), params, columns, row_variants })
     }
 
     /// Fetch the full column list for every requested `(schema, table)`
@@ -472,6 +474,182 @@ fn extract_ts_literal(expr: &str) -> Option<String> {
         return Some(value.to_string());
     }
     None
+}
+
+/// Build row-level variants for queries that produce a discriminated
+/// union. Currently two cases are handled:
+///
+///   - FULL OUTER JOIN: three variants — left-only, right-only, both.
+///     A column's side is inferred from its EXPLAIN expression's
+///     leading alias. The "absent" side's columns become literal
+///     `null`; the present side keeps the rendered TS type.
+///
+///   - GROUPING SETS (a, b, c, …): one variant per grouping set.
+///     Columns whose names appear in the set keep their type;
+///     un-grouped GROUP BY columns become literal `null`. Aggregates
+///     (count, sum, …) are untouched.
+fn build_row_variants(
+    sql: &str,
+    hints: &nullability::NullabilityHints,
+    columns: &[InferredColumn],
+) -> Vec<RowVariant> {
+    if let Some(v) = build_full_join_variants(hints, columns) {
+        return v;
+    }
+    if let Some(v) = build_grouping_sets_variants(sql, columns) {
+        return v;
+    }
+    Vec::new()
+}
+
+fn build_full_join_variants(
+    hints: &nullability::NullabilityHints,
+    columns: &[InferredColumn],
+) -> Option<Vec<RowVariant>> {
+    let (left, right) = hints.root_full_join.as_ref()?;
+    // Decide each column's source side via its EXPLAIN expression's
+    // leading alias. Columns whose source can't be determined are
+    // assumed present in all variants (no override).
+    use std::collections::BTreeMap;
+    let mut col_side: Vec<Option<bool>> = Vec::with_capacity(columns.len()); // Some(true) = left, Some(false) = right
+    for (i, c) in columns.iter().enumerate() {
+        let expr = hints.exprs.get(i).map(String::as_str).unwrap_or("");
+        let alias = expr_leading_alias(expr);
+        let stripped = alias.as_deref().map(strip_suffix_digits);
+        let side = match alias.as_deref() {
+            Some(a) if left.contains(a) => Some(true),
+            Some(a) if right.contains(a) => Some(false),
+            _ => match stripped.as_deref() {
+                Some(a) if left.contains(a) => Some(true),
+                Some(a) if right.contains(a) => Some(false),
+                _ => None,
+            },
+        };
+        let _ = c; // column itself isn't needed; side is from expr
+        col_side.push(side);
+    }
+    // Three variants: only-left (right→null), only-right (left→null),
+    // both (no overrides; falls back to base columns).
+    let mk = |on_left_null: bool, on_right_null: bool| -> RowVariant {
+        let mut ov: BTreeMap<String, String> = BTreeMap::new();
+        for (i, c) in columns.iter().enumerate() {
+            match col_side[i] {
+                Some(true)  if on_left_null  => { ov.insert(c.name.clone(), "null".into()); }
+                Some(false) if on_right_null => { ov.insert(c.name.clone(), "null".into()); }
+                _ => {}
+            }
+        }
+        RowVariant { overrides: ov }
+    };
+    let only_left  = mk(false, true);
+    let only_right = mk(true,  false);
+    let both       = mk(false, false);
+    Some(vec![only_left, only_right, both])
+}
+
+/// Pick the column name out of a `ColumnRef` node inside a GROUPING
+/// SETS entry. Multi-segment refs (`t.col`) take the last segment.
+fn column_ref_name_in_grouping(node: &pg_query::protobuf::Node) -> Option<String> {
+    use pg_query::protobuf::node::Node as NodeBody;
+    let cr = match node.node.as_ref()? {
+        NodeBody::ColumnRef(c) => c,
+        _ => return None,
+    };
+    let last = cr.fields.last()?;
+    match last.node.as_ref()? {
+        NodeBody::String(s) => Some(s.sval.clone()),
+        _ => None,
+    }
+}
+
+/// Extract `alias` from `expr`'s leading `<alias>.<col>` reference.
+fn expr_leading_alias(expr: &str) -> Option<String> {
+    let trimmed = expr.trim().trim_start_matches('(').trim_end_matches(')').trim();
+    let dot = trimmed.find('.')?;
+    let prefix = &trimmed[..dot];
+    let s = if prefix.starts_with('"') && prefix.ends_with('"') && prefix.len() >= 2 {
+        &prefix[1..prefix.len() - 1]
+    } else {
+        prefix
+    };
+    if s.is_empty() { return None; }
+    Some(s.to_string())
+}
+
+/// Detect `GROUP BY GROUPING SETS (...)` in the SQL and build one
+/// variant per set: columns named in the set keep their type, others
+/// (GROUP BY keys not in this set) become literal `null`. The
+/// detection uses pg_query's AST — `GroupingSet` nodes with
+/// `kind = GroupingSetSets`.
+fn build_grouping_sets_variants(
+    sql: &str,
+    columns: &[InferredColumn],
+) -> Option<Vec<RowVariant>> {
+    use pg_query::protobuf::{self, node::Node as NodeBody};
+    let parsed = pg_query::parse(sql).ok()?;
+    let raw = parsed.protobuf.stmts.first()?;
+    let stmt = raw.stmt.as_ref()?.node.as_ref()?;
+    let select = match stmt {
+        NodeBody::SelectStmt(s) => s,
+        _ => return None,
+    };
+    // Walk group_clause looking for a GroupingSet of kind Sets.
+    let sets = select.group_clause.iter()
+        .find_map(|n| match n.node.as_ref()? {
+            NodeBody::GroupingSet(gs) => {
+                if gs.kind == protobuf::GroupingSetKind::GroupingSetSets as i32 {
+                    Some(gs.content.clone())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        })?;
+    // Each entry in `content` is one grouping set. PG flattens the
+    // single-column parenthesised form `(col)` into a bare ColumnRef,
+    // and represents the empty set `()` as a nested GroupingSet of
+    // kind `GroupingSetEmpty`. Multi-column sets `(a, b)` come
+    // through as a List of ColumnRefs.
+    let mut variants_keys: Vec<std::collections::HashSet<String>> = Vec::new();
+    for entry in &sets {
+        let mut keys = std::collections::HashSet::new();
+        match entry.node.as_ref()? {
+            NodeBody::List(l) => {
+                for item in &l.items {
+                    if let Some(name) = column_ref_name_in_grouping(item) {
+                        keys.insert(name);
+                    }
+                }
+            }
+            NodeBody::ColumnRef(_) => {
+                if let Some(name) = column_ref_name_in_grouping(entry) {
+                    keys.insert(name);
+                }
+            }
+            NodeBody::GroupingSet(_) => {
+                // Empty grouping set `()` — keys stays empty (no
+                // grouping columns retained).
+            }
+            _ => continue,
+        }
+        variants_keys.push(keys);
+    }
+    if variants_keys.is_empty() { return None; }
+    // Union of all keys across all grouping sets — these are the
+    // "grouping columns" that may be NULL in some variant. Other
+    // columns (aggregates) stay unchanged.
+    let all_keys: std::collections::HashSet<String> = variants_keys.iter().flatten().cloned().collect();
+    let mut variants = Vec::with_capacity(variants_keys.len());
+    for keys in &variants_keys {
+        let mut ov = std::collections::BTreeMap::new();
+        for c in columns {
+            if all_keys.contains(&c.name) && !keys.contains(&c.name) {
+                ov.insert(c.name.clone(), "null".to_string());
+            }
+        }
+        variants.push(RowVariant { overrides: ov });
+    }
+    Some(variants)
 }
 
 fn strip_suffix_digits(s: &str) -> String {

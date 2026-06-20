@@ -1,10 +1,27 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InferredQuery {
     pub sql: String,
     pub params: Vec<InferredParam>,
     pub columns: Vec<InferredColumn>,
+    /// Row-level variants for queries that produce a discriminated
+    /// union — FULL OUTER JOIN (three "matched left / right / both"
+    /// shapes) and GROUPING SETS (one shape per grouping set, with
+    /// un-grouped keys nullable). Each variant is a per-column
+    /// TS-type override; columns not listed keep the type from
+    /// `columns`. Codegen renders `row_variants` as a TS union.
+    #[serde(default)]
+    pub row_variants: Vec<RowVariant>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RowVariant {
+    /// Column name → TS type for this variant. The final value
+    /// substitutes whatever `render_typed` would have emitted for
+    /// the base column.
+    pub overrides: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
