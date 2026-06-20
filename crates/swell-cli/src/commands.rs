@@ -227,11 +227,7 @@ async fn run_pipeline(cfg: &Config, opts: RunOpts) -> Result<RunSummary> {
 
     let dts = render(
         &inferred,
-        CodegenOptions {
-            runtime_module: "@dialo/swell",
-            extra_imports: &extra_imports,
-            tables: &tables,
-        },
+        CodegenOptions { extra_imports: &extra_imports, tables: &tables },
     );
     let out_path = cfg.root.join(&cfg.output.file);
     if let Some(parent) = out_path.parent() {
