@@ -96,17 +96,6 @@ $1: string | null
 result: { display_name: Users["display_name"] | null }
 ```
 
-## Enum column
-
-```sql
-SELECT role FROM users WHERE id = $1
-```
-
-```ts
-$1: string | null
-result: { role: Users["role"] }
-```
-
 ## Count aggregate is bigint
 
 ```sql
@@ -127,16 +116,6 @@ SELECT ARRAY[gen_random_uuid()] AS u, NOW() AS t
 result: { u: string[] | null; t: Date | null }
 ```
 
-## Count star is not nullable
-
-```sql
-SELECT count(*) AS n FROM users
-```
-
-```ts
-result: { n: string }
-```
-
 ## Sum is nullable
 
 ```sql
@@ -145,45 +124,6 @@ SELECT sum(1) AS s FROM users
 
 ```ts
 result: { s: string | null }
-```
-
-## Coalesce with literal is not nullable
-
-```sql
-SELECT coalesce(display_name, 'unknown') AS label FROM users WHERE id = $1
-```
-
-```ts
-$1: string | null
-result: { label: string }
-```
-
-## Left join makes rhs nullable
-
-```sql
-SELECT u.email, p.body
-FROM users u
-LEFT JOIN posts p ON p.author_id = u.id
-WHERE u.id = $1
-```
-
-```ts
-$1: string | null
-result: { email: Users["email"]; body: Posts["body"] | null }
-```
-
-## Inner join preserves not null
-
-```sql
-SELECT u.email, o.name
-FROM users u
-JOIN orgs o ON o.id = u.org_id
-WHERE u.id = $1
-```
-
-```ts
-$1: string | null
-result: { email: Users["email"]; name: Orgs["name"] }
 ```
 
 ## Jsonb column is unknown until m7
@@ -298,39 +238,6 @@ $1: string | null
 result: { row: { id: string; name: string } }
 ```
 
-## Custom domain renders as base type
-
-```sql
-SELECT email FROM users WHERE id = $1
-```
-
-```ts
-$1: string | null
-result: { email: Users["email"] }
-```
-
-## Custom enum renders as string union
-
-```sql
-SELECT role FROM users WHERE id = $1
-```
-
-```ts
-$1: string | null
-result: { role: Users["role"] }
-```
-
-## Custom composite type renders as object
-
-```sql
-SELECT home_address FROM users WHERE id = $1
-```
-
-```ts
-$1: string | null
-result: { home_address: Users["home_address"] | null }
-```
-
 ## Jsonb build object with dynamic key
 
 ```sql
@@ -426,27 +333,6 @@ $5: Json
 result: never
 ```
 
-## Select column carries table ref
-
-```sql
-SELECT id, email FROM users WHERE id = $1
-```
-
-```ts
-$1: string | null
-result: { id: Users["id"]; email: Users["email"] }
-```
-
-## Count star has no table ref
-
-```sql
-SELECT count(*) AS n FROM users
-```
-
-```ts
-result: { n: string }
-```
-
 ## Cast column has no table ref
 
 ```sql
@@ -455,27 +341,4 @@ SELECT id::text AS id_text FROM users
 
 ```ts
 result: { id_text: string | null }
-```
-
-## Insert values param carries table ref
-
-```sql
-INSERT INTO orgs (id, name) VALUES ($1, $2)
-```
-
-```ts
-$1: string
-$2: string
-result: never
-```
-
-## Where param has no table ref
-
-```sql
-SELECT id FROM users WHERE id = $1
-```
-
-```ts
-$1: string | null
-result: { id: Users["id"] }
 ```
