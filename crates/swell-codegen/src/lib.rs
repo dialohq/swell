@@ -61,9 +61,9 @@ pub fn render_query_compact(q: &InferredQuery, tables: &[TableSchema]) -> String
     let (_, names) = sorted_with_names(tables);
     let mut out = String::new();
     for (i, p) in q.params.iter().enumerate() {
-        out.push_str(&format!("${}: {}\n", i + 1, render_param_type(p)));
+        out += &format!("${}: {}\n", i + 1, render_param_type(p));
     }
-    out.push_str(&format!("result: {}\n", render_row(q, &names, tables)));
+    out += &format!("result: {}\n", render_row(q, &names, tables));
     out
 }
 
@@ -170,13 +170,9 @@ fn render_table_interface(t: &TableSchema, names: &TableNameMap) -> String {
     let mut out = format!("export interface {name} {{\n");
     for col in &t.columns {
         let nn = if col.not_null { "" } else { " | null" };
-        out.push_str(&format!(
-            "  {}: {}{nn};\n",
-            quote_ident(&col.name),
-            col.ts_type
-        ));
+        out += &format!("  {}: {}{nn};\n", quote_ident(&col.name), col.ts_type);
     }
-    out.push_str("}\n");
+    out += "}\n";
     out
 }
 
