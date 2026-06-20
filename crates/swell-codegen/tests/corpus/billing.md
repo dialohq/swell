@@ -657,6 +657,102 @@ $1: number | null
 result: { n: number | null }
 ```
 
+## Comment hint: notnull forces NOT NULL on a nullable expression
+
+`coalesce(display_name, '')` is nullable per the lowering verdict
+(coalesce of a nullable + a literal still keeps a non-null) but here
+we want to assert the override from a SQL comment too.
+
+```sql
+SELECT coalesce(display_name, '') /*@swell.notnull*/ AS d
+FROM billing.users WHERE id = $1
+```
+
+```ts
+$1: string | null
+result: { d: string }
+```
+
+## Comment hint: nullable forces nullable on a NOT NULL column
+
+A hint that disagrees with the schema drops the `Table["col"]`
+indexed access in favour of the raw TS type — the override should
+be visible in the generated `.d.ts` instead of buried under an
+interface lookup.
+
+```sql
+SELECT email --@swell.nullable
+FROM billing.users WHERE id = $1
+```
+
+```ts
+$1: string | null
+result: { email: string | null }
+```
+
+## Comment hint: type=T overrides the TS type
+
+```sql
+SELECT metadata /*@swell.type=UserMeta*/ AS meta
+FROM billing.users WHERE id = $1
+```
+
+```ts
+$1: string | null
+result: { meta: UserMeta }
+```
+
+## Comment hint: stacked notnull + type=T
+
+```sql
+SELECT metadata /*@swell.notnull, type=UserMeta*/ AS meta
+FROM billing.users WHERE id = $1
+```
+
+```ts
+$1: string | null
+result: { meta: UserMeta }
+```
+
+## Comment hint: attaches to the preceding column only
+
+```sql
+SELECT display_name --@swell.notnull
+, email FROM billing.users WHERE id = $1
+```
+
+```ts
+$1: string | null
+result: { display_name: string; email: BillingUsers["email"] }
+```
+
+## Comment hint: ignored inside a string literal
+
+The `--@swell.notnull` inside the string literal must NOT touch the
+column. The bare `text` literal stays inferred-non-null.
+
+```sql
+SELECT '--@swell.notnull' AS s
+```
+
+```ts
+result: { s: string }
+```
+
+## Comment hint: attaches to RETURNING target
+
+```sql
+INSERT INTO billing.users (email, password_hash)
+VALUES ($1, $2)
+RETURNING display_name /*@swell.notnull*/
+```
+
+```ts
+$1: string
+$2: string
+result: { display_name: string }
+```
+
 ## Union of two selects
 
 ```sql
