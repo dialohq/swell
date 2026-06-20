@@ -362,11 +362,10 @@ fn build_full_join_variants(
 }
 
 fn column_ref_name_in_grouping(node: &pg_query::protobuf::Node) -> Option<String> {
-    use pg_query::protobuf::node::Node as NB;
-    let NB::ColumnRef(cr) = node.node.as_ref()? else {
-        return None;
-    };
-    pg_util::string_parts(&cr.fields).pop()
+    match node.node.as_ref()? {
+        pg_query::protobuf::node::Node::ColumnRef(cr) => pg_util::string_parts(&cr.fields).pop(),
+        _ => None,
+    }
 }
 
 fn build_grouping_sets_variants(sql: &str, columns: &[InferredColumn]) -> Option<Vec<RowVariant>> {
