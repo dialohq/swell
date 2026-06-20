@@ -26,9 +26,9 @@
 //!   EXPLAIN option (PG 16+) so the planner doesn't constant-fold outer
 //!   joins away based on substituted parameter values.
 
-use crate::explain_expr::{
-    is_literal_non_null, leading_alias, parse_call_args, parse_literal_ts,
-};
+use crate::ast_classify;
+use crate::explain_expr::{is_literal_non_null, leading_alias};
+use pg_query::protobuf::{node::Node as NB, Node, SelectStmt};
 use serde::Deserialize;
 use std::collections::HashSet;
 use tokio_postgres::Client;
@@ -39,35 +39,6 @@ pub enum NullVerdict {
     NotNullable,
     Unknown,
 }
-
-/// Function-call expression prefixes (matched against the lowercased
-/// trimmed expression) that guarantee a non-NULL result. Covers
-/// `count(...)`, array literal constructors, never-null window funcs,
-/// time / system builtins, and JSON / row builders.
-const NEVER_NULL_PREFIXES: &[&str] = &[
-    "count(", "array[",
-    // Window funcs that always return a value over a non-empty partition.
-    "row_number(", "rank(", "dense_rank(", "ntile(",
-    "cume_dist(", "percent_rank(",
-    // Time / system builtins.
-    "now(", "current_timestamp", "current_date", "current_time",
-    "localtimestamp", "localtime",
-    "current_user", "session_user", "current_database(",
-    "current_schema(", "current_setting(",
-    "gen_random_uuid(", "uuid_generate_v1(", "uuid_generate_v4(",
-    "pg_advisory_lock(", "pg_advisory_xact_lock(",
-    // JSON / row builders — construct from args, never short-circuit.
-    "jsonb_build_object(", "json_build_object(",
-    "jsonb_build_array(", "json_build_array(",
-    "to_jsonb(", "to_json(", "row_to_json(", "array_to_json(",
-];
-
-/// Aggregate prefixes that return NULL on an empty input set.
-const NULLABLE_AGG_PREFIXES: &[&str] = &[
-    "sum(", "avg(", "min(", "max(",
-    "array_agg(", "json_agg(", "jsonb_agg(",
-    "string_agg(", "bool_and(", "bool_or(",
-];
 
 #[derive(Debug, Clone)]
 pub struct NullabilityHints {
@@ -157,11 +128,30 @@ pub async fn explain_nullability(
     // `count(*)` underneath.
     let named = collect_named_outputs(&plan);
 
+    // SQL-level target ASTs, indexed by output-column position. Used by
+    // the AST-first classification path — beats matching against the
+    // EXPLAIN deparse text because the parse tree disambiguates
+    // `coalesce(...)` from a user `coalesce_safe(...)`, recognises CASE
+    // / aggregate / never-null shapes structurally, and resolves
+    // `<alias>.<col>` without parsing strings. Falls back to the
+    // EXPLAIN-text classifier for SubPlan / CTE-resolved indirection.
+    let top_targets = extract_top_targets(sql);
+    let branch_targets = extract_setop_branch_targets(sql);
+
+    let ast_classify = |node: &Node| -> Option<NullVerdict> {
+        ast_classify::classify(node, &nullable_aliases, &non_null_aliases)
+    };
+
     if is_setop_node(&plan) {
         let branch_outputs = collect_setop_branches(&plan);
         for (branch_idx, outputs) in branch_outputs.iter().enumerate() {
             for (i, expr) in outputs.iter().take(n_columns).enumerate() {
-                let v = classify_expr(expr, &nullable_aliases, &non_null_aliases, &named);
+                let v = branch_targets.get(branch_idx)
+                    .and_then(|t| t.get(i)?.as_ref())
+                    .and_then(ast_classify)
+                    .unwrap_or_else(|| classify_expr(
+                        expr, &nullable_aliases, &non_null_aliases, &named,
+                    ));
                 by_column[i] = combine_setop(by_column[i], v, branch_idx > 0);
                 if branch_idx == 0 {
                     exprs[i] = expr.clone();
@@ -172,7 +162,11 @@ pub async fn explain_nullability(
     } else {
         let outputs = collect_topmost_output(&plan).unwrap_or_default();
         for (i, expr) in outputs.iter().take(n_columns).enumerate() {
-            by_column[i] = classify_expr(expr, &nullable_aliases, &non_null_aliases, &named);
+            by_column[i] = top_targets.get(i).and_then(|n| n.as_ref())
+                .and_then(ast_classify)
+                .unwrap_or_else(|| classify_expr(
+                    expr, &nullable_aliases, &non_null_aliases, &named,
+                ));
             exprs[i] = expr.clone();
             branches[i] = vec![expr.clone()];
         }
@@ -419,6 +413,16 @@ pub(crate) fn classify(expr: &str, nullable_aliases: &HashSet<String>) -> NullVe
 
 /// Like `classify` but also takes a set of aliases whose every output
 /// column is non-null (e.g. `unnest(<literal-array>)` results).
+///
+/// Reparses the EXPLAIN expression text as SQL and delegates to the
+/// AST classifier — that one walk handles FuncCall (aggregates,
+/// builders, window funcs, count), CoalesceExpr, CaseExpr, AArrayExpr,
+/// TypeCast, AConst, and ColumnRef structurally. The substring fallback
+/// below covers only the synthetic forms PG emits in EXPLAIN that
+/// don't reparse: planner-introduced `NULL::T`, `(SubPlan N)` or
+/// `<cte_alias>.<col>` indirection (handled one layer up in
+/// `classify_expr`), and quoted synthetic aliases like
+/// `"*VALUES*"."column1"`.
 pub(crate) fn classify_with(
     expr: &str,
     nullable_aliases: &HashSet<String>,
@@ -426,74 +430,23 @@ pub(crate) fn classify_with(
 ) -> NullVerdict {
     let trimmed = expr.trim();
 
-    // Planner-introduced NULL placeholders (rare here, but keep for safety).
+    if let Some(v) = ast_classify::try_classify_text(trimmed, nullable_aliases, non_null_aliases) {
+        return v;
+    }
+
+    // Substring fallback for EXPLAIN-only forms the parser can't take.
     if trimmed.starts_with("NULL::") || trimmed == "NULL" {
         return NullVerdict::Nullable;
     }
-
-    // Bare scalar literals (with optional `::cast` and outer parens):
-    // string `'foo'`, numeric `42`, boolean `true`/`false`.
     if is_literal_non_null(trimmed) {
         return NullVerdict::NotNullable;
     }
-
-    let lower = trimmed.to_ascii_lowercase();
-
-    if NEVER_NULL_PREFIXES.iter().any(|p| lower.starts_with(p)) {
-        return NullVerdict::NotNullable;
-    }
-    if NULLABLE_AGG_PREFIXES.iter().any(|p| lower.starts_with(p)) {
-        return NullVerdict::Nullable;
-    }
-
-    if lower.starts_with("case ") {
-        if !lower.contains(" else ") {
-            return NullVerdict::Nullable;
-        }
-        // CASE … ELSE <something> END. If the ELSE branch is a literal
-        // (number / quoted string / TRUE / FALSE), the whole expression
-        // is non-null. We don't bother proving the THEN branches non-null
-        // — even if they're nullable, the ELSE literal is still a fallback.
-        if let Some(else_idx) = lower.find(" else ") {
-            let after = &expr[else_idx + 6..]; // " else "
-            let trimmed_after = after.trim();
-            // First token after ELSE.
-            let first = trimmed_after.split_whitespace().next().unwrap_or("");
-            if first.starts_with('\'')
-                || first.chars().next().map(|c| c.is_ascii_digit() || c == '-' || c == '+').unwrap_or(false)
-                || first.eq_ignore_ascii_case("true")
-                || first.eq_ignore_ascii_case("false")
-            {
-                return NullVerdict::NotNullable;
-            }
-        }
-        return NullVerdict::Unknown;
-    }
-
-    if lower.starts_with("coalesce(") {
-        // Trailing literal makes the whole coalesce non-null.
-        let non_null = parse_call_args(trimmed, "coalesce")
-            .and_then(|args| args.last().cloned())
-            .map(|last| parse_literal_ts(&last).is_some())
-            .unwrap_or(false);
-        return if non_null { NullVerdict::NotNullable } else { NullVerdict::Unknown };
-    }
-
-    // Plain `<alias>.<col>` reference: nullable iff alias is on the
-    // nullable side of an outer join, non-null iff the alias is a
-    // known non-null source (literal `unnest`, all-literal Values
-    // Scan), otherwise unknown.
+    // `<alias>.<col>` text where the alias is one of PG's quoted
+    // synthetic forms (`"*VALUES*"."column1"`). Real ColumnRefs are
+    // already handled by the AST path above.
     if let Some(alias) = leading_alias(trimmed) {
-        if nullable_aliases.contains(alias) {
-            return NullVerdict::Nullable;
-        }
-        if non_null_aliases.contains(alias) {
-            return NullVerdict::NotNullable;
-        }
-    }
-    // Bare `<col>` from a single non-null source.
-    if non_null_aliases.len() == 1 && crate::explain_expr::is_simple_ident(trimmed) {
-        return NullVerdict::NotNullable;
+        if nullable_aliases.contains(alias) { return NullVerdict::Nullable; }
+        if non_null_aliases.contains(alias) { return NullVerdict::NotNullable; }
     }
 
     NullVerdict::Unknown
@@ -565,6 +518,77 @@ fn collect_named_outputs(plan: &PlanNode) -> NamedOutputs {
         }
     });
     out
+}
+
+// ------------- SQL-AST target extraction -------------
+
+/// Plain SELECT (not a setop tree) in pg_query's enum representation.
+const SETOP_NONE: i32 = pg_query::protobuf::SetOperation::SetopNone as i32;
+
+/// Per-column AST nodes for the top-level statement's output (SELECT
+/// target list, or INSERT/UPDATE/DELETE RETURNING list). Returns
+/// `Vec::new()` for set-op queries (handled by `extract_setop_branch_targets`)
+/// or any statement whose output isn't a flat target list.
+fn extract_top_targets(sql: &str) -> Vec<Option<Node>> {
+    let Some(stmt) = parse_first_stmt_body(sql) else { return Vec::new() };
+    let targets: Vec<Node> = match stmt {
+        // SetopNone (1) = a plain leaf SELECT, not a setop tree.
+        NB::SelectStmt(s) if s.op == SETOP_NONE => s.target_list,
+        NB::InsertStmt(ins) => ins.returning_list,
+        NB::UpdateStmt(upd) => upd.returning_list,
+        NB::DeleteStmt(del) => del.returning_list,
+        _ => return Vec::new(),
+    };
+    // Star targets (`SELECT *`, `SELECT u.*`) expand to N output columns
+    // but only one target_list entry; the rest of the per-column mapping
+    // shifts and gets misaligned. Drop the AST path for those queries —
+    // the substring fallback handles them fine.
+    if targets.iter().any(target_contains_star) {
+        return Vec::new();
+    }
+    targets.iter().map(res_target_val).collect()
+}
+
+fn target_contains_star(n: &Node) -> bool {
+    let Some(NB::ResTarget(rt)) = n.node.as_ref() else { return false };
+    let Some(val) = rt.val.as_deref() else { return false };
+    let Some(NB::ColumnRef(cr)) = val.node.as_ref() else { return false };
+    cr.fields.iter().any(|f| matches!(f.node.as_ref(), Some(NB::AStar(_))))
+}
+
+/// Per-branch per-column target AST nodes for set-op queries
+/// (UNION / INTERSECT / EXCEPT, recursive or not). Order matches the
+/// post-flatten order PG uses in EXPLAIN's `Append` children — a
+/// left-then-right walk of the SetOp tree.
+fn extract_setop_branch_targets(sql: &str) -> Vec<Vec<Option<Node>>> {
+    let Some(NB::SelectStmt(top)) = parse_first_stmt_body(sql) else { return Vec::new() };
+    if top.op == SETOP_NONE { return Vec::new(); }
+    let mut out = Vec::new();
+    collect_setop_branch_select(&top, &mut out);
+    out
+}
+
+fn collect_setop_branch_select(s: &SelectStmt, out: &mut Vec<Vec<Option<Node>>>) {
+    if s.op == SETOP_NONE {
+        out.push(s.target_list.iter().map(res_target_val).collect());
+        return;
+    }
+    if let Some(l) = s.larg.as_deref() { collect_setop_branch_select(l, out); }
+    if let Some(r) = s.rarg.as_deref() { collect_setop_branch_select(r, out); }
+}
+
+fn res_target_val(n: &Node) -> Option<Node> {
+    match n.node.as_ref()? {
+        NB::ResTarget(rt) => rt.val.as_deref().cloned(),
+        _ => None,
+    }
+}
+
+fn parse_first_stmt_body(sql: &str) -> Option<NB> {
+    let parsed = pg_query::parse(sql).ok()?;
+    let raw = parsed.protobuf.stmts.into_iter().next()?;
+    let boxed = raw.stmt?;
+    (*boxed).node
 }
 
 #[cfg(test)]

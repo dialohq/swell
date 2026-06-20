@@ -8,6 +8,7 @@
 pub mod describe;
 pub mod catalog;
 pub mod explain_expr;
+pub mod ast_classify;
 pub mod nullability;
 pub mod param_nullability;
 pub mod json_shape;
