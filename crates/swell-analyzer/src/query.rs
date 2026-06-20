@@ -61,6 +61,13 @@ pub struct TableSchema {
     pub schema: String,
     pub table: String,
     pub columns: Vec<TableSchemaColumn>,
+    /// Row-level CHECK refinements (Tier 3): each entry is one CHECK
+    /// constraint reduced to a union of variants. Codegen emits the
+    /// table type as `interface Base {...}` + `type Name = Base &
+    /// (variants) & (variants) & …` so TS computes the joint
+    /// constraint across multiple CHECKs.
+    #[serde(default)]
+    pub row_checks: Vec<TableRowCheck>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,4 +75,16 @@ pub struct TableSchemaColumn {
     pub name: String,
     pub ts_type: String,
     pub not_null: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TableRowCheck {
+    pub variants: Vec<TableRowVariant>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TableRowVariant {
+    /// column name → TS type rendering for this variant. Columns not
+    /// listed keep the base table column's type.
+    pub columns: BTreeMap<String, String>,
 }

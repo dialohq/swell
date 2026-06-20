@@ -153,6 +153,51 @@ CREATE TABLE feature_flags (
     locked_value  text NOT NULL CHECK (locked_value = 'on')
 );
 
+-- Tier 2: jsonb object shapes. AND-chain of jsonb_typeof / ?& / ->-typed
+-- predicates reduces to a TS object type.
+CREATE TABLE widgets (
+    id    uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    meta  jsonb NOT NULL CHECK (
+        jsonb_typeof(meta) = 'object'
+        AND meta ?& ARRAY['width', 'height']
+        AND jsonb_typeof(meta -> 'width') = 'number'
+        AND jsonb_typeof(meta -> 'height') = 'number'
+    )
+);
+
+-- Tier 3 col-level: OR over AND-chains reduces to a TS union.
+CREATE TABLE payloads (
+    id       uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    payload  jsonb NOT NULL CHECK (
+        (payload ->> 'kind' = 'text'
+         AND jsonb_typeof(payload -> 'body') = 'string')
+        OR (payload ->> 'kind' = 'image'
+            AND jsonb_typeof(payload -> 'url') = 'string')
+    )
+);
+
+-- Tier 3 row-level (num_nonnulls): exactly one of `email` / `phone`
+-- non-null per row → TS row variants.
+CREATE TABLE contacts (
+    id     uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    email  text,
+    phone  text,
+    CHECK (num_nonnulls(email, phone) = 1)
+);
+
+-- Tier 3 row-level (CASE): discriminant column pins per-branch
+-- refinement on the JSON config; ELSE false makes it exhaustive.
+CREATE TABLE field_configs (
+    id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    field_type  text NOT NULL,
+    config      jsonb NOT NULL,
+    CHECK (CASE
+        WHEN field_type = 'text'   THEN jsonb_typeof(config -> 'maxLength') = 'number'
+        WHEN field_type = 'select' THEN jsonb_typeof(config -> 'options')   = 'array'
+        ELSE false
+    END)
+);
+
 -- ---------- Functions ----------
 
 -- Sum of paid invoices in cents for a workspace. The `SET search_path`
@@ -230,6 +275,12 @@ export interface BillingAuditEvents {
   payload: Json;
   created_at: Date;
 }
+export interface BillingContactsBase {
+  id: string;
+  email: string | null;
+  phone: string | null;
+}
+export type BillingContacts = BillingContactsBase & ({ email: string; phone: null } | { email: null; phone: string });
 export interface BillingFeatureFlags {
   id: string;
   scope: "global" | "workspace" | "user";
@@ -237,6 +288,12 @@ export interface BillingFeatureFlags {
   pinned_to: "beta" | null;
   locked_value: "on";
 }
+export interface BillingFieldConfigsBase {
+  id: string;
+  field_type: string;
+  config: Json;
+}
+export type BillingFieldConfigs = BillingFieldConfigsBase & ({ config: { maxLength: number } & Record<string, Json>; field_type: "text" } | { config: { options: Json[] } & Record<string, Json>; field_type: "select" });
 export interface BillingInvoices {
   id: string;
   subscription_id: string;
@@ -255,6 +312,10 @@ export interface BillingMemberships {
   role: "owner" | "admin" | "member" | "viewer";
   joined_at: Date;
   invited_by: string | null;
+}
+export interface BillingPayloads {
+  id: string;
+  payload: { body: string; kind: "text" } & Record<string, Json> | { kind: "image"; url: string } & Record<string, Json>;
 }
 export interface BillingPlans {
   id: string;
@@ -295,6 +356,10 @@ export interface BillingUsers {
   created_at: Date;
   last_login_at: Date | null;
   metadata: Json;
+}
+export interface BillingWidgets {
+  id: string;
+  meta: { height: number; width: number } & Record<string, Json>;
 }
 export interface BillingWorkspaceOverview {
   workspace_id: string | null;
@@ -1362,4 +1427,70 @@ SELECT pinned_to FROM billing.feature_flags WHERE id = $1
 ```ts
 $1: string | null
 result: { pinned_to: BillingFeatureFlags["pinned_to"] }
+```
+
+## Check tier 2 narrows jsonb to an object shape
+
+```sql
+SELECT meta FROM billing.widgets WHERE id = $1
+```
+
+```ts
+$1: string | null
+result: { meta: BillingWidgets["meta"] }
+```
+
+## Check tier 3 col-level OR over AND-chains narrows jsonb to a union
+
+```sql
+SELECT payload FROM billing.payloads WHERE id = $1
+```
+
+```ts
+$1: string | null
+result: { payload: BillingPayloads["payload"] }
+```
+
+## Check tier 3 row-level num_nonnulls emits a row variant intersection
+
+```sql
+SELECT email, phone FROM billing.contacts WHERE id = $1
+```
+
+```ts
+$1: string | null
+result: { email: BillingContacts["email"]; phone: BillingContacts["phone"] }
+```
+
+## Check tier 3 row-level CASE discriminates field configs by type
+
+```sql
+SELECT field_type, config FROM billing.field_configs WHERE id = $1
+```
+
+```ts
+$1: string | null
+result: { field_type: BillingFieldConfigs["field_type"]; config: BillingFieldConfigs["config"] }
+```
+
+## Check tier 2 jsonb arrow expression on narrowed col loses table ref
+
+```sql
+SELECT meta -> 'width' AS width FROM billing.widgets WHERE id = $1
+```
+
+```ts
+$1: string | null
+result: { width: Json | null }
+```
+
+## Select star against table with row variants preserves intersection
+
+```sql
+SELECT * FROM billing.contacts WHERE id = $1
+```
+
+```ts
+$1: string | null
+result: BillingContacts
 ```

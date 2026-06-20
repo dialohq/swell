@@ -20,8 +20,8 @@ pub mod scope;
 pub mod ts_types;
 
 pub use query::{
-    InferredColumn, InferredParam, InferredQuery, RowVariant, TableColRef, TableSchema,
-    TableSchemaColumn,
+    InferredColumn, InferredParam, InferredQuery, RowVariant, TableColRef, TableRowCheck,
+    TableRowVariant, TableSchema, TableSchemaColumn,
 };
 pub use ts_types::{Direction, TypeCatalog, TypeOverride};
 
@@ -110,17 +110,16 @@ impl Analyzer {
             json_shape::infer_shapes(&self.client, &self.catalog, sql, described.columns.len())
                 .await;
 
-        // CHECK refinements per (schema, table) referenced by any
-        // base-column column_meta entry. Cached per table to avoid
-        // re-running the pg_constraint query for repeat references.
-        let mut check_refs: HashMap<(String, String), Vec<checks::ColRefinement>> = HashMap::new();
-        for m in column_meta.values() {
-            let key = (m.table_ref.schema.clone(), m.table_ref.table.clone());
-            if !check_refs.contains_key(&key) {
-                let v = checks::refinements_for(&self.client, &key.0, &key.1).await;
-                check_refs.insert(key, v);
-            }
-        }
+        // CHECK refinements for every distinct base table referenced
+        // by column_meta. Tier 1-3 column-level refinements feed into
+        // the per-query column rendering; row-level refinements are
+        // surfaced on `TableSchema.row_checks` by `table_schemas`.
+        let referenced_tables: Vec<(String, String)> = column_meta.values()
+            .map(|m| (m.table_ref.schema.clone(), m.table_ref.table.clone()))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        let check_refs = checks::fetch_refinements(&self.client, &referenced_tables).await;
 
         let params: Vec<InferredParam> = described
             .params
@@ -155,11 +154,9 @@ impl Analyzer {
                 let inferred_ts = infer_setop_literal_union(expr)
                     .or_else(|| json_shapes.by_target.get(i).cloned().flatten())
                     .unwrap_or(oid_ts);
-                let inferred_ts = refine_with_check(
-                    inferred_ts,
-                    column_meta.get(&(c.table_oid, c.attnum)),
-                    &check_refs,
-                );
+                let table_ref_opt = column_meta.get(&(c.table_oid, c.attnum))
+                    .map(|m| m.table_ref.clone());
+                let inferred_ts = refine_with_check(inferred_ts, table_ref_opt.as_ref(), &check_refs);
                 // SQLx-style override markers in the alias: `col!` forces
                 // NOT NULL, `col?` forces nullable.
                 let force_nullable = match c.name.chars().last() {
@@ -171,9 +168,7 @@ impl Analyzer {
                     name: c.name.clone(),
                     nullable: force_nullable.unwrap_or(inferred_nullable),
                     ts_type: inferred_ts,
-                    table_ref: column_meta
-                        .get(&(c.table_oid, c.attnum))
-                        .map(|m| m.table_ref.clone()),
+                    table_ref: table_ref_opt,
                 }
             })
             .collect();
@@ -233,40 +228,64 @@ impl Analyzer {
                 schema,
                 table,
                 columns,
+                row_checks: Vec::new(),
             })
             .collect();
-        // Apply CHECK refinements per table. A refinement only
-        // overrides the TS type when the base render is *narrowable*
-        // (string / number / boolean / Json) — domain renderings,
-        // enums, composites etc. stay intact.
+        // Apply CHECK refinements per table. Column-level (Tier 1-3)
+        // override `ts_type` when narrowable; row-level (Tier 3 cross-
+        // column) populate `row_checks` for codegen to render as
+        // `Base & (variants)`.
+        let pairs_for_checks: Vec<(String, String)> =
+            out.iter().map(|t| (t.schema.clone(), t.table.clone())).collect();
+        let col_refs = checks::fetch_refinements(&self.client, &pairs_for_checks).await;
         for t in &mut out {
-            apply_check_refinements(
-                &checks::refinements_for(&self.client, &t.schema, &t.table).await,
-                &mut t.columns,
-            );
+            apply_column_refinements(&t.schema, &t.table, &col_refs, &mut t.columns);
+        }
+        // Row-level CHECKs need the per-column base TS rendering so the
+        // `Exclude<Base, ...>` catch-all has its base type. Build that
+        // map first, then fetch and attach refinements.
+        let table_columns: HashMap<(String, String), HashMap<String, String>> = out.iter()
+            .map(|t| {
+                let cols = t.columns.iter()
+                    .map(|c| (c.name.clone(), column_ts_with_nullability(c)))
+                    .collect();
+                ((t.schema.clone(), t.table.clone()), cols)
+            })
+            .collect();
+        let row_refs = checks::fetch_row_refinements(
+            &self.client, &pairs_for_checks, &table_columns,
+        ).await;
+        for t in &mut out {
+            if let Some(refs) = row_refs.get(&(t.schema.clone(), t.table.clone())) {
+                t.row_checks = refs.iter().cloned().map(|r| r.into_table_check()).collect();
+            }
         }
         Ok(out)
     }
 }
 
-fn apply_check_refinements(refs: &[checks::ColRefinement], cols: &mut [TableSchemaColumn]) {
-    for r in refs {
-        if let Some(c) = cols.iter_mut().find(|c| c.name == r.column) {
-            if is_narrowable(&c.ts_type) {
-                // The row-type renderer appends ` | null` based on
-                // `not_null`, so strip an explicit trailing ` | null`
-                // from the refinement to avoid `"beta" | null | null`.
-                let refined = if !c.not_null {
-                    r.refined_ts
-                        .strip_suffix(" | null")
-                        .unwrap_or(&r.refined_ts)
-                        .to_string()
-                } else {
-                    r.refined_ts.clone()
-                };
-                c.ts_type = refined;
-            }
-        }
+fn column_ts_with_nullability(c: &TableSchemaColumn) -> String {
+    if c.not_null { c.ts_type.clone() } else { format!("{} | null", c.ts_type) }
+}
+
+fn apply_column_refinements(
+    schema: &str,
+    table: &str,
+    refs: &HashMap<(String, String, String), checks::Refinement>,
+    cols: &mut [TableSchemaColumn],
+) {
+    for c in cols.iter_mut() {
+        let key = (schema.to_string(), table.to_string(), c.name.clone());
+        let Some(r) = refs.get(&key) else { continue };
+        if !is_narrowable(&c.ts_type) { continue }
+        let Some(rendered) = r.render_ts() else { continue };
+        // Row-type renderer appends ` | null` on nullable cols, so
+        // strip an explicit trailing ` | null` to avoid duplication.
+        c.ts_type = if !c.not_null {
+            rendered.strip_suffix(" | null").unwrap_or(&rendered).to_string()
+        } else {
+            rendered
+        };
     }
 }
 
@@ -276,21 +295,16 @@ fn is_narrowable(ts: &str) -> bool {
 
 fn refine_with_check(
     ts: String,
-    meta: Option<&build::ResolvedBaseCol>,
-    refs: &HashMap<(String, String), Vec<checks::ColRefinement>>,
+    table_ref: Option<&TableColRef>,
+    refs: &HashMap<(String, String, String), checks::Refinement>,
 ) -> String {
     if !is_narrowable(&ts) {
         return ts;
     }
-    let Some(m) = meta else { return ts };
-    let key = (m.table_ref.schema.clone(), m.table_ref.table.clone());
-    let Some(refinements) = refs.get(&key) else {
-        return ts;
-    };
-    refinements
-        .iter()
-        .find(|r| r.column == m.table_ref.column)
-        .map(|r| r.refined_ts.clone())
+    let Some(tref) = table_ref else { return ts };
+    let key = (tref.schema.clone(), tref.table.clone(), tref.column.clone());
+    refs.get(&key)
+        .and_then(|r| r.render_ts())
         .unwrap_or(ts)
 }
 
