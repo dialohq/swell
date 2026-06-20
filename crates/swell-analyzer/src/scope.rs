@@ -115,10 +115,10 @@ impl Scope {
             .filter_map(|(a, t)| t.col_not_null(col).map(|nn| (a, t, nn)))
             .collect();
         if let Some((alias, table, _)) = matches.first() {
-            let same_table = matches
+            if !matches
                 .iter()
-                .all(|(_, t, _)| t.schema == table.schema && t.name == table.name);
-            if !same_table {
+                .all(|(_, t, _)| t.schema == table.schema && t.name == table.name)
+            {
                 return None;
             }
             let widening = matches.iter().any(|(a, _, _)| self.is_nullable_alias(a));

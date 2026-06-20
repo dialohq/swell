@@ -2,12 +2,13 @@
 //! tree → fully lowered `Analyzed` in one pass.
 
 use crate::analyzed::{Analyzed, Expr, Output, Param, ResolvedCol};
-use crate::describe::DescribedQuery;
+use crate::describe::{self, DescribedQuery};
 use crate::lowering::{self, lower};
 use crate::pg_util::{norm_schema, range_var_alias, select_stmts, string_parts, walk_from_tree};
-use crate::plan::PlanWalk;
+use crate::plan::{self, PlanWalk};
 use crate::query::TableColRef;
 use crate::scope::{DerivedColumn, Scope};
+use crate::{column_pairs, resolve_column_meta};
 use anyhow::Result;
 use pg_query::protobuf::{node::Node as NB, Node, SelectStmt};
 use std::collections::{HashMap, HashSet};
@@ -102,7 +103,7 @@ pub async fn build(
 
 fn lower_output(
     i: usize,
-    col: &crate::describe::DescribedColumn,
+    col: &describe::DescribedColumn,
     target_source: &TargetSource,
     scope: &Scope,
     column_meta: &ColumnMeta,
@@ -185,9 +186,9 @@ fn collect_setop_branch(s: &SelectStmt, out: &mut Vec<Vec<Node>>) {
         // Star inside a branch — empty branch defaults to Unknown.
         if s.target_list.iter().any(target_contains_star) {
             out.push(Vec::new());
-            return;
+        } else {
+            out.push(s.target_list.iter().filter_map(res_target_val).collect());
         }
-        out.push(s.target_list.iter().filter_map(res_target_val).collect());
         return;
     }
     if let Some(l) = s.larg.as_deref() {
@@ -241,18 +242,15 @@ fn analyze_view_refs<'a>(
             let Some(view_sql) = fetch_view_def(client, oid).await else {
                 continue;
             };
-            let described = match crate::describe::describe(client, &view_sql).await {
+            let described = match describe::describe(client, &view_sql).await {
                 Ok(d) => d,
                 Err(e) => {
                     tracing::debug!("describe view {oid}: {e}");
                     continue;
                 }
             };
-            let plan_walk = crate::plan::explain(client, &view_sql)
-                .await
-                .unwrap_or_default();
-            let column_meta =
-                crate::resolve_column_meta(client, &crate::column_pairs(&described)).await;
+            let plan_walk = plan::explain(client, &view_sql).await.unwrap_or_default();
+            let column_meta = resolve_column_meta(client, &column_pairs(&described)).await;
             let mut next_visited = visited.clone();
             next_visited.insert(oid);
             let analyzed = build(
