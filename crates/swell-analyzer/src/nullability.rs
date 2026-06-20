@@ -27,7 +27,7 @@
 //!   joins away based on substituted parameter values.
 
 use crate::ast_classify;
-use crate::explain_expr::{is_literal_non_null, leading_alias};
+use crate::explain_expr::leading_alias;
 use pg_query::protobuf::{node::Node as NB, Node, SelectStmt};
 use serde::Deserialize;
 use std::collections::HashSet;
@@ -324,11 +324,38 @@ fn collect_non_null_source_aliases(node: &PlanNode) -> HashSet<String> {
 
 /// Recognise `unnest(ARRAY[lit, lit, …])` or `unnest('{lit,lit}'::T[])`
 /// — the array argument is a bare literal so every yielded element is
-/// non-null.
+/// non-null. Reparses the EXPLAIN "Function Call" text as SQL and
+/// inspects the AST so we accept any cast / paren shape pg's deparse
+/// happens to choose without a textual prefix list.
 fn unnest_call_is_literal_array(call: &str) -> bool {
-    let Some(rest) = call.strip_prefix("unnest(") else { return false; };
-    let inner = rest.trim_end_matches(')').trim();
-    inner.starts_with("ARRAY[") || inner.starts_with("array[") || inner.starts_with('\'')
+    let Ok(parsed) = pg_query::parse(&format!("SELECT {call}")) else { return false };
+    let Some(raw) = parsed.protobuf.stmts.into_iter().next() else { return false };
+    let Some(boxed) = raw.stmt else { return false };
+    let Some(NB::SelectStmt(s)) = (*boxed).node else { return false };
+    let Some(target) = s.target_list.into_iter().next() else { return false };
+    let Some(NB::ResTarget(rt)) = target.node else { return false };
+    let val = match rt.val.map(|b| *b).and_then(|n| n.node) {
+        Some(v) => v,
+        None => return false,
+    };
+    let fc = match val {
+        NB::FuncCall(fc) => fc,
+        _ => return false,
+    };
+    if fc.funcname.last().and_then(|n| match &n.node {
+        Some(NB::String(s)) => Some(s.sval.as_str()),
+        _ => None,
+    }) != Some("unnest") { return false; }
+    // ARRAY[...] literal OR a bare string literal cast to an array.
+    fc.args.first().and_then(|n| n.node.as_ref()).is_some_and(|n| match n {
+        NB::AArrayExpr(_) => true,
+        NB::AConst(c) => matches!(&c.val, Some(pg_query::protobuf::a_const::Val::Sval(_))),
+        NB::TypeCast(tc) => tc.arg.as_deref()
+            .and_then(|a| a.node.as_ref())
+            .is_some_and(|n| matches!(n,
+                NB::AArrayExpr(_) | NB::AConst(_))),
+        _ => false,
+    })
 }
 
 // ------------- Plan tree types -------------
@@ -434,16 +461,9 @@ pub(crate) fn classify_with(
         return v;
     }
 
-    // Substring fallback for EXPLAIN-only forms the parser can't take.
-    if trimmed.starts_with("NULL::") || trimmed == "NULL" {
-        return NullVerdict::Nullable;
-    }
-    if is_literal_non_null(trimmed) {
-        return NullVerdict::NotNullable;
-    }
-    // `<alias>.<col>` text where the alias is one of PG's quoted
-    // synthetic forms (`"*VALUES*"."column1"`). Real ColumnRefs are
-    // already handled by the AST path above.
+    // EXPLAIN-only fallback for synthetic forms the SQL parser can't
+    // take — quoted synthetic aliases like `"*VALUES*"."column1"`.
+    // Real ColumnRefs are handled by the AST path above.
     if let Some(alias) = leading_alias(trimmed) {
         if nullable_aliases.contains(alias) { return NullVerdict::Nullable; }
         if non_null_aliases.contains(alias) { return NullVerdict::NotNullable; }
