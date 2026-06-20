@@ -312,7 +312,7 @@ async fn fetch_view_oids(
     }
     let schemas: Vec<&str> = candidates.iter().map(|(_, s, _)| norm_schema(s)).collect();
     let names: Vec<&str> = candidates.iter().map(|(_, _, n)| n.as_str()).collect();
-    let rows = match client
+    let Ok(rows) = client
         .query(
             r#"
         WITH ask(schema, name) AS (SELECT * FROM unnest($1::text[], $2::text[]))
@@ -325,12 +325,9 @@ async fn fetch_view_oids(
             &[&schemas, &names],
         )
         .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::debug!("fetch_view_oids: {e}");
-            return Vec::new();
-        }
+        .inspect_err(|e| tracing::debug!("fetch_view_oids: {e}"))
+    else {
+        return Vec::new();
     };
     let by_name: HashMap<(String, String), u32> = rows
         .iter()

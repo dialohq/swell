@@ -244,7 +244,7 @@ pub async fn resolve_column_meta(client: &Client, pairs: &[(u32, i16)]) -> build
     let unique: HashSet<(u32, i16)> = pairs.iter().copied().collect();
     let tables: Vec<i64> = unique.iter().map(|(t, _)| *t as i64).collect();
     let attnums: Vec<i32> = unique.iter().map(|(_, a)| *a as i32).collect();
-    let rows = match client
+    let Ok(rows) = client
         .query(
             r#"
         WITH ask(t, a) AS (SELECT * FROM unnest($1::bigint[], $2::int[]))
@@ -258,12 +258,9 @@ pub async fn resolve_column_meta(client: &Client, pairs: &[(u32, i16)]) -> build
             &[&tables, &attnums],
         )
         .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::debug!("resolve_column_meta: {e}");
-            return HashMap::new();
-        }
+        .inspect_err(|e| tracing::debug!("resolve_column_meta: {e}"))
+    else {
+        return HashMap::new();
     };
     let mut out = HashMap::with_capacity(rows.len());
     for row in &rows {
