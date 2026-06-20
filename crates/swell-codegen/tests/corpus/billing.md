@@ -260,7 +260,7 @@ export interface BillingWorkspaces {
   slug: string;
   name: string;
   billing_email: string;
-  billing_address: { line1: text; line2: text; city: text; region: text; country: text; postal: text } | null;
+  billing_address: { line1: string | null; line2: string | null; city: string | null; region: string | null; country: string | null; postal: string | null } | null;
   created_at: Date;
   deleted_at: Date | null;
   settings: Json;
@@ -394,7 +394,7 @@ RETURNING id, email, created_at, last_login_at
 ```ts
 $1: string
 $2: string
-result: { id: BillingUsers["id"]; email: BillingUsers["email"]; created_at: BillingUsers["created_at"]; last_login_at: BillingUsers["last_login_at"] | null }
+result: { id: BillingUsers["id"]; email: BillingUsers["email"]; created_at: BillingUsers["created_at"]; last_login_at: BillingUsers["last_login_at"] }
 ```
 
 ## Insert on conflict returning
@@ -424,7 +424,7 @@ RETURNING id, status, paid_at, amount_cents
 
 ```ts
 $1: string | null
-result: { id: BillingInvoices["id"]; status: BillingInvoices["status"]; paid_at: BillingInvoices["paid_at"] | null; amount_cents: BillingInvoices["amount_cents"] }
+result: { id: BillingInvoices["id"]; status: BillingInvoices["status"]; paid_at: BillingInvoices["paid_at"]; amount_cents: BillingInvoices["amount_cents"] }
 ```
 
 ## Update returning with override corrects nullability
@@ -699,8 +699,8 @@ result: { lookup: { [k: string]: string; role: "owner" | "admin" | "member" | "v
 
 ```sql
 SELECT jsonb_build_object(
-    'role', m.role
-    u.email, u.id,
+    'role', m.role,
+    u.email, u.id
 ) AS lookup
 FROM billing.users u JOIN billing.memberships m ON m.user_id = u.id
 WHERE u.id = $1
@@ -719,7 +719,7 @@ SELECT billing_address FROM billing.workspaces WHERE id = $1
 
 ```ts
 $1: string | null
-result: { billing_address: BillingWorkspaces["billing_address"] | null }
+result: { billing_address: BillingWorkspaces["billing_address"] }
 ```
 
 ## Enum column rendered as union
@@ -1110,7 +1110,7 @@ SELECT blackout_periods FROM billing.promotions WHERE id = $1
 
 ```ts
 $1: string | null
-result: { blackout_periods: BillingPromotions["blackout_periods"] | null }
+result: { blackout_periods: BillingPromotions["blackout_periods"] }
 ```
 
 ## Array of enum renders as paren union
@@ -1132,7 +1132,7 @@ SELECT id, code, code_lower FROM billing.promotions WHERE id = $1
 
 ```ts
 $1: string | null
-result: { id: BillingPromotions["id"]; code: BillingPromotions["code"]; code_lower: BillingPromotions["code_lower"] | null }
+result: { id: BillingPromotions["id"]; code: BillingPromotions["code"]; code_lower: BillingPromotions["code_lower"] }
 ```
 
 ## Generated stored column is nullable when expr can be
@@ -1143,7 +1143,7 @@ SELECT code_lower FROM billing.promotions WHERE id = $1
 
 ```ts
 $1: string | null
-result: { code_lower: BillingPromotions["code_lower"] | null }
+result: { code_lower: BillingPromotions["code_lower"] }
 ```
 
 ## Insert into table with identity does not require id param
@@ -1159,7 +1159,7 @@ $1: string
 $2: string
 $3: { lower: Date | null; upper: Date | null }
 $4: string
-result: { id: BillingPromotions["id"]; code: BillingPromotions["code"]; code_lower: BillingPromotions["code_lower"] | null }
+result: { id: BillingPromotions["id"]; code: BillingPromotions["code"]; code_lower: BillingPromotions["code_lower"] }
 ```
 
 ## Jsonb object agg emits record

@@ -1,55 +1,39 @@
 //! SQLx-style alias overrides.
 //!
-//! Users can attach a suffix to a column alias to override its inferred
-//! type or nullability:
+//! Users can attach a suffix to a quoted alias to override its inferred
+//! nullability:
 //!
 //!   - `as "col!"`        force NOT NULL
 //!   - `as "col?"`        force nullable
-//!   - `as "col: T"`      force TS type to `T`
-//!   - `as "col!: T"`     force NOT NULL and override type
 //!
-//! Postgres accepts these unusual characters because they're inside a
-//! quoted identifier. The driver returns them verbatim as the column name
-//! in `RowDescription`. We post-process column names to extract the
-//! override and rewrite the `name` / `nullable` / `ts_type` fields.
+//! Postgres accepts `!` / `?` inside quoted identifiers, so the driver
+//! returns the marker verbatim as the column name in `RowDescription`.
+//! The marker stays on the column name end-to-end — what the user
+//! wrote in SQL is what they see in the row type — but the analyzer
+//! still acts on it to widen / tighten the inferred nullability.
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Override {
+    /// The column's user-visible name. Preserves the trailing `!` / `?`
+    /// marker — Postgres surfaces it as the column name, so the row type
+    /// matches the SQL the user wrote.
     pub clean_name: String,
     pub force_nullable: Option<bool>,
-    pub force_ts_type: Option<String>,
 }
 
 /// Parse a column-name suffix into an override descriptor.
 ///
-/// Returns the bare-name and any flags found:
 ///   "id"            → { name: "id" }
-///   "label!"        → { name: "label", force_nullable: Some(false) }
-///   "label?"        → { name: "label", force_nullable: Some(true) }
-///   "label: Foo"    → { name: "label", force_ts_type: Some("Foo") }
-///   "label!: Foo"   → { name: "label", force_nullable: Some(false),
-///                       force_ts_type: Some("Foo") }
+///   "label!"        → { name: "label!", force_nullable: Some(false) }
+///   "label?"        → { name: "label?", force_nullable: Some(true) }
 pub fn parse(name: &str) -> Override {
     let mut o = Override::default();
-
-    // Split off `: T` first.
-    let (head, ts) = match name.find(": ") {
-        Some(i) => (&name[..i], Some(name[i + 2..].trim().to_string())),
-        None => (name, None),
-    };
-    o.force_ts_type = ts.filter(|s| !s.is_empty());
-
-    // Look for trailing ! or ? on the head.
-    if let Some(stripped) = head.strip_suffix('!') {
+    o.clean_name = name.to_string();
+    if name.ends_with('!') {
         o.force_nullable = Some(false);
-        o.clean_name = stripped.to_string();
-    } else if let Some(stripped) = head.strip_suffix('?') {
+    } else if name.ends_with('?') {
         o.force_nullable = Some(true);
-        o.clean_name = stripped.to_string();
-    } else {
-        o.clean_name = head.to_string();
     }
-
     o
 }
 
@@ -62,35 +46,19 @@ mod tests {
         let o = parse("email");
         assert_eq!(o.clean_name, "email");
         assert_eq!(o.force_nullable, None);
-        assert_eq!(o.force_ts_type, None);
     }
 
     #[test]
-    fn force_not_null() {
+    fn force_not_null_preserves_marker_in_name() {
         let o = parse("label!");
-        assert_eq!(o.clean_name, "label");
+        assert_eq!(o.clean_name, "label!");
         assert_eq!(o.force_nullable, Some(false));
     }
 
     #[test]
-    fn force_nullable() {
+    fn force_nullable_preserves_marker_in_name() {
         let o = parse("label?");
-        assert_eq!(o.clean_name, "label");
+        assert_eq!(o.clean_name, "label?");
         assert_eq!(o.force_nullable, Some(true));
-    }
-
-    #[test]
-    fn type_override() {
-        let o = parse("settings: UserSettings");
-        assert_eq!(o.clean_name, "settings");
-        assert_eq!(o.force_ts_type.as_deref(), Some("UserSettings"));
-    }
-
-    #[test]
-    fn type_and_not_null() {
-        let o = parse("payload!: { kind: \"x\" }");
-        assert_eq!(o.clean_name, "payload");
-        assert_eq!(o.force_nullable, Some(false));
-        assert_eq!(o.force_ts_type.as_deref(), Some("{ kind: \"x\" }"));
     }
 }
