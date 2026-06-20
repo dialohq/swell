@@ -33,12 +33,10 @@ pub async fn infer_shapes(
     let mut out = JsonShapeInferred {
         by_target: vec![None; n_targets],
     };
-    let parsed = match pg_query::parse(sql) {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::debug!("pg_query::parse failed for json_shape: {e}");
-            return out;
-        }
+    let Ok(parsed) =
+        pg_query::parse(sql).inspect_err(|e| tracing::debug!("parse failed for json_shape: {e}"))
+    else {
+        return out;
     };
     let Some(select) = crate::pg_util::select_stmts(&parsed.protobuf).next() else {
         return out;

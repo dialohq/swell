@@ -243,12 +243,11 @@ fn analyze_view_refs<'a>(
             let Some(view_sql) = fetch_view_def(client, oid).await else {
                 continue;
             };
-            let described = match describe::describe(client, &view_sql).await {
-                Ok(d) => d,
-                Err(e) => {
-                    tracing::debug!("describe view {oid}: {e}");
-                    continue;
-                }
+            let Ok(described) = describe::describe(client, &view_sql)
+                .await
+                .inspect_err(|e| tracing::debug!("describe view {oid}: {e}"))
+            else {
+                continue;
             };
             let plan_walk = plan::explain(client, &view_sql).await.unwrap_or_default();
             let column_meta = resolve_column_meta(client, &column_pairs(&described)).await;
