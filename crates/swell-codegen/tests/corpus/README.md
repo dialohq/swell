@@ -8,8 +8,13 @@ analyzer → codegen helpers).
 
 ## Suite format
 
-```md
-# [Setup](./analyzer.setup.sql)
+````md
+# Setup
+
+```sql
+DROP TABLE IF EXISTS users CASCADE;
+CREATE TABLE users (id uuid PRIMARY KEY, …);
+```
 
 # Common types
 
@@ -29,14 +34,14 @@ SELECT id, email FROM users WHERE id = $1
 $1: string | null
 result: { id: Users["id"]; email: Users["email"] }
 ```
-```
+````
 
 Sections, recognised by H1 headings:
 
-* **`# Setup`** — either an inline ` ```sql ` block applied to the DB,
-  or a markdown link `# [Setup](./_some.sql)` pointing to a sibling
-  file. Use the link form when the same fixture is shared across
-  multiple suites.
+* **`# Setup`** — an inline ` ```sql ` block applied to the DB before
+  any test in the suite runs. Markdown-link form `# [Setup](./x.sql)`
+  is also supported for fixtures shared across multiple suites
+  (resolved relative to the .md).
 * **`# Common types`** — the rendered table interfaces. Maintained
   automatically: when the schema changes, `CORPUS_PROMOTE=1` rewrites
   this block.
