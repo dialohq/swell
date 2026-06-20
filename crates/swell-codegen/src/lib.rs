@@ -59,12 +59,13 @@ pub fn render_table_interfaces(tables: &[TableSchema]) -> String {
 /// One `$N: type` line per param plus a `result: …` line, for the
 /// markdown corpus runner's per-test expected blocks.
 pub fn render_query_compact(q: &InferredQuery, tables: &[TableSchema]) -> String {
+    use std::fmt::Write;
     let (_, names) = sorted_with_names(tables);
     let mut out = String::new();
     for (i, p) in q.params.iter().enumerate() {
-        out.push_str(&format!("${}: {}\n", i + 1, render_param_type(p)));
+        let _ = writeln!(out, "${}: {}", i + 1, render_param_type(p));
     }
-    out.push_str(&format!("result: {}\n", render_row(q, &names, tables)));
+    let _ = writeln!(out, "result: {}", render_row(q, &names, tables));
     out
 }
 
@@ -474,6 +475,19 @@ mod tests {
         }
     }
 
+    fn render_one(sql: &str, params: Vec<InferredParam>, cols: Vec<InferredColumn>) -> String {
+        render(&[q(sql, params, cols)], CodegenOptions::default())
+    }
+
+    fn render_one_with(
+        sql: &str,
+        params: Vec<InferredParam>,
+        cols: Vec<InferredColumn>,
+        tables: &[TableSchema],
+    ) -> String {
+        render(&[q(sql, params, cols)], with_tables(tables))
+    }
+
     #[track_caller]
     fn assert_has(out: &str, needle: &str) {
         assert!(out.contains(needle), "expected `{needle}` in:\n{out}");
@@ -521,14 +535,7 @@ mod tests {
 
     #[test]
     fn entry_no_params() {
-        let out = render(
-            &[q(
-                "SELECT 1",
-                vec![],
-                vec![col("?column?", "number", false)],
-            )],
-            CodegenOptions::default(),
-        );
+        let out = render_one("SELECT 1", vec![], vec![col("?column?", "number", false)]);
         assert_has(
             &out,
             "    \"SELECT 1\": { params: []; row: { \"?column?\": number } };",
@@ -537,26 +544,20 @@ mod tests {
 
     #[test]
     fn entry_with_params() {
-        let out = render(
-            &[q(
-                "SELECT id FROM users WHERE id = $1",
-                vec![p("string", true)],
-                vec![col("id", "string", false)],
-            )],
-            CodegenOptions::default(),
+        let out = render_one(
+            "SELECT id FROM users WHERE id = $1",
+            vec![p("string", true)],
+            vec![col("id", "string", false)],
         );
         assert_has(&out, "    \"SELECT id FROM users WHERE id = $1\": { params: [string | null]; row: { id: string } };");
     }
 
     #[test]
     fn entry_write_only_query() {
-        let out = render(
-            &[q(
-                "DELETE FROM users WHERE id = $1",
-                vec![p("string", true)],
-                vec![],
-            )],
-            CodegenOptions::default(),
+        let out = render_one(
+            "DELETE FROM users WHERE id = $1",
+            vec![p("string", true)],
+            vec![],
         );
         assert_has(
             &out,
@@ -566,13 +567,10 @@ mod tests {
 
     #[test]
     fn multiline_query_renders_as_computed_template_literal_key() {
-        let out = render(
-            &[q(
-                "SELECT id, email\nFROM users\nWHERE id = $1",
-                vec![p("string", true)],
-                vec![col("id", "string", false)],
-            )],
-            CodegenOptions::default(),
+        let out = render_one(
+            "SELECT id, email\nFROM users\nWHERE id = $1",
+            vec![p("string", true)],
+            vec![col("id", "string", false)],
         );
         assert_has(
             &out,
@@ -582,13 +580,10 @@ mod tests {
 
     #[test]
     fn template_literal_escapes_backticks_and_interpolation() {
-        let out = render(
-            &[q(
-                "SELECT '`x`' AS a, '${y}' AS b\nFROM t",
-                vec![],
-                vec![col("a", "string", false)],
-            )],
-            CodegenOptions::default(),
+        let out = render_one(
+            "SELECT '`x`' AS a, '${y}' AS b\nFROM t",
+            vec![],
+            vec![col("a", "string", false)],
         );
         assert_has(&out, "\\`x\\`");
         assert_has(&out, "\\${y}");
@@ -620,26 +615,20 @@ mod tests {
 
     #[test]
     fn unknown_params_stay_unwidened() {
-        let out = render(
-            &[q(
-                "SELECT 1 WHERE $1::int = 1",
-                vec![p("unknown", true)],
-                vec![],
-            )],
-            CodegenOptions::default(),
+        let out = render_one(
+            "SELECT 1 WHERE $1::int = 1",
+            vec![p("unknown", true)],
+            vec![],
         );
         assert_has(&out, "params: [unknown];");
     }
 
     #[test]
     fn non_null_params_render_without_union() {
-        let out = render(
-            &[q(
-                "INSERT INTO t (a) VALUES ($1)",
-                vec![p("string", false)],
-                vec![],
-            )],
-            CodegenOptions::default(),
+        let out = render_one(
+            "INSERT INTO t (a) VALUES ($1)",
+            vec![p("string", false)],
+            vec![],
         );
         assert_has(&out, "params: [string];");
     }
@@ -684,16 +673,14 @@ mod tests {
                 ("owner_id", "string", false),
             ],
         )];
-        let out = render(
-            &[q(
-                "SELECT id, name FROM scheduler.campaigns WHERE id = $1",
-                vec![p("number", true)],
-                vec![
-                    col_from("id", "number", false, "scheduler", "campaigns"),
-                    col_from("name", "string", false, "scheduler", "campaigns"),
-                ],
-            )],
-            with_tables(&tables),
+        let out = render_one_with(
+            "SELECT id, name FROM scheduler.campaigns WHERE id = $1",
+            vec![p("number", true)],
+            vec![
+                col_from("id", "number", false, "scheduler", "campaigns"),
+                col_from("name", "string", false, "scheduler", "campaigns"),
+            ],
+            &tables,
         );
         assert_has(
             &out,
@@ -709,13 +696,11 @@ mod tests {
         // read shape into INSERT/UPDATE positions. Params keep the
         // analyzer's write-direction `ts_type` verbatim.
         let tables = vec![ts("public", "events", vec![("at", "Spacetime", true)])];
-        let out = render(
-            &[q(
-                "INSERT INTO events (at) VALUES ($1)",
-                vec![p_from("Date", false, "public", "events", "at")],
-                vec![],
-            )],
-            with_tables(&tables),
+        let out = render_one_with(
+            "INSERT INTO events (at) VALUES ($1)",
+            vec![p_from("Date", false, "public", "events", "at")],
+            vec![],
+            &tables,
         );
         assert_has(&out, "params: [Date]");
         assert_lacks(&out, "params: [Events[");
@@ -731,13 +716,11 @@ mod tests {
             "events",
             vec![("at", "Spacetime", true), ("kind", "string", true)],
         )];
-        let out = render(
-            &[q(
-                "SELECT at FROM events",
-                vec![],
-                vec![col_from("at", "Spacetime", false, "public", "events")],
-            )],
-            with_tables(&tables),
+        let out = render_one_with(
+            "SELECT at FROM events",
+            vec![],
+            vec![col_from("at", "Spacetime", false, "public", "events")],
+            &tables,
         );
         assert_has(&out, "row: { at: Events[\"at\"] }");
     }
@@ -747,13 +730,11 @@ mod tests {
         // LEFT JOIN widens a NOT NULL base column to nullable; codegen
         // keeps the table ref but unions with null.
         let tables = vec![ts("public", "posts", vec![("body", "string", true)])];
-        let out = render(
-            &[q(
-                "SELECT p.body FROM users u LEFT JOIN posts p ON p.author_id = u.id",
-                vec![],
-                vec![col_from("body", "string", true, "public", "posts")],
-            )],
-            with_tables(&tables),
+        let out = render_one_with(
+            "SELECT p.body FROM users u LEFT JOIN posts p ON p.author_id = u.id",
+            vec![],
+            vec![col_from("body", "string", true, "public", "posts")],
+            &tables,
         );
         assert_has(&out, "row: { body: Posts[\"body\"] | null }");
     }
