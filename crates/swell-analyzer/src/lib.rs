@@ -199,19 +199,17 @@ impl Analyzer {
         for row in &rows {
             let schema: String = row.get(0);
             let table: String = row.get(1);
-            let name: String = row.get(2);
             let oid: i64 = row.get(3);
             let typname: String = row.get(4);
-            let not_null: bool = row.get(5);
             grouped
                 .entry((schema, table))
                 .or_default()
                 .push(TableSchemaColumn {
-                    name,
+                    name: row.get(2),
                     ts_type: self
                         .catalog
                         .render_oid(oid as u32, &typname, Direction::Read),
-                    not_null,
+                    not_null: row.get(5),
                 });
         }
         Ok(grouped
