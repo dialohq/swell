@@ -350,14 +350,12 @@ async fn infer_column_ref(
     cr: &pg_query::protobuf::ColumnRef,
 ) -> Option<String> {
     let parts = string_parts(&cr.fields);
-    let (alias, col) = match parts.as_slice() {
-        // Bare column — unknown which table.
-        [_] => return None,
-        [a, c] | [_, .., a, c] => (a.clone(), c.clone()),
+    // Bare column — unknown which table.
+    let (a, c) = match parts.as_slice() {
+        [a, c] | [_, .., a, c] => (a, c),
         _ => return None,
     };
-    let table_oid = *alias_oids.get(&alias)?;
-    column_type(client, catalog, table_oid, &col).await
+    column_type(client, catalog, *alias_oids.get(a)?, c).await
 }
 
 /// Fetch `(attname, oid, notnull, typname)` for one column or every
