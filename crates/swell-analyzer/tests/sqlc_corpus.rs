@@ -67,7 +67,6 @@ fn split_named_queries(text: &str) -> Vec<(String, String)> {
 }
 
 struct TestDb {
-    db_name: String,
     url: String,
 }
 
@@ -90,8 +89,7 @@ impl TestDb {
             None => (root.as_str(), String::new()),
         };
         let base = path.rsplit_once('/').map(|(b, _)| b).unwrap_or(path);
-        let url = format!("{base}/{db_name}{query}");
-        Self { db_name, url }
+        Self { url: format!("{base}/{db_name}{query}") }
     }
 
     fn url(&self) -> &str { &self.url }

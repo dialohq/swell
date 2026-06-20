@@ -64,64 +64,45 @@ pub async fn infer(client: &Client, sql: &str, n_params: usize) -> Vec<ParamInfo
     }
 
     // One round-trip resolves every binding's (schema, table, column)
-    // to `attnotnull`. The previous version made three separate
-    // queries (table_oids, attnums, attnotnull); this CTE joins
-    // everything against the catalog at once.
-    let resolved = resolve_bindings(client, &bindings).await;
+    // to `attnotnull`.
+    let attnotnull = resolve_attnotnull(client, &bindings).await;
 
     for b in &bindings {
         if b.param_index == 0 || b.param_index > n_params {
             continue;
         }
-        let key = (normalize_schema(&b.schema), b.table.clone(), b.column.clone());
+        let schema = normalize_schema(&b.schema);
+        let key = (schema.clone(), b.table.clone(), b.column.clone());
         let entry = &mut out[b.param_index - 1];
-        let Some(info) = resolved.get(&key) else { continue };
+        let Some(&not_null) = attnotnull.get(&key) else { continue };
 
-        // Set table_ref for any binding to a known base column,
-        // regardless of nullability — codegen needs the link to
-        // render `Table["col"]` in the param tuple.
+        // Codegen needs the link to render `Table["col"]` in the param
+        // tuple for any binding to a known base column, regardless of
+        // nullability.
         if entry.table_ref.is_none() {
             entry.table_ref = Some(TableColRef {
-                schema: key.0.clone(),
-                table: b.table.clone(),
-                column: b.column.clone(),
+                schema, table: b.table.clone(), column: b.column.clone(),
             });
         }
-        if info.not_null {
-            entry.nullable = false;
-        }
+        if not_null { entry.nullable = false; }
     }
     out
 }
 
-struct ResolvedBinding {
-    not_null: bool,
-}
-
-/// Resolve every binding's `(schema, table, column)` to a per-column
-/// `attnotnull` bit in one round trip. Bindings whose table or column
-/// can't be resolved (typo, dropped schema, etc.) are absent — caller
-/// falls through to the conservative "nullable" default.
-async fn resolve_bindings(
+/// Resolve every binding's `(schema, table, column)` to its `attnotnull`
+/// bit in one round trip. Bindings whose table or column can't be
+/// resolved (typo, dropped schema) are absent — caller falls through to
+/// the conservative "nullable" default.
+async fn resolve_attnotnull(
     client: &Client, bindings: &[Binding],
-) -> HashMap<(String, String, String), ResolvedBinding> {
-    let mut unique: std::collections::HashSet<(String, String, String)> =
-        std::collections::HashSet::new();
-    for b in bindings {
-        unique.insert((normalize_schema(&b.schema), b.table.clone(), b.column.clone()));
-    }
-    let mut out = HashMap::new();
-    if unique.is_empty() {
-        return out;
-    }
-    let mut schemas = Vec::with_capacity(unique.len());
-    let mut tables  = Vec::with_capacity(unique.len());
-    let mut columns = Vec::with_capacity(unique.len());
-    for (s, t, c) in &unique {
-        schemas.push(s.clone());
-        tables.push(t.clone());
-        columns.push(c.clone());
-    }
+) -> HashMap<(String, String, String), bool> {
+    let unique: std::collections::HashSet<(String, String, String)> = bindings.iter()
+        .map(|b| (normalize_schema(&b.schema), b.table.clone(), b.column.clone()))
+        .collect();
+    if unique.is_empty() { return HashMap::new(); }
+    let schemas: Vec<&str> = unique.iter().map(|(s, _, _)| s.as_str()).collect();
+    let tables: Vec<&str>  = unique.iter().map(|(_, t, _)| t.as_str()).collect();
+    let columns: Vec<&str> = unique.iter().map(|(_, _, c)| c.as_str()).collect();
     let rows = match client.query(
         r#"
         WITH ask(schema, tbl, col) AS (
@@ -137,19 +118,9 @@ async fn resolve_bindings(
         &[&schemas, &tables, &columns],
     ).await {
         Ok(r) => r,
-        Err(e) => {
-            tracing::debug!("resolve_bindings: {e}");
-            return out;
-        }
+        Err(e) => { tracing::debug!("resolve_attnotnull: {e}"); return HashMap::new(); }
     };
-    for row in &rows {
-        let s: String = row.get(0);
-        let t: String = row.get(1);
-        let c: String = row.get(2);
-        let nn: bool = row.get(3);
-        out.insert((s, t, c), ResolvedBinding { not_null: nn });
-    }
-    out
+    rows.iter().map(|row| ((row.get(0), row.get(1), row.get(2)), row.get(3))).collect()
 }
 
 struct Binding {
