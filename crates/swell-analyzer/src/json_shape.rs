@@ -194,9 +194,8 @@ async fn infer_user_func_return(
         )
         .await
         .ok()??;
-    let oid: u32 = row.get(0);
     let typname: String = row.get(1);
-    let base = catalog.render_oid(oid, &typname, Direction::Read);
+    let base = catalog.render_oid(row.get(0), &typname, Direction::Read);
     Some(format!("{} | null", base))
 }
 
