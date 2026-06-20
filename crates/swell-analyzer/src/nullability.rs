@@ -110,11 +110,21 @@ pub async fn explain_nullability(
     let mut exprs = vec![String::new(); n_columns];
     let mut branches: Vec<Vec<String>> = vec![Vec::new(); n_columns];
 
+    // SubPlan and CTE name resolution. PG emits `(SubPlan N)` or
+    // `<cte_alias>.<col>` for scalar subqueries / CTE references; the
+    // actual underlying expressions live in InitPlan / SubPlan / CTE
+    // wrapper nodes inside `plans`. We pre-collect them so the
+    // per-column classification can look through `(SubPlan 1)` to the
+    // `count(*)` underneath.
+    let subplan_outputs = collect_subplan_outputs(&plan);
+    let cte_base_outputs = collect_cte_base_outputs(&plan);
+
     if is_setop_node(&plan) {
         let branch_outputs = collect_setop_branches(&plan);
         for (branch_idx, outputs) in branch_outputs.iter().enumerate() {
             for (i, expr) in outputs.iter().take(n_columns).enumerate() {
-                let v = classify_with(expr, &nullable_aliases, &non_null_aliases);
+                let v = classify_expr(expr, &nullable_aliases, &non_null_aliases,
+                    &subplan_outputs, &cte_base_outputs);
                 by_column[i] = combine_setop(by_column[i], v, branch_idx > 0);
                 if branch_idx == 0 {
                     exprs[i] = expr.clone();
@@ -125,7 +135,8 @@ pub async fn explain_nullability(
     } else {
         let outputs = collect_topmost_output(&plan).unwrap_or_default();
         for (i, expr) in outputs.iter().take(n_columns).enumerate() {
-            by_column[i] = classify_with(expr, &nullable_aliases, &non_null_aliases);
+            by_column[i] = classify_expr(expr, &nullable_aliases, &non_null_aliases,
+                &subplan_outputs, &cte_base_outputs);
             exprs[i] = expr.clone();
             branches[i] = vec![expr.clone()];
         }
@@ -318,6 +329,8 @@ struct PlanNode {
     function_name: Option<String>,
     #[serde(rename = "Function Call", default)]
     function_call: Option<String>,
+    #[serde(rename = "Subplan Name", default)]
+    subplan_name: Option<String>,
     #[serde(rename = "Values List", default)]
     #[allow(dead_code)]
     values_list: Option<serde_json::Value>,
@@ -532,6 +545,124 @@ pub(crate) fn classify_with(
     }
 
     NullVerdict::Unknown
+}
+
+/// Like `classify_with`, but also resolves `(SubPlan N)` and
+/// `<cte_alias>.<col>` references via the pre-collected plan maps.
+fn classify_expr(
+    expr: &str,
+    nullable_aliases: &HashSet<String>,
+    non_null_aliases: &HashSet<String>,
+    subplan_outputs: &std::collections::HashMap<String, Vec<String>>,
+    cte_base_outputs: &std::collections::HashMap<String, Vec<String>>,
+) -> NullVerdict {
+    let trimmed = expr.trim();
+    // `(SubPlan N)` — resolve to the SubPlan's Output.
+    let s = trimmed.trim_start_matches('(').trim_end_matches(')').trim();
+    if let Some(rest) = s.strip_prefix("SubPlan ") {
+        if let Some(outputs) = subplan_outputs.get(&format!("SubPlan {}", rest)) {
+            // Use the first output expression as representative.
+            if let Some(first) = outputs.first() {
+                return classify_with(first, nullable_aliases, non_null_aliases);
+            }
+        }
+    }
+    // `<cte_alias>.<col>` — resolve to the CTE's base case Output for
+    // that column (if known). The CTE's recursive branch is ignored;
+    // we assume the base case sets the floor for nullability and the
+    // recursive arithmetic preserves it.
+    if let Some(alias) = leading_alias(trimmed) {
+        if let Some(outputs) = cte_base_outputs.get(alias) {
+            // Best-effort: use the same expression text minus the
+            // alias prefix to match the underlying Output entry; if
+            // that fails just take the first one.
+            let resolved = outputs.first().cloned();
+            if let Some(r) = resolved {
+                return classify_with(&r, nullable_aliases, non_null_aliases);
+            }
+        }
+    }
+    classify_with(trimmed, nullable_aliases, non_null_aliases)
+}
+
+/// Find every `SubPlan <N>` definition in the plan tree and return
+/// its Output expressions. The PG planner names scalar subqueries
+/// `SubPlan 1`, `SubPlan 2`, … and refers to them in outer Outputs
+/// via `(SubPlan N)`.
+fn collect_subplan_outputs(
+    node: &PlanNode,
+) -> std::collections::HashMap<String, Vec<String>> {
+    let mut out = std::collections::HashMap::new();
+    collect_subplan_outputs_rec(node, &mut out);
+    out
+}
+
+fn collect_subplan_outputs_rec(
+    node: &PlanNode,
+    out: &mut std::collections::HashMap<String, Vec<String>>,
+) {
+    if let Some(name) = &node.subplan_name {
+        if name.starts_with("SubPlan ") || name.starts_with("InitPlan ") {
+            if let Some(o) = collect_topmost_output(node) {
+                out.entry(name.clone()).or_insert(o);
+            }
+        }
+    }
+    if let Some(children) = &node.plans {
+        for c in children {
+            collect_subplan_outputs_rec(c, out);
+        }
+    }
+}
+
+/// CTE name → base-case Output expressions. Recursive CTEs have two
+/// children under their Recursive Union; we only keep the
+/// non-recursive (Outer parent-relationship) branch's Output, on the
+/// assumption that the recursive branch's arithmetic preserves the
+/// base case's nullability.
+fn collect_cte_base_outputs(
+    node: &PlanNode,
+) -> std::collections::HashMap<String, Vec<String>> {
+    let mut out = std::collections::HashMap::new();
+    collect_cte_base_outputs_rec(node, &mut out);
+    out
+}
+
+fn collect_cte_base_outputs_rec(
+    node: &PlanNode,
+    out: &mut std::collections::HashMap<String, Vec<String>>,
+) {
+    if node.node_type.as_deref() == Some("Recursive Union") {
+        if let Some(name) = node.subplan_name.as_deref() {
+            // Subplan name is `CTE <name>`.
+            if let Some(cte_name) = name.strip_prefix("CTE ") {
+                if let Some(children) = &node.plans {
+                    for c in children {
+                        if c.parent_relationship.as_deref() == Some("Outer") {
+                            if let Some(o) = collect_topmost_output(c) {
+                                out.entry(cte_name.to_string()).or_insert(o);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Non-recursive CTE — single child plan tagged with `CTE <name>`.
+    if let Some(name) = &node.subplan_name {
+        if let Some(cte_name) = name.strip_prefix("CTE ") {
+            if node.node_type.as_deref() != Some("Recursive Union") {
+                if let Some(o) = collect_topmost_output(node) {
+                    out.entry(cte_name.to_string()).or_insert(o);
+                }
+            }
+        }
+    }
+    if let Some(children) = &node.plans {
+        for c in children {
+            collect_cte_base_outputs_rec(c, out);
+        }
+    }
 }
 
 fn is_simple_ident(s: &str) -> bool {
