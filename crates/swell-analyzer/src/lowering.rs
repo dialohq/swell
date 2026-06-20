@@ -231,17 +231,13 @@ fn lower_column_ref(cr: &pg_query::protobuf::ColumnRef, scope: &Scope) -> Option
 /// `Cast { is_unsafe }` blocks propagation — the specific
 /// `(source, target)` pair has a user-defined `castmethod='f'` that
 /// could return NULL on non-NULL input.
+#[rustfmt::skip]
 pub fn is_non_null(e: &Expr) -> bool {
     match e {
         Expr::Literal(_) | Expr::ArrayConstructor => true,
-        Expr::Cast {
-            inner, is_unsafe, ..
-        } => !*is_unsafe && is_non_null(inner),
+        Expr::Cast { inner, is_unsafe, .. } => !*is_unsafe && is_non_null(inner),
         Expr::Column(c) => c.not_null,
-        Expr::Func {
-            kind: FuncKind::NeverNull,
-            ..
-        } => true,
+        Expr::Func { kind: FuncKind::NeverNull, .. } => true,
         Expr::Coalesce(args) => args.iter().any(is_non_null),
         Expr::Case { has_else_non_null } => *has_else_non_null,
         Expr::SubQuery(a) => a.outputs.first().is_some_and(|o| is_non_null(&o.expr)),
@@ -252,20 +248,14 @@ pub fn is_non_null(e: &Expr) -> bool {
 
 /// Strong nullable verdict — overrides attnotnull when, e.g., an outer
 /// join widens a NOT NULL column or a user-defined cast might return NULL.
+#[rustfmt::skip]
 pub fn is_nullable(e: &Expr) -> bool {
     match e {
         Expr::Null => true,
-        Expr::Cast {
-            inner, is_unsafe, ..
-        } => is_nullable(inner) || *is_unsafe,
+        Expr::Cast { inner, is_unsafe, .. } => is_nullable(inner) || *is_unsafe,
         Expr::Column(c) => !c.not_null,
-        Expr::Func {
-            kind: FuncKind::NullableAgg,
-            ..
-        } => true,
-        Expr::Case {
-            has_else_non_null: false,
-        } => true,
+        Expr::Func { kind: FuncKind::NullableAgg, .. } => true,
+        Expr::Case { has_else_non_null: false } => true,
         Expr::SetOp(branches) => branches.iter().any(is_nullable),
         _ => false,
     }
