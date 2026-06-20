@@ -47,8 +47,11 @@ pub struct TypeCatalog {
     /// domain OID → (base type OID, base type name) — keep the name so that
     /// recursing through a domain resolves to the right TS scalar.
     pub domains: BTreeMap<u32, (u32, String)>,
-    /// composite type OID → list of (field_name, field_type_oid)
-    pub composites: BTreeMap<u32, Vec<(String, u32)>>,
+    /// composite type OID → list of (field_name, field_type_oid, field_type_name).
+    /// `field_type_name` is the `pg_type.typname` for the field's type, so
+    /// `render_oid` can map it to a TS type even when postgres-types
+    /// hasn't seen the OID (which happens for user-defined element types).
+    pub composites: BTreeMap<u32, Vec<(String, u32, String)>>,
     /// range / multirange OID → element type OID (and its name)
     pub ranges: BTreeMap<u32, (u32, String)>,
     /// array OID → element type OID (and its name) — covers user-defined
@@ -105,7 +108,7 @@ impl TypeCatalog {
             Kind::Domain(base) => self.render(base, dir),
             Kind::Composite(fields) => {
                 let inner: Vec<String> = fields.iter()
-                    .map(|f| format!("{}: {}", quote_field(f.name()), self.render(f.type_(), dir)))
+                    .map(|f| format!("{}: {} | null", quote_field(f.name()), self.render(f.type_(), dir)))
                     .collect();
                 format!("{{ {} }}", inner.join("; "))
             }
@@ -135,8 +138,14 @@ impl TypeCatalog {
             return self.render_oid(*base_oid, base_name, dir);
         }
         if let Some(fields) = self.composites.get(&oid) {
+            // Composite attributes are always nullable in Postgres
+            // (there's no NOT NULL on composite-type attributes), so
+            // each field renders as `<ts> | null`.
             let inner: Vec<String> = fields.iter()
-                .map(|(n, t_oid)| format!("{}: {}", quote_field(n), self.render_oid(*t_oid, "", dir)))
+                .map(|(n, t_oid, t_name)| {
+                    let ts = self.render_oid(*t_oid, t_name, dir);
+                    format!("{}: {} | null", quote_field(n), ts)
+                })
                 .collect();
             return format!("{{ {} }}", inner.join("; "));
         }

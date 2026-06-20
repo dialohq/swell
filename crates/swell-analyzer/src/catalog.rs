@@ -90,10 +90,12 @@ pub async fn load_type_catalog(client: &Client, schemas: &[String]) -> anyhow::R
     let rows = client
         .query(
             r#"
-            SELECT t.oid::oid AS type_oid, a.attname, a.atttypid::oid, a.attnum
+            SELECT t.oid::oid AS type_oid, a.attname, a.atttypid::oid,
+                   ft.typname AS field_type_name, a.attnum
             FROM pg_type t
             JOIN pg_class c ON c.oid = t.typrelid
             JOIN pg_attribute a ON a.attrelid = c.oid
+            JOIN pg_type ft ON ft.oid = a.atttypid
             JOIN pg_namespace n ON n.oid = t.typnamespace
             WHERE t.typtype = 'c'
               AND c.relkind = 'c'
@@ -109,7 +111,8 @@ pub async fn load_type_catalog(client: &Client, schemas: &[String]) -> anyhow::R
         let oid: u32 = row.get(0);
         let name: String = row.get(1);
         let field_oid: u32 = row.get(2);
-        cat.composites.entry(oid).or_default().push((name, field_oid));
+        let field_type_name: String = row.get(3);
+        cat.composites.entry(oid).or_default().push((name, field_oid, field_type_name));
     }
 
     // ------------ Range and multirange types ------------
