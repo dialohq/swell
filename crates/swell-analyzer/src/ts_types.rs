@@ -61,21 +61,8 @@ impl TypeCatalog {
         // For user types `postgres-types` sees opaque OIDs — route
         // through `render_oid` to pick up catalog info.
         match t.kind() {
-            Kind::Simple => {
-                if self.enums.contains_key(&t.oid())
-                    || self.domains.contains_key(&t.oid())
-                    || self.composites.contains_key(&t.oid())
-                    || self.ranges.contains_key(&t.oid())
-                {
-                    self.render_oid(t.oid(), t.name(), dir)
-                } else {
-                    simple_name_to_ts(t.name()).to_string()
-                }
-            }
-            Kind::Array(inner) => {
-                let inner_ts = self.render(inner, dir);
-                format!("{}[]", maybe_paren_for_array(&inner_ts))
-            }
+            Kind::Simple => self.render_oid(t.oid(), t.name(), dir),
+            Kind::Array(inner) => format!("{}[]", maybe_paren_for_array(&self.render(inner, dir))),
             Kind::Range(inner) => {
                 let inner_ts = self.render(inner, dir);
                 format!(
@@ -97,14 +84,8 @@ impl TypeCatalog {
                     .collect();
                 format!("{{ {} }}", inner.join("; "))
             }
-            Kind::Enum(labels) => {
-                if labels.is_empty() {
-                    "string".into()
-                } else {
-                    enum_union(labels)
-                }
-            }
-            Kind::Pseudo => "unknown".to_string(),
+            Kind::Enum(labels) if labels.is_empty() => "string".into(),
+            Kind::Enum(labels) => enum_union(labels),
             _ => "unknown".to_string(),
         }
     }
@@ -129,8 +110,11 @@ impl TypeCatalog {
             let inner: Vec<String> = fields
                 .iter()
                 .map(|(n, t_oid, t_name)| {
-                    let ts = self.render_oid(*t_oid, t_name, dir);
-                    format!("{}: {} | null", quote_field(n), ts)
+                    format!(
+                        "{}: {} | null",
+                        quote_field(n),
+                        self.render_oid(*t_oid, t_name, dir)
+                    )
                 })
                 .collect();
             return format!("{{ {} }}", inner.join("; "));
@@ -140,8 +124,10 @@ impl TypeCatalog {
             return format!("{{ lower: {} | null; upper: {} | null }}", elem, elem);
         }
         if let Some((elem_oid, elem_name)) = self.arrays.get(&oid) {
-            let elem = self.render_oid(*elem_oid, elem_name, dir);
-            return format!("{}[]", maybe_paren_for_array(&elem));
+            return format!(
+                "{}[]",
+                maybe_paren_for_array(&self.render_oid(*elem_oid, elem_name, dir))
+            );
         }
         simple_name_to_ts(name).to_string()
     }
@@ -180,16 +166,7 @@ fn maybe_paren_for_array(inner: &str) -> String {
     }
 }
 
-fn quote_field(name: &str) -> String {
-    let simple = !name.is_empty()
-        && name.chars().next().unwrap().is_ascii_alphabetic()
-        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-    if simple {
-        name.to_string()
-    } else {
-        format!("\"{}\"", name.replace('"', "\\\""))
-    }
-}
+use crate::pg_util::quote_field;
 
 #[cfg(test)]
 mod tests {

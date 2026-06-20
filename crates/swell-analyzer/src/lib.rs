@@ -12,6 +12,7 @@ pub mod describe;
 pub mod json_shape;
 pub mod lowering;
 pub mod param_nullability;
+pub mod pg_util;
 pub mod plan;
 pub mod query;
 pub mod scope;
@@ -113,6 +114,7 @@ impl Analyzer {
             &param_bindings,
             self.unsafe_casts.clone(),
             self.typname_to_oid.clone(),
+            &HashSet::new(),
         )
         .await?;
 
@@ -379,20 +381,13 @@ fn column_ref_name_in_grouping(node: &pg_query::protobuf::Node) -> Option<String
     let NB::ColumnRef(cr) = node.node.as_ref()? else {
         return None;
     };
-    let last = cr.fields.last()?;
-    match last.node.as_ref()? {
-        NB::String(s) => Some(s.sval.clone()),
-        _ => None,
-    }
+    pg_util::string_parts(&cr.fields).pop()
 }
 
 fn build_grouping_sets_variants(sql: &str, columns: &[InferredColumn]) -> Option<Vec<RowVariant>> {
     use pg_query::protobuf::{self, node::Node as NB};
     let parsed = pg_query::parse(sql).ok()?;
-    let raw = parsed.protobuf.stmts.first()?;
-    let NB::SelectStmt(select) = raw.stmt.as_ref()?.node.as_ref()? else {
-        return None;
-    };
+    let select = pg_util::select_stmts(&parsed.protobuf).next()?;
     // Find a GroupingSet of kind Sets in the group clause.
     let sets = select
         .group_clause
@@ -408,24 +403,18 @@ fn build_grouping_sets_variants(sql: &str, columns: &[InferredColumn]) -> Option
     // kind Empty; multi-column `(a, b)` is a List of ColumnRefs.
     let mut variants_keys: Vec<std::collections::HashSet<String>> = Vec::new();
     for entry in &sets {
-        let mut keys = std::collections::HashSet::new();
-        match entry.node.as_ref()? {
-            NB::List(l) => {
-                for item in &l.items {
-                    if let Some(name) = column_ref_name_in_grouping(item) {
-                        keys.insert(name);
-                    }
-                }
-            }
-            NB::ColumnRef(_) => {
-                if let Some(name) = column_ref_name_in_grouping(entry) {
-                    keys.insert(name);
-                }
-            }
-            NB::GroupingSet(_) => {} // empty set
+        let items: &[pg_query::protobuf::Node] = match entry.node.as_ref()? {
+            NB::List(l) => &l.items,
+            NB::ColumnRef(_) => std::slice::from_ref(entry),
+            NB::GroupingSet(_) => &[], // empty set
             _ => continue,
-        }
-        variants_keys.push(keys);
+        };
+        variants_keys.push(
+            items
+                .iter()
+                .filter_map(column_ref_name_in_grouping)
+                .collect(),
+        );
     }
     if variants_keys.is_empty() {
         return None;
@@ -455,16 +444,12 @@ fn decide_nullability(
     verdict: build::Verdict,
 ) -> bool {
     use build::Verdict::*;
-    if c.table_oid != 0 && c.attnum > 0 {
-        let base_nn = column_meta
-            .get(&(c.table_oid, c.attnum))
-            .map(|m| m.not_null)
-            .unwrap_or(false);
-        // (true, Nullable) → nullable (outer-join trumps attnotnull).
-        // (true, _)        → not nullable.
-        // (false, _)       → nullable.
-        !base_nn || matches!(verdict, Nullable)
-    } else {
-        !matches!(verdict, NotNullable)
+    if c.table_oid == 0 || c.attnum <= 0 {
+        return !matches!(verdict, NotNullable);
     }
+    // Outer-join widening (Nullable verdict) trumps attnotnull.
+    let base_nn = column_meta
+        .get(&(c.table_oid, c.attnum))
+        .is_some_and(|m| m.not_null);
+    !base_nn || matches!(verdict, Nullable)
 }
