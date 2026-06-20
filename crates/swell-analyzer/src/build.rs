@@ -127,25 +127,25 @@ fn lower_output(
     // Fallback: star expansion / shape we didn't recognise. Synthesise
     // `Expr::Column` from RowDescription's (table_oid, attnum) plus
     // the scope's pre-fetched attnotnull, applying outer-join widening.
-    if let Some(meta) = column_meta.get(&(col.table_oid, col.attnum)) {
-        let alias = scope
-            .find_alias(&meta.table_ref.schema, &meta.table_ref.table)
-            .unwrap_or("")
-            .to_string();
-        let widened = !alias.is_empty() && scope.is_nullable_alias(&alias);
-        let force_nn = !alias.is_empty() && scope.is_non_null_alias(&alias);
-        let typoid = scope
-            .resolve_alias(&alias)
-            .and_then(|t| t.col_typoid(&meta.table_ref.column))
-            .unwrap_or(0);
-        return Expr::Column(ResolvedCol {
-            table_ref: meta.table_ref.clone(),
-            alias,
-            not_null: (meta.not_null || force_nn) && !widened,
-            typoid,
-        });
-    }
-    Expr::Unknown
+    let Some(meta) = column_meta.get(&(col.table_oid, col.attnum)) else {
+        return Expr::Unknown;
+    };
+    let alias = scope
+        .find_alias(&meta.table_ref.schema, &meta.table_ref.table)
+        .unwrap_or("")
+        .to_string();
+    let widened = !alias.is_empty() && scope.is_nullable_alias(&alias);
+    let force_nn = !alias.is_empty() && scope.is_non_null_alias(&alias);
+    let typoid = scope
+        .resolve_alias(&alias)
+        .and_then(|t| t.col_typoid(&meta.table_ref.column))
+        .unwrap_or(0);
+    Expr::Column(ResolvedCol {
+        table_ref: meta.table_ref.clone(),
+        alias,
+        not_null: (meta.not_null || force_nn) && !widened,
+        typoid,
+    })
 }
 
 enum TargetSource {
