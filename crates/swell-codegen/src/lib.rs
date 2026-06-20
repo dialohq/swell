@@ -49,6 +49,43 @@ impl Default for CodegenOptions<'_> {
     }
 }
 
+/// Render just the table interfaces — no auto-gen banner, no swell
+/// imports, no Registry. Used by the markdown-corpus runner for the
+/// `# Common types` block: shared interfaces appear once per file
+/// rather than being repeated in every test's expected output.
+pub fn render_table_interfaces(tables: &[TableSchema]) -> String {
+    let mut sorted: Vec<&TableSchema> = tables.iter().collect();
+    sorted.sort_by(|a, b| (a.schema.as_str(), a.table.as_str())
+        .cmp(&(b.schema.as_str(), b.table.as_str())));
+    let names = TableNameMap::from(&sorted);
+    let mut out = String::new();
+    for t in &sorted {
+        out.push_str(&render_table_interface(t, &names));
+    }
+    out
+}
+
+/// Render a single query in compact form — one `$N: type` line per
+/// param, then a `result: …` line for the row. Used by the
+/// markdown-corpus runner so per-test expected blocks stay short:
+///
+///   ```ts
+///   $1: string | null
+///   result: { id: Users["id"] }
+///   ```
+pub fn render_query_compact(q: &InferredQuery, tables: &[TableSchema]) -> String {
+    let mut sorted: Vec<&TableSchema> = tables.iter().collect();
+    sorted.sort_by(|a, b| (a.schema.as_str(), a.table.as_str())
+        .cmp(&(b.schema.as_str(), b.table.as_str())));
+    let names = TableNameMap::from(&sorted);
+    let mut out = String::new();
+    for (i, p) in q.params.iter().enumerate() {
+        out.push_str(&format!("${}: {}\n", i + 1, render_param_type(p, &names)));
+    }
+    out.push_str(&format!("result: {}\n", render_row_type(&q.columns, &names)));
+    out
+}
+
 pub fn render(queries: &[InferredQuery], opts: CodegenOptions<'_>) -> String {
     let mut out = String::new();
     out.push_str(HEADER);
