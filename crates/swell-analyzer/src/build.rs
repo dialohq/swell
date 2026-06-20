@@ -4,7 +4,7 @@
 //! that produces a fully lowered `Analyzed`. No EXPLAIN-text reading
 //! downstream of this point.
 
-use crate::analyzed::{Analyzed, Expr, Output, Param, ResolvedCol};
+use crate::analyzed::{Analyzed, CastPolicy, Expr, Output, Param, ResolvedCol};
 use crate::describe::DescribedQuery;
 use crate::lowering::{self, lower};
 use crate::plan::PlanWalk;
@@ -34,6 +34,7 @@ pub async fn build(
     plan: PlanWalk,
     column_meta: &ColumnMeta,
     param_bindings: &HashMap<usize, TableColRef>,
+    cast_policy: CastPolicy,
 ) -> Result<Analyzed> {
     // Scope is the alias-resolution + nullability environment shared
     // across the whole lowering pass for this statement.
@@ -42,6 +43,7 @@ pub async fn build(
         plan.alias_to_table.clone(),
         plan.nullable_aliases.clone(),
         plan.non_null_aliases.clone(),
+        cast_policy,
     ).await?;
 
     // Derived tables (RangeSubselect in FROM) and CTEs lowered into
@@ -288,9 +290,9 @@ fn lower_select_columns(
 /// Three-state verdict from a lowered `Expr`. The downstream
 /// `decide_nullability` function combines this with `attnotnull` from
 /// RowDescription's base-column refs.
-pub fn verdict(expr: &Expr) -> Verdict {
-    if lowering::is_nullable(expr) { Verdict::Nullable }
-    else if lowering::is_non_null(expr) { Verdict::NotNullable }
+pub fn verdict(expr: &Expr, policy: CastPolicy) -> Verdict {
+    if lowering::is_nullable(expr, policy) { Verdict::Nullable }
+    else if lowering::is_non_null(expr, policy) { Verdict::NotNullable }
     else { Verdict::Unknown }
 }
 
