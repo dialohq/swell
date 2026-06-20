@@ -186,12 +186,15 @@ pub async fn load_type_catalog(client: &Client, schemas: &[String]) -> anyhow::R
 /// JSON helpers `json_shape.rs` transforms at AST level. We accept the
 /// `pg_catalog` builtin only when no user-defined function in the
 /// current `search_path` shadows the name.
-#[rustfmt::skip]
 const SAFE_BUILTIN_CANDIDATES: &[&str] = &[
-    "jsonb_build_object", "json_build_object",
-    "jsonb_agg", "json_agg",
-    "to_jsonb", "row_to_json",
-    "jsonb_object_agg", "json_object_agg",
+    "jsonb_build_object",
+    "json_build_object",
+    "jsonb_agg",
+    "json_agg",
+    "to_jsonb",
+    "row_to_json",
+    "jsonb_object_agg",
+    "json_object_agg",
 ];
 
 async fn load_safe_builtin_procs(client: &Client) -> anyhow::Result<BTreeMap<String, u32>> {

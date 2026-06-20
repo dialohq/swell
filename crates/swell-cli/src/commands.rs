@@ -25,11 +25,17 @@ pub struct RunOpts {
 
 impl RunOpts {
     // `gen` and `prepare` share semantics — DB-on, prune-on, require-off.
-    #[rustfmt::skip]
-    pub const GEN: Self = Self { allow_db: true, prune: true, require_cache: false };
+    pub const GEN: Self = Self {
+        allow_db: true,
+        prune: true,
+        require_cache: false,
+    };
     pub const PREPARE: Self = Self::GEN;
-    #[rustfmt::skip]
-    pub const CHECK: Self = Self { allow_db: false, prune: false, require_cache: true };
+    pub const CHECK: Self = Self {
+        allow_db: false,
+        prune: false,
+        require_cache: true,
+    };
 }
 
 pub struct RunSummary {
@@ -101,17 +107,24 @@ pub async fn watch(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
-#[rustfmt::skip]
 fn is_relevant(ev: &Event, cfg: &Config) -> bool {
-    if !matches!(ev.kind, EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)) {
+    if !matches!(
+        ev.kind,
+        EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)
+    ) {
         return false;
     }
     let cache_dir = cfg.cache.dir.to_string_lossy();
     let out_file = cfg.output.file.to_string_lossy();
     ev.paths.iter().any(|p| {
         let s = p.to_string_lossy();
-        if s.contains(&*cache_dir) || s.ends_with(&*out_file) { return false; }
-        matches!(p.extension().and_then(|e| e.to_str()), Some("ts" | "tsx" | "sql" | "toml"))
+        if s.contains(&*cache_dir) || s.ends_with(&*out_file) {
+            return false;
+        }
+        matches!(
+            p.extension().and_then(|e| e.to_str()),
+            Some("ts" | "tsx" | "sql" | "toml")
+        )
     })
 }
 
