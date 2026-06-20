@@ -40,11 +40,25 @@ pub enum NullVerdict {
 #[derive(Debug, Clone)]
 pub struct NullabilityHints {
     pub by_column: Vec<NullVerdict>,
+    /// Raw `Output` expressions from EXPLAIN VERBOSE, one per result
+    /// column, in column order. Exposed so the analyzer can do extra
+    /// per-expression checks (e.g. coalesce-with-non-null-arg) that
+    /// need access to attnotnull beyond what `classify` sees.
+    pub exprs: Vec<String>,
+    /// `alias → (schema, relation)` for every scan node in the plan.
+    /// Lets the analyzer turn an EXPLAIN expression like
+    /// `(users.email)` back into `(public, users, email)` so it can
+    /// look up `attnotnull` for the referenced base column.
+    pub alias_to_table: std::collections::HashMap<String, (String, String)>,
 }
 
 impl NullabilityHints {
     pub fn unknown(n: usize) -> Self {
-        Self { by_column: vec![NullVerdict::Unknown; n] }
+        Self {
+            by_column: vec![NullVerdict::Unknown; n],
+            exprs: vec![String::new(); n],
+            alias_to_table: std::collections::HashMap::new(),
+        }
     }
 }
 
@@ -73,12 +87,40 @@ pub async fn explain_nullability(
     let nullable_aliases = collect_nullable_aliases(&plan);
     // Topmost Output list aligned with RowDescription.
     let outputs = collect_topmost_output(&plan).unwrap_or_default();
+    // `alias → (schema, relation)` from every scan node; used by the
+    // caller to resolve EXPLAIN's `<alias>.<col>` back to a table column.
+    let alias_to_table = collect_alias_to_table(&plan);
 
     let mut by_column = vec![NullVerdict::Unknown; n_columns];
+    let mut exprs = vec![String::new(); n_columns];
     for (i, expr) in outputs.iter().take(n_columns).enumerate() {
         by_column[i] = classify(expr, &nullable_aliases);
+        exprs[i] = expr.clone();
     }
-    Ok(NullabilityHints { by_column })
+    Ok(NullabilityHints { by_column, exprs, alias_to_table })
+}
+
+/// Walk every Scan node and record its `(alias, schema, relation_name)`
+/// so the caller can resolve EXPLAIN's column qualifications.
+fn collect_alias_to_table(node: &PlanNode) -> std::collections::HashMap<String, (String, String)> {
+    let mut out = std::collections::HashMap::new();
+    collect_alias_to_table_rec(node, &mut out);
+    out
+}
+
+fn collect_alias_to_table_rec(
+    node: &PlanNode,
+    out: &mut std::collections::HashMap<String, (String, String)>,
+) {
+    if let (Some(alias), Some(rel)) = (&node.alias, &node.relation_name) {
+        let schema = node.schema.clone().unwrap_or_default();
+        out.entry(alias.clone()).or_insert((schema, rel.clone()));
+    }
+    if let Some(children) = &node.plans {
+        for c in children {
+            collect_alias_to_table_rec(c, out);
+        }
+    }
 }
 
 // ------------- Plan tree types -------------
@@ -98,6 +140,10 @@ struct PlanNode {
     plans: Option<Vec<PlanNode>>,
     #[serde(default)]
     alias: Option<String>,
+    #[serde(rename = "Relation Name", default)]
+    relation_name: Option<String>,
+    #[serde(default)]
+    schema: Option<String>,
     #[serde(rename = "Join Type", default)]
     join_type: Option<String>,
     #[serde(rename = "Parent Relationship", default)]
@@ -196,6 +242,34 @@ pub(crate) fn classify(expr: &str, nullable_aliases: &HashSet<String>) -> NullVe
     let lower = trimmed.to_ascii_lowercase();
 
     if lower.starts_with("count(") {
+        return NullVerdict::NotNullable;
+    }
+
+    // Array literal constructor — never null even when elements are.
+    if lower.starts_with("array[") {
+        return NullVerdict::NotNullable;
+    }
+
+    // Window functions that always return a value (the partition is
+    // non-empty by construction at the call site).
+    let non_null_window_funcs = [
+        "row_number(", "rank(", "dense_rank(", "ntile(",
+        "cume_dist(", "percent_rank(",
+    ];
+    if non_null_window_funcs.iter().any(|p| lower.starts_with(p)) {
+        return NullVerdict::NotNullable;
+    }
+
+    // SQL builtins / system functions that always produce a value.
+    let never_null_builtins = [
+        "now(", "current_timestamp", "current_date", "current_time",
+        "localtimestamp", "localtime",
+        "current_user", "session_user", "current_database(",
+        "current_schema(", "current_setting(",
+        "gen_random_uuid(", "uuid_generate_v1(", "uuid_generate_v4(",
+        "pg_advisory_lock(", "pg_advisory_xact_lock(",
+    ];
+    if never_null_builtins.iter().any(|p| lower.starts_with(p)) {
         return NullVerdict::NotNullable;
     }
 

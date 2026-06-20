@@ -82,7 +82,7 @@ pub fn render_query_compact(q: &InferredQuery, tables: &[TableSchema]) -> String
     for (i, p) in q.params.iter().enumerate() {
         out.push_str(&format!("${}: {}\n", i + 1, render_param_type(p, &names)));
     }
-    out.push_str(&format!("result: {}\n", render_row_type(&q.columns, &names)));
+    out.push_str(&format!("result: {}\n", render_row_type(&q.columns, &names, tables)));
     out
 }
 
@@ -122,7 +122,7 @@ pub fn render(queries: &[InferredQuery], opts: CodegenOptions<'_>) -> String {
     } else {
         out.push_str("  interface Registry {\n");
         for q in queries {
-            out.push_str(&render_entry(q, "    ", &names));
+            out.push_str(&render_entry(q, "    ", &names, opts.tables));
         }
         out.push_str("  }\n");
     }
@@ -213,10 +213,12 @@ fn render_table_interface(t: &TableSchema, names: &TableNameMap) -> String {
     out
 }
 
-fn render_entry(q: &InferredQuery, indent: &str, names: &TableNameMap) -> String {
+fn render_entry(
+    q: &InferredQuery, indent: &str, names: &TableNameMap, tables: &[TableSchema],
+) -> String {
     let key = render_key(&q.sql);
     let params = render_params_tuple(q, names);
-    let row = render_row_type(&q.columns, names);
+    let row = render_row_type(&q.columns, names, tables);
     format!("{indent}{key}: {{ params: {params}; row: {row} }};\n")
 }
 
@@ -266,7 +268,9 @@ fn render_param_type(p: &InferredParam, _names: &TableNameMap) -> String {
     }
 }
 
-fn render_row_type(cols: &[InferredColumn], names: &TableNameMap) -> String {
+fn render_row_type(
+    cols: &[InferredColumn], names: &TableNameMap, tables: &[TableSchema],
+) -> String {
     if cols.is_empty() {
         // `row: never` makes accidental use of a write-only statement's row
         // shape visible — `one`/`maybe`/`many`/call all type as `never`.
@@ -275,7 +279,7 @@ fn render_row_type(cols: &[InferredColumn], names: &TableNameMap) -> String {
     let fields: Vec<String> = cols
         .iter()
         .map(|c| format!("{}: {}", quote_ident(&c.name),
-            render_typed(&c.ts_type, c.nullable, c.table_ref.as_ref(), names)))
+            render_typed(&c.ts_type, c.nullable, c.table_ref.as_ref(), names, tables)))
         .collect();
     format!("{{ {} }}", fields.join("; "))
 }
@@ -284,17 +288,42 @@ fn render_row_type(cols: &[InferredColumn], names: &TableNameMap) -> String {
 /// `Table["col"]` whenever a base column is known, fall back to the
 /// inferred ts_type otherwise. `unknown` already admits null at the
 /// type level so we don't decorate it further.
+///
+/// When the column is a direct base-table reference, `Table["col"]`
+/// already encodes the column's natural nullability (via the table
+/// interface). Appending `| null` *only* when the rendered nullability
+/// diverges from the table's `attnotnull` — i.e. the override / outer-
+/// join inferences widened it — avoids `string | null | null` noise
+/// in the generated output.
 fn render_typed(
-    ts_type: &str, nullable: bool, table_ref: Option<&TableColRef>, names: &TableNameMap,
+    ts_type: &str,
+    nullable: bool,
+    table_ref: Option<&TableColRef>,
+    names: &TableNameMap,
+    tables: &[TableSchema],
 ) -> String {
     let base = table_ref
         .and_then(|r| indexed_table_ref(r, names))
         .unwrap_or_else(|| ts_type.to_string());
-    if nullable && base != "unknown" {
-        format!("{} | null", base)
-    } else {
-        base
+    // `unknown` already admits null at the type level.
+    if !nullable || base == "unknown" {
+        return base;
     }
+    // For indexed-access references, only append `| null` when the
+    // column wasn't already nullable in the underlying table — i.e.
+    // an outer join / override widened it past the interface's shape.
+    if let Some(r) = table_ref {
+        let base_already_nullable = tables
+            .iter()
+            .find(|t| t.schema == r.schema && t.table == r.table)
+            .and_then(|t| t.columns.iter().find(|c| c.name == r.column))
+            .map(|c| !c.not_null)
+            .unwrap_or(false);
+        if base_already_nullable {
+            return base;
+        }
+    }
+    format!("{base} | null")
 }
 
 fn indexed_table_ref(r: &TableColRef, names: &TableNameMap) -> Option<String> {

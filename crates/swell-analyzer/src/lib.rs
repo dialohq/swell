@@ -90,6 +90,16 @@ impl Analyzer {
             nullability::NullabilityHints::unknown(described.columns.len())
         });
 
+        // Extra verdict refinement: a `COALESCE(...)` whose args include any
+        // NOT-NULL base column is non-null. `classify` already handles the
+        // trailing-literal case; this handles `COALESCE(nullable_col,
+        // not_null_col)` by looking up attnotnull for each `<alias>.<col>`
+        // arg using the plan's scan map.
+        let coalesce_refined = refine_coalesce_non_null(
+            &self.client,
+            &null_hints,
+        ).await;
+
         let json_shapes = json_shape::infer_shapes(
             &self.client, &self.catalog, sql, described.columns.len(),
         ).await;
@@ -112,10 +122,13 @@ impl Analyzer {
 
         let columns = described.columns.iter().enumerate()
             .map(|(i, c)| {
-                let inferred_nullable = decide_nullability(
-                    c, &attnotnull, null_hints.by_column.get(i).copied()
-                        .unwrap_or(nullability::NullVerdict::Unknown),
-                );
+                let verdict = if coalesce_refined.get(i).copied().unwrap_or(false) {
+                    nullability::NullVerdict::NotNullable
+                } else {
+                    null_hints.by_column.get(i).copied()
+                        .unwrap_or(nullability::NullVerdict::Unknown)
+                };
+                let inferred_nullable = decide_nullability(c, &attnotnull, verdict);
                 let oid_ts = catalog::render_for_oid(&self.catalog, c.type_.oid(), &c.type_, Direction::Read);
                 let json_ts = json_shapes.by_target.get(i).cloned().flatten();
                 let inferred_ts = json_ts.unwrap_or(oid_ts);
@@ -127,7 +140,7 @@ impl Analyzer {
                     name: ov.clean_name,
                     oid: c.type_.oid(),
                     nullable: ov.force_nullable.unwrap_or(inferred_nullable),
-                    ts_type: ov.force_ts_type.unwrap_or(inferred_ts),
+                    ts_type: inferred_ts,
                     table_ref,
                 }
             })
@@ -246,6 +259,295 @@ async fn resolve_column_meta(
         });
     }
     out
+}
+
+/// For each output column whose EXPLAIN expression is `COALESCE(...)`,
+/// check whether any arg is a NOT NULL base column reference and return
+/// `true` for that column index. The caller upgrades the column's
+/// verdict to `NotNullable` when this returns true.
+///
+/// `classify` already handles the trailing-literal case (e.g.
+/// `coalesce(x, 'lit')`); this picks up the cases where the non-null
+/// guarantor is a NOT NULL column.
+async fn refine_coalesce_non_null(
+    client: &Client,
+    hints: &nullability::NullabilityHints,
+) -> Vec<bool> {
+    use std::collections::{HashMap, HashSet};
+    let mut out = vec![false; hints.exprs.len()];
+
+    // Collect every (schema, table) we need to know attnotnull for.
+    // Args may be `alias.col` or bare `col` (PG omits the alias when
+    // there's only one relation in scope). For the bare case we have
+    // to query the catalog for every scan table and figure out which
+    // one owns the column.
+    let mut needed: HashSet<(String, String)> = HashSet::new();
+    let mut per_column_args: Vec<Vec<String>> = vec![Vec::new(); hints.exprs.len()];
+    for (i, expr) in hints.exprs.iter().enumerate() {
+        let args = match coalesce_args(expr) {
+            Some(args) => args,
+            None => continue,
+        };
+        per_column_args[i] = args.clone();
+        for arg in &args {
+            match parse_column_ref(arg) {
+                ColumnRefShape::Qualified(alias, _) => {
+                    if let Some(table) = hints.alias_to_table.get(&alias) {
+                        needed.insert((table.0.clone(), table.1.clone()));
+                    }
+                }
+                ColumnRefShape::Bare(_) => {
+                    // Bare column — include every scan table; the lookup
+                    // disambiguates by which table actually has that column.
+                    for table in hints.alias_to_table.values() {
+                        needed.insert((table.0.clone(), table.1.clone()));
+                    }
+                }
+                ColumnRefShape::None => {}
+            }
+        }
+    }
+    if needed.is_empty() {
+        // No coalesce args reference a base column; only the literal
+        // path matters and `classify` already handled that.
+        // Still need to scan per-column args for pure literals (covered
+        // by classify, but be defensive).
+        for (i, args) in per_column_args.iter().enumerate() {
+            for arg in args {
+                if is_literal_token(arg) {
+                    out[i] = true;
+                    break;
+                }
+            }
+        }
+        return out;
+    }
+
+    // Bulk-query attnotnull for every (schema, table) once.
+    let schemas: Vec<String> = needed.iter().map(|p| p.0.clone()).collect();
+    let tables: Vec<String> = needed.iter().map(|p| p.1.clone()).collect();
+    let mut attnotnull: HashMap<(String, String, String), bool> = HashMap::new();
+    let rows_res = client.query(
+        r#"
+        WITH ask(schema, name) AS (SELECT * FROM unnest($1::text[], $2::text[]))
+        SELECT n.nspname::text, c.relname::text, a.attname::text, a.attnotnull
+        FROM ask
+        JOIN pg_namespace n ON n.nspname = ask.schema
+        JOIN pg_class c     ON c.relnamespace = n.oid AND c.relname = ask.name
+        JOIN pg_attribute a ON a.attrelid = c.oid
+        WHERE a.attnum > 0 AND NOT a.attisdropped
+        "#,
+        &[&schemas, &tables],
+    ).await;
+    if let Ok(rows) = rows_res {
+        for row in &rows {
+            attnotnull.insert(
+                (row.get(0), row.get(1), row.get(2)),
+                row.get::<_, bool>(3),
+            );
+        }
+    }
+
+    for (i, args) in per_column_args.iter().enumerate() {
+        for arg in args {
+            if is_literal_token(arg) {
+                out[i] = true;
+                break;
+            }
+            let resolved = match parse_column_ref(arg) {
+                ColumnRefShape::Qualified(alias, col) => hints.alias_to_table.get(&alias)
+                    .map(|(s, t)| (s.clone(), t.clone(), col)),
+                ColumnRefShape::Bare(col) => {
+                    // Pick the unique table that has a column by this name;
+                    // if multiple tables have it, leave as unknown.
+                    let mut hit: Option<(String, String, String)> = None;
+                    let mut ambiguous = false;
+                    for (schema, table) in hints.alias_to_table.values() {
+                        let k = (schema.clone(), table.clone(), col.clone());
+                        if attnotnull.contains_key(&k) {
+                            if hit.is_some() { ambiguous = true; break; }
+                            hit = Some(k);
+                        }
+                    }
+                    if ambiguous { None } else { hit }
+                }
+                ColumnRefShape::None => None,
+            };
+            if let Some(k) = resolved {
+                if attnotnull.get(&k).copied().unwrap_or(false) {
+                    out[i] = true;
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+enum ColumnRefShape {
+    Qualified(String, String),
+    Bare(String),
+    None,
+}
+
+/// Return the args of a top-level `coalesce(...)` expression in
+/// EXPLAIN-VERBOSE form. EXPLAIN sometimes wraps the whole expression
+/// in extra parens (`(coalesce(a, b))`); we step inward through
+/// balanced parens until we find the `coalesce` head.
+fn coalesce_args(expr: &str) -> Option<Vec<String>> {
+    let mut s = expr.trim();
+    // Peel one balanced `(...)` wrapper at a time.
+    loop {
+        if !s.starts_with('(') || !s.ends_with(')') { break; }
+        if !is_balanced_paren_wrapper(s) { break; }
+        s = &s[1..s.len() - 1];
+        s = s.trim();
+    }
+    let lower = s.to_ascii_lowercase();
+    if !lower.starts_with("coalesce(") {
+        return None;
+    }
+    let body_start = "coalesce(".len();
+    let bytes = s.as_bytes();
+    let mut depth = 1;
+    let mut i = body_start;
+    let mut in_string = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_string {
+            if b == b'\'' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' { i += 2; continue; }
+                in_string = false;
+            }
+        } else {
+            match b {
+                b'\'' => in_string = true,
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 { break; }
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    if depth != 0 || i >= bytes.len() {
+        return None;
+    }
+    Some(split_top_level_args(&s[body_start..i]))
+}
+
+/// True iff the leading `(` of `s` is closed by the very last `)` of
+/// `s` — i.e. the whole string is wrapped in one balanced pair.
+fn is_balanced_paren_wrapper(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    if bytes.is_empty() || bytes[0] != b'(' || *bytes.last().unwrap() != b')' {
+        return false;
+    }
+    let mut depth = 0;
+    let mut in_string = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_string {
+            if b == b'\'' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' { i += 2; continue; }
+                in_string = false;
+            }
+        } else {
+            match b {
+                b'\'' => in_string = true,
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 && i != bytes.len() - 1 {
+                        return false;
+                    }
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    depth == 0
+}
+
+fn split_top_level_args(body: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut cur = String::new();
+    let bytes = body.as_bytes();
+    let mut depth: i32 = 0;
+    let mut in_string = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_string {
+            cur.push(b as char);
+            if b == b'\'' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                    cur.push('\''); i += 2; continue;
+                }
+                in_string = false;
+            }
+        } else {
+            match b {
+                b'\'' => { in_string = true; cur.push('\''); }
+                b'(' => { depth += 1; cur.push('('); }
+                b')' => { depth -= 1; cur.push(')'); }
+                b',' if depth == 0 => {
+                    args.push(cur.trim().to_string());
+                    cur.clear();
+                }
+                c => cur.push(c as char),
+            }
+        }
+        i += 1;
+    }
+    if !cur.trim().is_empty() {
+        args.push(cur.trim().to_string());
+    }
+    args
+}
+
+/// Recognise a non-null literal token: quoted string, signed number,
+/// or `true` / `false`. Peels off a trailing `::cast` if any.
+fn is_literal_token(arg: &str) -> bool {
+    let s = arg.split("::").next().unwrap_or(arg).trim();
+    if s.is_empty() { return false; }
+    if s.starts_with('\'') { return true; }
+    let first = s.chars().next().unwrap();
+    if first == '-' || first == '+' || first.is_ascii_digit() {
+        return s.chars().skip(1).all(|c| c.is_ascii_digit() || c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-');
+    }
+    matches!(s.to_ascii_lowercase().as_str(), "true" | "false")
+}
+
+/// Parse a column reference, peeling off any `::cast` and bracketing
+/// parens. Returns whether it's a qualified `<alias>.<col>` or a bare
+/// `<col>` reference (PG omits the alias in EXPLAIN when there's only
+/// one relation in scope).
+fn parse_column_ref(arg: &str) -> ColumnRefShape {
+    let s = arg.split("::").next().unwrap_or(arg).trim();
+    let s = s.trim_start_matches('(').trim_end_matches(')').trim();
+    let is_ident = |s: &str| {
+        !s.is_empty()
+            && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            && !s.chars().next().unwrap().is_ascii_digit()
+    };
+    if let Some(dot) = s.find('.') {
+        let alias = &s[..dot];
+        let col = &s[dot + 1..];
+        if is_ident(alias) && is_ident(col) {
+            return ColumnRefShape::Qualified(alias.to_string(), col.to_string());
+        }
+        return ColumnRefShape::None;
+    }
+    if is_ident(s) {
+        ColumnRefShape::Bare(s.to_string())
+    } else {
+        ColumnRefShape::None
+    }
 }
 
 /// Combine attnotnull and EXPLAIN evidence into a final nullable verdict.
