@@ -46,7 +46,15 @@ async fn corpus() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus");
     assert!(root.is_dir(), "corpus dir missing at {}", root.display());
 
-    let files = sorted_files_with_ext(&root, "md");
+    let files: Vec<PathBuf> = sorted_files_with_ext(&root, "md")
+        .into_iter()
+        .filter(|p| {
+            // Skip docs / hidden helper files. Only real suite .md files
+            // get loaded.
+            let name = p.file_name().unwrap().to_string_lossy().to_string();
+            !name.starts_with('_') && !name.eq_ignore_ascii_case("README.md")
+        })
+        .collect();
     assert!(!files.is_empty(), "no .md suites under {}", root.display());
 
     let url = std::env::var("DATABASE_URL")
