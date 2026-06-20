@@ -657,6 +657,63 @@ $1: number | null
 result: { n: number | null }
 ```
 
+## Cast over not null column stays not null
+
+Validates that `RowDescription`'s lost (table_oid, attnum) link doesn't
+flip the inference to nullable. `email` is NOT NULL on `billing.users`,
+so `email::text` must stay non-null. The codegen recovers the
+`Table["col"]` reference through the cast wrapper too.
+
+```sql
+SELECT email::text FROM billing.users WHERE id = $1
+```
+
+```ts
+$1: string | null
+result: { email: BillingUsers["email"] }
+```
+
+## Aliased cast over not null column stays not null
+
+```sql
+SELECT u.email::text AS "userEmail" FROM billing.users u WHERE u.id = $1
+```
+
+```ts
+$1: string | null
+result: { userEmail: BillingUsers["email"] }
+```
+
+## Cast over nullable column stays nullable
+
+Negative control: a cast over a nullable base column must NOT be
+flipped to NOT NULL.
+
+```sql
+SELECT display_name::text FROM billing.users WHERE id = $1
+```
+
+```ts
+$1: string | null
+result: { display_name: BillingUsers["display_name"] }
+```
+
+## Chained casts preserve not null
+
+The outer `::varchar` is a real (non-no-op) cast, so `RowDescription`
+drops the (table_oid, attnum) link — but the lowered `Expr::Cast`
+chain still propagates `not_null` through both wrappers, so the
+column stays non-null even without the `Table["col"]` rewrite.
+
+```sql
+SELECT u.email::text::varchar FROM billing.users u WHERE u.id = $1
+```
+
+```ts
+$1: string | null
+result: { email: string }
+```
+
 ## Union of two selects
 
 ```sql
