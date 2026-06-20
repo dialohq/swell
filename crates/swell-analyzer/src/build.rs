@@ -206,12 +206,19 @@ fn res_target_val(n: &Node) -> Option<Node> {
     }
 }
 
-#[rustfmt::skip]
 fn target_contains_star(n: &Node) -> bool {
-    let Some(NB::ResTarget(rt)) = n.node.as_ref() else { return false };
-    let Some(val) = rt.val.as_deref() else { return false };
-    let Some(NB::ColumnRef(cr)) = val.node.as_ref() else { return false };
-    cr.fields.iter().any(|f| matches!(f.node.as_ref(), Some(NB::AStar(_))))
+    let Some(NB::ResTarget(rt)) = n.node.as_ref() else {
+        return false;
+    };
+    let Some(val) = rt.val.as_deref() else {
+        return false;
+    };
+    let Some(NB::ColumnRef(cr)) = val.node.as_ref() else {
+        return false;
+    };
+    cr.fields
+        .iter()
+        .any(|f| matches!(f.node.as_ref(), Some(NB::AStar(_))))
 }
 
 // ---------- View recursion ----------

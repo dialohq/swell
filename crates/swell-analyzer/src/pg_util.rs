@@ -19,12 +19,12 @@ pub fn walk_from_tree<F: FnMut(&Node)>(node: &Node, f: &mut F) {
 
 /// Top-level `SelectStmt` for every parsed statement.
 pub fn select_stmts(p: &ParseResult) -> impl Iterator<Item = &SelectStmt> {
-    p.stmts.iter().filter_map(|raw| {
-        let NB::SelectStmt(s) = raw.stmt.as_deref()?.node.as_ref()? else {
-            return None;
-        };
-        Some(s.as_ref())
-    })
+    p.stmts
+        .iter()
+        .filter_map(|raw| match raw.stmt.as_deref()?.node.as_ref()? {
+            NB::SelectStmt(s) => Some(s.as_ref()),
+            _ => None,
+        })
 }
 
 /// Unqualified last component of a function name (`pg_catalog.foo` → `foo`).
@@ -49,12 +49,12 @@ pub fn string_parts(nodes: &[Node]) -> Vec<String> {
 /// User-written alias on a `RangeVar`, falling back to the relation
 /// name when no alias was given.
 pub fn range_var_alias(rv: &RangeVar) -> String {
-    let from_alias = rv
-        .alias
+    rv.alias
         .as_ref()
         .map(|a| a.aliasname.as_str())
-        .filter(|s| !s.is_empty());
-    from_alias.unwrap_or(&rv.relname).to_string()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&rv.relname)
+        .to_string()
 }
 
 /// Empty schema name resolves to `public`.
