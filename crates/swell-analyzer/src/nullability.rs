@@ -119,10 +119,11 @@ pub async fn explain_nullability(
     // don't trigger the extended-protocol bind step.
     let stmt = format!("EXPLAIN (VERBOSE, FORMAT JSON, GENERIC_PLAN) {}", sql);
     let msgs = client.simple_query(&stmt).await?;
-    let json_text = extract_first_value(&msgs).unwrap_or_default();
-
-    let json: serde_json::Value = serde_json::from_str(&json_text).unwrap_or(serde_json::Value::Null);
-    let plans: Vec<ExplainEntry> = serde_json::from_value(json).unwrap_or_default();
+    let json_text = msgs.iter().find_map(|m| match m {
+        tokio_postgres::SimpleQueryMessage::Row(r) => r.get(0).map(str::to_string),
+        _ => None,
+    }).unwrap_or_default();
+    let plans: Vec<ExplainEntry> = serde_json::from_str(&json_text).unwrap_or_default();
     let plan = match plans.into_iter().next() {
         Some(p) => p.plan,
         None => return Ok(NullabilityHints::unknown(n_columns)),
@@ -564,17 +565,6 @@ fn collect_named_outputs(plan: &PlanNode) -> NamedOutputs {
         }
     });
     out
-}
-
-fn extract_first_value(msgs: &[tokio_postgres::SimpleQueryMessage]) -> Option<String> {
-    for m in msgs {
-        if let tokio_postgres::SimpleQueryMessage::Row(row) = m {
-            if let Some(s) = row.get(0) {
-                return Some(s.to_string());
-            }
-        }
-    }
-    None
 }
 
 #[cfg(test)]
