@@ -49,11 +49,10 @@ fn render_row(q: &InferredQuery, names: &TableNameMap, tables: &[TableSchema]) -
 /// by the markdown-corpus runner's `# Common types` block.
 pub fn render_table_interfaces(tables: &[TableSchema]) -> String {
     let (sorted, names) = sorted_with_names(tables);
-    let mut out = String::new();
-    for t in &sorted {
-        out.push_str(&render_table_interface(t, &names));
-    }
-    out
+    sorted
+        .iter()
+        .map(|t| render_table_interface(t, &names))
+        .collect()
 }
 
 /// One `$N: type` line per param plus a `result: …` line, for the
