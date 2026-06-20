@@ -139,21 +139,18 @@ impl Scope {
         if let Some((alias, dcol)) = derived_matches.next() {
             if derived_matches.next().is_none() {
                 return Some(BareResolved {
-                    schema: String::new(),
                     table: alias.clone(),
                     alias: alias.clone(),
                     not_null: crate::lowering::is_non_null(&dcol.expr),
-                    typoid: 0,
+                    ..Default::default()
                 });
             }
         }
         if self.non_null.len() == 1 {
             return Some(BareResolved {
-                schema: String::new(),
-                table: String::new(),
                 alias: self.non_null.iter().next()?.clone(),
                 not_null: true,
-                typoid: 0,
+                ..Default::default()
             });
         }
         None
@@ -178,6 +175,7 @@ impl Scope {
     }
 }
 
+#[derive(Default)]
 pub struct BareResolved {
     pub schema: String,
     pub table: String,
