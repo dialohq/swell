@@ -71,40 +71,39 @@ pub fn render(queries: &[InferredQuery], opts: CodegenOptions<'_>) -> String {
     let mut out = String::from(HEADER);
     // Side-effect import keeps swell in the graph so `declare module`
     // resolves; the type aliases stay available for override emitters.
-    out.push_str(&format!(
-        "import {{ type Json, type SqlText }} from \"{RUNTIME_MODULE}\";\n"
-    ));
+    out += &format!("import {{ type Json, type SqlText }} from \"{RUNTIME_MODULE}\";\n");
     for (from, names) in opts.extra_imports {
         if names.is_empty() {
             continue;
         }
-        let typed: Vec<String> = names.iter().map(|n| format!("type {n}")).collect();
-        out.push_str(&format!(
-            "import {{ {} }} from \"{from}\";\n",
-            typed.join(", ")
-        ));
+        let typed = names
+            .iter()
+            .map(|n| format!("type {n}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        out += &format!("import {{ {typed} }} from \"{from}\";\n");
     }
     out.push('\n');
 
     let (sorted_tables, names) = sorted_with_names(opts.tables);
     for t in &sorted_tables {
-        out.push_str(&render_table_interface(t, &names));
+        out += &render_table_interface(t, &names);
     }
     if !sorted_tables.is_empty() {
         out.push('\n');
     }
 
-    out.push_str(&format!("declare module \"{RUNTIME_MODULE}\" {{\n"));
+    out += &format!("declare module \"{RUNTIME_MODULE}\" {{\n");
     if queries.is_empty() {
-        out.push_str("  interface Registry {}\n");
+        out += "  interface Registry {}\n";
     } else {
-        out.push_str("  interface Registry {\n");
+        out += "  interface Registry {\n";
         for q in queries {
-            out.push_str(&render_entry(q, "    ", &names, opts.tables));
+            out += &render_entry(q, "    ", &names, opts.tables);
         }
-        out.push_str("  }\n");
+        out += "  }\n";
     }
-    out.push_str("}\n");
+    out += "}\n";
     out
 }
 
