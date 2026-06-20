@@ -227,17 +227,8 @@ async fn infer_user_func_return(
     catalog: &TypeCatalog,
     fc: &FuncCall,
 ) -> Option<String> {
-    let names: Vec<String> = fc.funcname.iter()
-        .filter_map(|n| match n.node.as_ref()? {
-            node::Node::String(s) => Some(s.sval.clone()),
-            _ => None,
-        })
-        .collect();
-    let (schema, name) = match names.as_slice() {
-        [n]        => (None, n.as_str()),
-        [s, n]     => (Some(s.as_str()), n.as_str()),
-        _ => return None,
-    };
+    let names = funcname_parts(fc);
+    let (schema, name) = funcname_split(&names)?;
     // Look up the function's return type. There can be multiple
     // overloads with different arg signatures; we take the first that
     // matches by name (and schema, if qualified). Good enough for the
@@ -282,29 +273,37 @@ fn resolve_to_safe_builtin<'c>(
     catalog: &'c TypeCatalog,
     fc: &FuncCall,
 ) -> Option<&'c str> {
-    let parts: Vec<String> = fc
-        .funcname
-        .iter()
+    let parts = funcname_parts(fc);
+    let (schema, name) = funcname_split(&parts)?;
+    match schema {
+        // Explicit pg_catalog qualification — always trusted.
+        // Unqualified — only safe if connect-time probe confirmed the
+        // name resolves to the catalog OID under the current search_path.
+        Some("pg_catalog") | None =>
+            Some(catalog.safe_builtin_procs.get_key_value(name)?.0.as_str()),
+        // Any other schema → user-defined; never apply the transform.
+        Some(_) => None,
+    }
+}
+
+/// Pull the string segments out of a `FuncCall.funcname` — typically
+/// `["pg_catalog", "jsonb_build_object"]` or just `["jsonb_build_object"]`.
+fn funcname_parts(fc: &FuncCall) -> Vec<String> {
+    fc.funcname.iter()
         .filter_map(|n| match n.node.as_ref()? {
             node::Node::String(s) => Some(s.sval.clone()),
             _ => None,
         })
-        .collect();
+        .collect()
+}
 
-    let (schema, name) = match parts.as_slice() {
-        [name] => (None, name.as_str()),
-        [schema, name] => (Some(schema.as_str()), name.as_str()),
-        _ => return None,
-    };
-
-    match schema {
-        // Explicit pg_catalog qualification — always trusted.
-        Some("pg_catalog") => Some(catalog.safe_builtin_procs.get_key_value(name)?.0.as_str()),
-        // Any other schema → user-defined; never apply the transform.
-        Some(_) => None,
-        // Unqualified — only safe if connect-time probe confirmed it resolves
-        // to the catalog OID under the current search_path.
-        None => Some(catalog.safe_builtin_procs.get_key_value(name)?.0.as_str()),
+/// `[name]` → `(None, name)`; `[schema, name]` → `(Some(schema), name)`;
+/// anything else → `None`.
+fn funcname_split(parts: &[String]) -> Option<(Option<&str>, &str)> {
+    match parts {
+        [name] => Some((None, name.as_str())),
+        [schema, name] => Some((Some(schema.as_str()), name.as_str())),
+        _ => None,
     }
 }
 
