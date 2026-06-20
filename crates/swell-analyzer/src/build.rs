@@ -76,31 +76,32 @@ pub async fn build(
         .params
         .iter()
         .enumerate()
-        .map(|(i, t)| {
-            let binding = param_bindings.get(&(i + 1)).cloned().map(|table_ref| {
-                // INSERT/UPDATE targets aren't aliased in the plan walk —
-                // look them up via `find_alias` and fall back to the
-                // param_nullability tighten otherwise.
-                let not_null = scope
-                    .find_alias(&table_ref.schema, &table_ref.table)
-                    .and_then(|a| scope.resolve_alias(a))
-                    .and_then(|t| t.col_not_null(&table_ref.column))
-                    .unwrap_or(false);
-                ResolvedCol {
-                    table_ref,
-                    alias: String::new(),
-                    not_null,
-                    typoid: 0,
-                }
-            });
-            Param {
-                binding,
-                pg_type: t.clone(),
-            }
+        .map(|(i, t)| Param {
+            binding: param_bindings
+                .get(&(i + 1))
+                .cloned()
+                .map(|tr| resolve_param_binding(tr, &scope)),
+            pg_type: t.clone(),
         })
         .collect();
 
     Ok(Analyzed { outputs, params })
+}
+
+/// INSERT/UPDATE targets aren't aliased in the plan walk — look them
+/// up via `find_alias` so `not_null` reflects the underlying column.
+fn resolve_param_binding(table_ref: TableColRef, scope: &Scope) -> ResolvedCol {
+    let not_null = scope
+        .find_alias(&table_ref.schema, &table_ref.table)
+        .and_then(|a| scope.resolve_alias(a))
+        .and_then(|t| t.col_not_null(&table_ref.column))
+        .unwrap_or(false);
+    ResolvedCol {
+        table_ref,
+        alias: String::new(),
+        not_null,
+        typoid: 0,
+    }
 }
 
 fn lower_output(

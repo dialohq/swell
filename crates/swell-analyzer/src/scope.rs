@@ -115,15 +115,15 @@ impl Scope {
             .filter_map(|(a, t)| t.col_not_null(col).map(|nn| (a, t, nn)))
             .collect();
         if let Some((alias, table, _)) = matches.first() {
-            if !matches
-                .iter()
-                .all(|(_, t, _)| t.schema == table.schema && t.name == table.name)
-            {
-                return None;
+            let (mut widening, mut force_nn, mut base_nn) = (false, false, true);
+            for (a, t, nn) in &matches {
+                if t.schema != table.schema || t.name != table.name {
+                    return None;
+                }
+                widening |= self.is_nullable_alias(a);
+                force_nn |= self.is_non_null_alias(a);
+                base_nn &= *nn;
             }
-            let widening = matches.iter().any(|(a, _, _)| self.is_nullable_alias(a));
-            let force_nn = matches.iter().any(|(a, _, _)| self.is_non_null_alias(a));
-            let base_nn = matches.iter().all(|(_, _, nn)| *nn);
             return Some(BareResolved {
                 schema: table.schema.clone(),
                 table: table.name.clone(),
