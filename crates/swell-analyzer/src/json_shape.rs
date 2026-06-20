@@ -390,51 +390,33 @@ async fn infer_build_object(
         return Some(format!("{{ {} }}", body.join("; ")));
     }
 
-    // From here every branch has at least one dynamic key.
-    // List dynamic-arg value types first, then constant-arg values,
-    // deduped. Dynamic args are the union's "broad" case (any key may
-    // map there), constants are narrow / specific; putting the broad
-    // arm first makes the rendered TS read naturally:
+    // Dynamic args are the union's "broad" case (any key may map there),
+    // constants are narrow / specific; putting the broad arm first makes
+    // the rendered TS read naturally:
     //   `Record<string, string | "owner" | "admin">`.
-    let value_union = {
+    let dedup_union = |groups: &[&[&str]]| -> String {
         let mut seen = std::collections::BTreeSet::new();
-        let mut dedup: Vec<String> = Vec::new();
-        for (k, v) in &pairs {
-            if matches!(k, KeyKind::Dynamic) && seen.insert(v.clone()) {
-                dedup.push(v.clone());
+        let mut out: Vec<String> = Vec::new();
+        for g in groups {
+            for v in *g {
+                if seen.insert(v.to_string()) { out.push(v.to_string()); }
             }
         }
-        for (k, v) in &pairs {
-            if matches!(k, KeyKind::Literal(_)) && seen.insert(v.clone()) {
-                dedup.push(v.clone());
-            }
-        }
-        if dedup.is_empty() { "unknown".to_string() } else { dedup.join(" | ") }
+        if out.is_empty() { "unknown".into() } else { out.join(" | ") }
     };
+    let dyn_vals: Vec<&str> = pairs.iter()
+        .filter_map(|(k, v)| matches!(k, KeyKind::Dynamic).then(|| v.as_str())).collect();
+    let lit_vals: Vec<&str> = pairs.iter()
+        .filter_map(|(k, v)| matches!(k, KeyKind::Literal(_)).then(|| v.as_str())).collect();
 
-    let constants_all_last = match last_dynamic_idx {
-        Some(idx) => pairs[..=idx]
-            .iter()
-            .all(|(k, _)| matches!(k, KeyKind::Dynamic)),
-        None => false,
-    };
+    let constants_all_last = last_dynamic_idx
+        .is_some_and(|idx| pairs[..=idx].iter().all(|(k, _)| matches!(k, KeyKind::Dynamic)));
 
     if constants_all_last {
-        // Build `{ [k: string]: V; const1: T1; const2: T2; … }`.
-        // The index-signature value type is the dynamic args' value
-        // type (union of every dynamic pair's value); the named fields
-        // are the trailing constant pairs.
-        let dyn_value_union = {
-            let mut seen = std::collections::BTreeSet::new();
-            let mut dedup: Vec<String> = Vec::new();
-            for (k, v) in &pairs {
-                if matches!(k, KeyKind::Dynamic) && seen.insert(v.clone()) {
-                    dedup.push(v.clone());
-                }
-            }
-            if dedup.is_empty() { "unknown".to_string() } else { dedup.join(" | ") }
-        };
-        let mut body = vec![format!("[k: string]: {}", dyn_value_union)];
+        // `{ [k: string]: V; const1: T1; … }`. The index-signature value
+        // type is the dynamic args' deduped union; the named fields are
+        // the trailing constant pairs.
+        let mut body = vec![format!("[k: string]: {}", dedup_union(&[&dyn_vals]))];
         for (k, v) in &pairs {
             if let KeyKind::Literal(name) = k {
                 body.push(format!("{}: {}", quote_field(name), v));
@@ -443,7 +425,7 @@ async fn infer_build_object(
         return Some(format!("{{ {} }}", body.join("; ")));
     }
 
-    Some(format!("Record<string, {}>", value_union))
+    Some(format!("Record<string, {}>", dedup_union(&[&dyn_vals, &lit_vals])))
 }
 
 async fn infer_column_ref(
@@ -476,24 +458,43 @@ async fn infer_column_ref(
     column_type(client, catalog, table_oid, &col).await
 }
 
+/// Fetch (attname, oid, notnull, typname) for a single column or every
+/// column of `table_oid` (when `col` is None, ordered by attnum).
+async fn fetch_attrs(
+    client: &Client, table_oid: u32, col: Option<&str>,
+) -> Vec<(String, u32, bool, String)> {
+    let oid = table_oid as i64;
+    let rows = match col {
+        Some(c) => client.query(
+            r#"SELECT a.attname, a.atttypid::bigint, a.attnotnull, t.typname
+               FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid
+               WHERE a.attrelid::bigint = $1 AND a.attname = $2
+                 AND a.attnum > 0 AND NOT a.attisdropped"#,
+            &[&oid, &c],
+        ).await,
+        None => client.query(
+            r#"SELECT a.attname, a.atttypid::bigint, a.attnotnull, t.typname
+               FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid
+               WHERE a.attrelid::bigint = $1 AND a.attnum > 0 AND NOT a.attisdropped
+               ORDER BY a.attnum"#,
+            &[&oid],
+        ).await,
+    };
+    let Ok(rows) = rows else { return Vec::new() };
+    rows.iter().map(|row| {
+        let oid: i64 = row.get(1);
+        (row.get(0), oid as u32, row.get(2), row.get(3))
+    }).collect()
+}
+
+fn render_attr(catalog: &TypeCatalog, oid: u32, typname: &str, notnull: bool) -> String {
+    let ty = catalog.render_oid(oid, typname, Direction::Read);
+    if notnull { ty } else { format!("{} | null", ty) }
+}
+
 async fn column_type(client: &Client, catalog: &TypeCatalog, table_oid: u32, col: &str) -> Option<String> {
-    let row = client
-        .query_opt(
-            r#"
-            SELECT a.atttypid::bigint, a.attnotnull, t.typname
-            FROM pg_attribute a
-            JOIN pg_type t ON t.oid = a.atttypid
-            WHERE a.attrelid::bigint = $1 AND a.attname = $2 AND a.attnum > 0 AND NOT a.attisdropped
-            "#,
-            &[&(table_oid as i64), &col],
-        )
-        .await
-        .ok()??;
-    let oid: i64 = row.get(0);
-    let notnull: bool = row.get(1);
-    let name: String = row.get(2);
-    let ty_string = catalog.render_oid(oid as u32, &name, Direction::Read);
-    Some(if notnull { ty_string } else { format!("{} | null", ty_string) })
+    let (_, oid, nn, typname) = fetch_attrs(client, table_oid, Some(col)).await.into_iter().next()?;
+    Some(render_attr(catalog, oid, &typname, nn))
 }
 
 async fn infer_table_ref(
@@ -512,29 +513,10 @@ async fn infer_table_ref(
     }).collect();
     if parts.len() != 1 { return None; }
     let table_oid = *alias_oids.get(&parts[0])?;
-    enumerate_table(client, catalog, table_oid).await
-}
-
-async fn enumerate_table(client: &Client, catalog: &TypeCatalog, table_oid: u32) -> Option<String> {
-    let rows = client.query(
-        r#"
-        SELECT a.attname, a.atttypid::bigint, a.attnotnull, t.typname
-        FROM pg_attribute a
-        JOIN pg_type t ON t.oid = a.atttypid
-        WHERE a.attrelid::bigint = $1 AND a.attnum > 0 AND NOT a.attisdropped
-        ORDER BY a.attnum
-        "#,
-        &[&(table_oid as i64)],
-    ).await.ok()?;
-    if rows.is_empty() { return None; }
-    let fields: Vec<String> = rows.iter().map(|row| {
-        let name: String = row.get(0);
-        let oid: i64 = row.get(1);
-        let notnull: bool = row.get(2);
-        let typname: String = row.get(3);
-        let ty = catalog.render_oid(oid as u32, &typname, Direction::Read);
-        let ty = if notnull { ty } else { format!("{} | null", ty) };
-        format!("{}: {}", quote_field(&name), ty)
+    let attrs = fetch_attrs(client, table_oid, None).await;
+    if attrs.is_empty() { return None; }
+    let fields: Vec<String> = attrs.iter().map(|(name, oid, nn, typname)| {
+        format!("{}: {}", quote_field(name), render_attr(catalog, *oid, typname, *nn))
     }).collect();
     Some(format!("{{ {} }}", fields.join("; ")))
 }

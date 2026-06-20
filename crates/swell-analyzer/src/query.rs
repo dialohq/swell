@@ -26,7 +26,6 @@ pub struct RowVariant {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InferredParam {
-    pub oid: u32,
     pub ts_type: String,
     /// True iff the call site may pass `null` for this `$N`. False when
     /// at least one textual reference to `$N` binds *directly* to a
@@ -49,7 +48,6 @@ fn default_nullable() -> bool { true }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InferredColumn {
     pub name: String,
-    pub oid: u32,
     pub nullable: bool,
     pub ts_type: String,
     /// Base-table column this result column directly references.
@@ -86,7 +84,6 @@ pub struct TableSchema {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableSchemaColumn {
     pub name: String,
-    pub oid: u32,
     pub ts_type: String,
     pub not_null: bool,
 }

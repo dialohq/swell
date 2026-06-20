@@ -124,7 +124,6 @@ impl Analyzer {
             .map(|(i, t)| {
                 let info = param_info.get(i).cloned().unwrap_or_default();
                 InferredParam {
-                    oid: t.oid(),
                     ts_type: catalog::render_for_oid(&self.catalog, t.oid(), t, Direction::Write),
                     nullable: info.nullable,
                     table_ref: info.table_ref,
@@ -167,7 +166,6 @@ impl Analyzer {
                     .map(|m| m.table_ref.clone());
                 InferredColumn {
                     name: c.name.clone(),
-                    oid: c.type_.oid(),
                     nullable: force_nullable.unwrap_or(inferred_nullable),
                     ts_type: inferred_ts,
                     table_ref,
@@ -196,7 +194,7 @@ impl Analyzer {
             r#"
             WITH ask(schema, name) AS (SELECT * FROM unnest($1::text[], $2::text[]))
             SELECT n.nspname, c.relname, a.attname, a.atttypid::bigint, t.typname,
-                   a.attnotnull, a.attnum
+                   a.attnotnull
             FROM ask
             JOIN pg_namespace n ON n.nspname = ask.schema
             JOIN pg_class c     ON c.relnamespace = n.oid AND c.relname = ask.name
@@ -218,7 +216,6 @@ impl Analyzer {
             let not_null: bool = row.get(5);
             grouped.entry((schema, table)).or_default().push(TableSchemaColumn {
                 name,
-                oid: oid as u32,
                 ts_type: self.catalog.render_oid(oid as u32, &typname, Direction::Read),
                 not_null,
             });
