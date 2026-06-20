@@ -56,6 +56,11 @@ pub struct NullabilityHints {
     /// `(users.email)` back into `(public, users, email)` so it can
     /// look up `attnotnull` for the referenced base column.
     pub alias_to_table: std::collections::HashMap<String, (String, String)>,
+    /// `Some(("Full", left_aliases, right_aliases))` for plans whose
+    /// root is an outer join. The two alias sets list which scan-
+    /// aliases sit on the join's left vs right side. The analyzer uses
+    /// this to synthesise the FULL JOIN row-variant union.
+    pub root_full_join: Option<(HashSet<String>, HashSet<String>)>,
 }
 
 impl NullabilityHints {
@@ -65,6 +70,7 @@ impl NullabilityHints {
             exprs: vec![String::new(); n],
             branches: vec![Vec::new(); n],
             alias_to_table: std::collections::HashMap::new(),
+            root_full_join: None,
         }
     }
 }
@@ -141,7 +147,37 @@ pub async fn explain_nullability(
             branches[i] = vec![expr.clone()];
         }
     }
-    Ok(NullabilityHints { by_column, exprs, branches, alias_to_table })
+    // If the plan's outer-most join is FULL, capture the alias sets
+    // for each side so the analyzer can build the 3-variant row union.
+    let root_full_join = detect_root_full_join(&plan);
+
+    Ok(NullabilityHints { by_column, exprs, branches, alias_to_table, root_full_join })
+}
+
+fn detect_root_full_join(plan: &PlanNode) -> Option<(HashSet<String>, HashSet<String>)> {
+    // Walk through passthrough wrappers to find the join.
+    let mut cur = plan;
+    loop {
+        if cur.join_type.as_deref() == Some("Full") {
+            let children = cur.plans.as_deref()?;
+            let mut left = HashSet::new();
+            let mut right = HashSet::new();
+            for c in children {
+                match c.parent_relationship.as_deref() {
+                    Some("Outer") => left.extend(collect_subtree_aliases(c)),
+                    Some("Inner") => right.extend(collect_subtree_aliases(c)),
+                    _ => {}
+                }
+            }
+            if !left.is_empty() && !right.is_empty() {
+                return Some((left, right));
+            }
+            return None;
+        }
+        let next = unwrap_passthrough(cur);
+        if std::ptr::eq(next, cur) { return None; }
+        cur = next;
+    }
 }
 
 fn is_setop_node(plan: &PlanNode) -> bool {
@@ -414,6 +450,7 @@ fn collect_subtree_aliases(node: &PlanNode) -> HashSet<String> {
 
 // ------------- Per-expression classification -------------
 
+#[cfg(test)]
 pub(crate) fn classify(expr: &str, nullable_aliases: &HashSet<String>) -> NullVerdict {
     classify_with(expr, nullable_aliases, &HashSet::new())
 }

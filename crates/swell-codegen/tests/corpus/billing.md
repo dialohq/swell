@@ -308,7 +308,7 @@ WHERE a.id = $1 OR b.id = $2
 ```ts
 $1: string | null
 $2: string | null
-result: { left_email: BillingUsers["email"], right_email: null } | { left_email: null; right_email: BillingUsers["email"] } | { left_email: BillingUsers["email"]; right_email: BillingUsers["email"] }
+result: { left_email: BillingUsers["email"]; right_email: null } | { left_email: null; right_email: BillingUsers["email"] } | { left_email: BillingUsers["email"]; right_email: BillingUsers["email"] }
 ```
 
 ## Self join with aliases
