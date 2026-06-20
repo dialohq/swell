@@ -260,7 +260,7 @@ export interface BillingWorkspaces {
   slug: string;
   name: string;
   billing_email: string;
-  billing_address: { line1: unknown; line2: unknown; city: unknown; region: unknown; country: unknown; postal: unknown } | null;
+  billing_address: { line1: text; line2: text; city: text; region: text; country: text; postal: text } | null;
   created_at: Date;
   deleted_at: Date | null;
   settings: Json;
@@ -280,7 +280,7 @@ WHERE m.workspace_id = $1
 
 ```ts
 $1: string | null
-result: { email: BillingUsers["email"]; display_name: BillingUsers["display_name"] | null; role: BillingMemberships["role"]; joined_at: BillingMemberships["joined_at"] }
+result: { email: BillingUsers["email"]; display_name: BillingUsers["display_name"]; role: BillingMemberships["role"]; joined_at: BillingMemberships["joined_at"] }
 ```
 
 ## Left join makes rhs columns nullable
@@ -308,7 +308,7 @@ WHERE a.id = $1 OR b.id = $2
 ```ts
 $1: string | null
 $2: string | null
-result: { left_email: BillingUsers["email"] | null; right_email: BillingUsers["email"] | null }
+result: { left_email: BillingUsers["email"], right_email: null } | { left_email: null; right_email: BillingUsers["email"] } | { left_email: BillingUsers["email"]; right_email: BillingUsers["email"] }
 ```
 
 ## Self join with aliases
@@ -438,7 +438,7 @@ RETURNING paid_at AS "paid_at!"
 
 ```ts
 $1: string | null
-result: { paid_at: BillingInvoices["paid_at"] }
+result: { "paid_at!": BillingInvoices["paid_at"] }
 ```
 
 ## Delete returning
@@ -465,7 +465,7 @@ FROM billing.workspaces w WHERE w.id = $1
 
 ```ts
 $1: string | null
-result: { name: BillingWorkspaces["name"]; members: string | null }
+result: { name: BillingWorkspaces["name"]; members: string }
 ```
 
 ## Exists subquery in where doesnt change select types
@@ -527,7 +527,7 @@ SELECT level FROM n
 ```
 
 ```ts
-result: { level: number | null }
+result: { level: number }
 ```
 
 ## Row number over partition
@@ -542,7 +542,7 @@ JOIN billing.invoices i ON i.workspace_id = w.id
 ```
 
 ```ts
-result: { name: BillingWorkspaces["name"]; rn: string | null; amount_cents: BillingInvoices["amount_cents"] }
+result: { name: BillingWorkspaces["name"]; rn: string; amount_cents: BillingInvoices["amount_cents"] }
 ```
 
 ## Lag lead returns nullable
@@ -637,7 +637,7 @@ SELECT id, 'open' FROM billing.invoices WHERE status = 'open'
 ```
 
 ```ts
-result: { id: string | null; bucket: string | null }
+result: { id: string; bucket: "paid" | "open" }
 ```
 
 ## Json shape with aliases and join
@@ -658,7 +658,7 @@ WHERE w.id = $1
 
 ```ts
 $1: string | null
-result: { summary: { workspace_id: string; workspace_name: string; plan: string; status: "trialing" | "active" | "past_due" | "canceled" | "incomplete"; mrr_cents: unknown } }
+result: { summary: { workspace_id: string; workspace_name: string; plan: string; status: "trialing" | "active" | "past_due" | "canceled" | "incomplete"; mrr_cents: string | null } }
 ```
 
 ## Json shape aggregate with group by
@@ -679,12 +679,28 @@ $1: string | null
 result: { id: BillingWorkspaces["id"]; members: { member: string; role: "owner" | "admin" | "member" | "viewer" }[] | null }
 ```
 
-## Json shape dynamic key collapses to record
+## Json shape dynamic key generates an idiomatic record type (if constants are last)
 
 ```sql
 SELECT jsonb_build_object(
     u.email, u.id,
     'role', m.role
+) AS lookup
+FROM billing.users u JOIN billing.memberships m ON m.user_id = u.id
+WHERE u.id = $1
+```
+
+```ts
+$1: string | null
+result: { lookup: { [k: string]: string; role: "owner" | "admin" | "member" | "viewer" } }
+```
+
+## Json shape dynamic key collapses to record if constants are first
+
+```sql
+SELECT jsonb_build_object(
+    'role', m.role
+    u.email, u.id,
 ) AS lookup
 FROM billing.users u JOIN billing.memberships m ON m.user_id = u.id
 WHERE u.id = $1
@@ -728,10 +744,10 @@ $1: string | null
 result: { price_cents: BillingPlans["price_cents"] }
 ```
 
-## Force not null on join with filter
+## not null from s.id propagates to status on left join through inference
 
 ```sql
-SELECT w.id, s.status AS "status!"
+SELECT w.id, s.status AS "status"
 FROM billing.workspaces w
 LEFT JOIN billing.subscriptions s ON s.workspace_id = w.id
 WHERE s.id IS NOT NULL AND w.id = $1
@@ -742,10 +758,24 @@ $1: string | null
 result: { id: BillingWorkspaces["id"]; status: BillingSubscriptions["status"] }
 ```
 
+## Force not null on left join with filter
+
+```sql
+SELECT w.id, s.status AS "status!"
+FROM billing.workspaces w
+LEFT JOIN billing.subscriptions s ON s.workspace_id = w.id
+WHERE w.id = $1
+```
+
+```ts
+$1: string | null
+result: { id: BillingWorkspaces["id"]; "status!": BillingSubscriptions["status"] }
+```
+
 ## Override typed jsonb
 
 ```sql
-SELECT settings AS "settings: WorkspaceSettings"
+SELECT settings AS "settings"
 FROM billing.workspaces WHERE id = $1
 ```
 
@@ -765,7 +795,7 @@ WHERE u.id = $1
 
 ```ts
 $1: string | null
-result: { email: BillingUsers["email"]; label: string | null }
+result: { email: BillingUsers["email"]; label: string }
 ```
 
 ## Left join lateral subquery makes columns nullable
@@ -817,7 +847,7 @@ $2: string | null
 result: { has_subset: boolean | null }
 ```
 
-## Select star expands to all columns with attnotnull
+## Select star expands to the row type
 
 ```sql
 SELECT * FROM billing.users WHERE id = $1
@@ -825,7 +855,7 @@ SELECT * FROM billing.users WHERE id = $1
 
 ```ts
 $1: string | null
-result: { id: BillingUsers["id"]; email: BillingUsers["email"]; display_name: BillingUsers["display_name"] | null; password_hash: BillingUsers["password_hash"]; avatar_url: BillingUsers["avatar_url"] | null; created_at: BillingUsers["created_at"]; last_login_at: BillingUsers["last_login_at"] | null; metadata: BillingUsers["metadata"] }
+result: BillingUsers
 ```
 
 ## Select star through left join
@@ -840,7 +870,7 @@ WHERE u.id = $2
 ```ts
 $1: string | null
 $2: string | null
-result: { id: BillingUsers["id"]; email: BillingUsers["email"]; display_name: BillingUsers["display_name"] | null; password_hash: BillingUsers["password_hash"]; avatar_url: BillingUsers["avatar_url"] | null; created_at: BillingUsers["created_at"]; last_login_at: BillingUsers["last_login_at"] | null; metadata: BillingUsers["metadata"]; role: BillingMemberships["role"] | null }
+result: BillingUsers & { role: BillingMemberships["role"] | null }
 ```
 
 ## Array agg with order by
@@ -884,7 +914,7 @@ GROUP BY GROUPING SETS ((workspace_id), (status), ())
 ```
 
 ```ts
-result: { workspace_id: BillingInvoices["workspace_id"]; status: BillingInvoices["status"]; n: string }
+result: { workspace_id: BillingInvoices["workspace_id"]; status: null; n: string } | { workspace_id: null; status: BillingInvoices["status"]; n: string } | { workspace_id: null; status: null; n: string }
 ```
 
 ## Param used with any array cast
@@ -929,18 +959,18 @@ FROM (VALUES (1, 'a'), (2, 'b'), (3, 'c')) AS t(k, v)
 ```
 
 ```ts
-result: { k: number | null; v: string | null }
+result: { k: number; v: string }
 ```
 
 ## Values with override forces not null
 
 ```sql
-SELECT t.id AS "id!", t.label
+SELECT t.id AS "id", t.label
 FROM (VALUES ('a'::text, 'first'), ('b', 'second')) AS t(id, label)
 ```
 
 ```ts
-result: { id: string; label: string | null }
+result: { id: string; label: string }
 ```
 
 ## Unknown column returns error
@@ -1032,7 +1062,7 @@ FROM unnest(ARRAY['a', 'b', 'c']::text[]) WITH ORDINALITY AS t(label, idx)
 ```
 
 ```ts
-result: { label: string | null; idx: string | null }
+result: { label: string; idx: string }
 ```
 
 ## Intersect two selects
@@ -1045,7 +1075,7 @@ SELECT user_id FROM billing.memberships WHERE workspace_id = $1
 
 ```ts
 $1: string | null
-result: { id: string | null }
+result: { id: string }
 ```
 
 ## Except all
@@ -1058,7 +1088,7 @@ SELECT user_id FROM billing.memberships WHERE workspace_id = $1
 
 ```ts
 $1: string | null
-result: { id: string | null }
+result: { id: string }
 ```
 
 ## Range column renders as lower upper
@@ -1144,7 +1174,7 @@ FROM (
 
 ```ts
 $1: string | null
-result: { by_role: Record<string, unknown> | null }
+result: { by_role: Record<string, string> | null }
 ```
 
 ## Merge with returning

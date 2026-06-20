@@ -67,7 +67,7 @@ export interface Users {
   email: string;
   display_name: string | null;
   role: "admin" | "member";
-  home_address: { street: unknown; city: unknown; zip: unknown } | null;
+  home_address: { street: string | null; city: string | null; zip: string | null } | null;
   settings: Json;
 }
 ```
@@ -93,7 +93,7 @@ SELECT display_name FROM users WHERE id = $1
 
 ```ts
 $1: string | null
-result: { display_name: Users["display_name"] | null }
+result: { display_name: Users["display_name"] }
 ```
 
 ## Count aggregate is bigint
@@ -113,7 +113,7 @@ SELECT ARRAY[gen_random_uuid()] AS u, NOW() AS t
 ```
 
 ```ts
-result: { u: string[] | null; t: Date | null }
+result: { u: string[]; t: Date }
 ```
 
 ## Sum is nullable
@@ -137,10 +137,32 @@ $1: string | null
 result: { settings: Users["settings"] }
 ```
 
-## Override force not null
+## A non nullable expression in coalesce makes entire coalesce non-nullable (1)
 
 ```sql
-SELECT coalesce(display_name, email) AS "label!" FROM users WHERE id = $1
+SELECT coalesce(display_name, email) AS "label" FROM users WHERE id = $1
+```
+
+```ts
+$1: string | null
+result: { label: string }
+```
+
+## A non nullable expression in coalesce makes entire coalesce non-nullable (2)
+
+```sql
+SELECT coalesce(email, display_name) AS "label" FROM users WHERE id = $1
+```
+
+```ts
+$1: string | null
+result: { label: string }
+```
+
+## A non nullable expression in coalesce makes entire coalesce non-nullable (3)
+
+```sql
+SELECT coalesce(display_name, 'test') AS "label" FROM users WHERE id = $1
 ```
 
 ```ts
@@ -156,29 +178,7 @@ SELECT email AS "email_maybe?" FROM users WHERE id = $1
 
 ```ts
 $1: string | null
-result: { email_maybe: Users["email"] | null }
-```
-
-## Override type
-
-```sql
-SELECT settings AS "settings: UserSettings" FROM users WHERE id = $1
-```
-
-```ts
-$1: string | null
-result: { settings: Users["settings"] }
-```
-
-## Override type and not null
-
-```sql
-SELECT settings AS "settings!: UserSettings" FROM users WHERE id = $1
-```
-
-```ts
-$1: string | null
-result: { settings: Users["settings"] }
+result: { "email_maybe?": Users["email"] | null }
 ```
 
 ## Jsonb build object simple
@@ -250,7 +250,7 @@ FROM users u WHERE u.id = $1
 
 ```ts
 $1: string | null
-result: { payload: Record<string, string | "admin" | "member"> }
+result: { payload: { [k: string]: string; role: "admin" | "member" } }
 ```
 
 ## Enum inside jsonb build object
