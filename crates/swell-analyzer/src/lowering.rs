@@ -5,7 +5,7 @@
 //! calls categorised against the catalog short-name sets, and casts
 //! recursed through.
 
-use crate::analyzed::{Expr, FuncKind, Lit, ResolvedCol};
+use crate::analyzed::{CastPolicy, Expr, FuncKind, Lit, ResolvedCol};
 use crate::query::TableColRef;
 use crate::scope::Scope;
 use pg_query::protobuf::{a_const::Val, node::Node as NB, Node};
@@ -70,7 +70,7 @@ pub fn lower(node: &Node, scope: &Scope) -> Expr {
 
         NB::CaseExpr(ce) => {
             let has_else_non_null = ce.defresult.as_deref()
-                .map(|d| is_non_null(&lower(d, scope)))
+                .map(|d| is_non_null(&lower(d, scope), scope.cast_policy()))
                 .unwrap_or(false);
             Expr::Case { has_else_non_null }
         }
@@ -170,7 +170,7 @@ fn lower_column_ref(cr: &pg_query::protobuf::ColumnRef, scope: &Scope) -> Option
     }
     // Derived-table alias (RangeSubselect / CTE) — find the column by
     // name in the pre-lowered derived list and inherit its non-null
-    // verdict via `is_non_null(child_expr)`.
+    // verdict via `is_non_null(child_expr, scope.cast_policy())`.
     if let Some(derived) = scope.derived(alias) {
         let child = derived.iter().find(|c| c.name == col)?;
         return Some(ResolvedCol {
@@ -180,7 +180,7 @@ fn lower_column_ref(cr: &pg_query::protobuf::ColumnRef, scope: &Scope) -> Option
                 column: col.to_string(),
             },
             alias: alias.to_string(),
-            not_null: is_non_null(&child.expr),
+            not_null: is_non_null(&child.expr, scope.cast_policy()),
         });
     }
     // Alias isn't a real base table in the plan walk's `alias_to_table`.
@@ -208,39 +208,57 @@ fn lower_column_ref(cr: &pg_query::protobuf::ColumnRef, scope: &Scope) -> Option
 /// branch non-null" check. For `SetOp`, every branch must be non-null
 /// (the union admits NULL if any branch can produce it).
 ///
-/// Casts: a user-defined cast (e.g. `id::text` over a custom domain)
-/// can return NULL even on non-null input, so we *don't* propagate
-/// non-null through `Cast` over a `Column`. We *do* propagate through
-/// `Cast` over a literal-class value (`Literal`, `ArrayConstructor`,
-/// `Func { NeverNull }`) — those are immune to cast surprises since
-/// the value is fabricated, not transformed from a column.
-pub fn is_non_null(e: &Expr) -> bool {
+/// Casts: `CastPolicy::Trust` inherits the inner verdict (built-in
+/// I/O / binary / `pg_catalog` function casts never return NULL on
+/// non-NULL input — they `ERROR` instead). `CastPolicy::Conservative`
+/// kicks in when the database has at least one user-defined
+/// `castmethod='f'` cast; in that mode only literal-class inner
+/// expressions (where the value is fabricated, not transformed from
+/// a column) propagate non-null.
+pub fn is_non_null(e: &Expr, policy: CastPolicy) -> bool {
     match e {
         Expr::Literal(_) => true,
         Expr::ArrayConstructor => true,
-        Expr::Cast { inner } => matches!(inner.as_ref(),
-            Expr::Literal(_) | Expr::ArrayConstructor
-            | Expr::Func { kind: FuncKind::NeverNull, .. }),
+        Expr::Cast { inner } => match policy {
+            CastPolicy::Trust => is_non_null(inner, policy),
+            CastPolicy::Conservative => matches!(inner.as_ref(),
+                Expr::Literal(_) | Expr::ArrayConstructor
+                | Expr::Func { kind: FuncKind::NeverNull, .. }),
+        },
         Expr::Column(c) => c.not_null,
         Expr::Func { kind: FuncKind::NeverNull, .. } => true,
-        Expr::Coalesce(args) => args.iter().any(is_non_null),
+        Expr::Coalesce(args) => args.iter().any(|a| is_non_null(a, policy)),
         Expr::Case { has_else_non_null } => *has_else_non_null,
-        Expr::SubQuery(a) => a.outputs.first().is_some_and(|o| is_non_null(&o.expr)),
-        Expr::SetOp(branches) => !branches.is_empty() && branches.iter().all(is_non_null),
+        Expr::SubQuery(a) => a.outputs.first().is_some_and(|o| is_non_null(&o.expr, policy)),
+        Expr::SetOp(branches) => !branches.is_empty() && branches.iter().all(|b| is_non_null(b, policy)),
         _ => false,
     }
 }
 
 /// Strong "this column is nullable" verdict — used to override an
-/// otherwise-NOT-NULL base column when, e.g., an outer join widens it.
-pub fn is_nullable(e: &Expr) -> bool {
+/// otherwise-NOT-NULL base column when, e.g., an outer join widens it
+/// or a user-defined cast might return NULL.
+///
+/// Under `CastPolicy::Conservative`, `<col>::T` is treated as
+/// potentially NULL even when `col` is NOT NULL — some `castfunc` in
+/// the database can return NULL, and without per-cast type info we
+/// can't tell which casts are safe. Literal-class inner expressions
+/// (`Literal`, `ArrayConstructor`, never-null funcs) stay safe because
+/// the value being cast is fabricated, not transformed from a column.
+pub fn is_nullable(e: &Expr, policy: CastPolicy) -> bool {
     match e {
         Expr::Null => true,
-        Expr::Cast { inner } => is_nullable(inner),
+        Expr::Cast { inner } => {
+            if is_nullable(inner, policy) { return true; }
+            matches!(policy, CastPolicy::Conservative)
+                && !matches!(inner.as_ref(),
+                    Expr::Literal(_) | Expr::ArrayConstructor
+                    | Expr::Func { kind: FuncKind::NeverNull, .. })
+        }
         Expr::Column(c) => !c.not_null,
         Expr::Func { kind: FuncKind::NullableAgg, .. } => true,
         Expr::Case { has_else_non_null: false } => true,
-        Expr::SetOp(branches) => branches.iter().any(is_nullable),
+        Expr::SetOp(branches) => branches.iter().any(|b| is_nullable(b, policy)),
         _ => false,
     }
 }

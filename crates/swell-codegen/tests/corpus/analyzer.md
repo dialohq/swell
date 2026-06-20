@@ -10,6 +10,11 @@ DROP TABLE IF EXISTS orgs  CASCADE;
 DROP TYPE  IF EXISTS user_role     CASCADE;
 DROP DOMAIN IF EXISTS email_address CASCADE;
 DROP TYPE  IF EXISTS address       CASCADE;
+-- Defensive: clean up any leftover from `cast_policy.md`. Its setup
+-- creates a user-defined function-based cast which would otherwise
+-- persist into this suite's analyzer connect and flip the `pg_cast`
+-- probe to Conservative.
+DROP TYPE  IF EXISTS swell_cast_test_type CASCADE;
 
 -- Custom enum.
 CREATE TYPE user_role AS ENUM ('admin', 'member');
@@ -340,5 +345,5 @@ SELECT id::text AS id_text FROM users
 ```
 
 ```ts
-result: { id_text: string | null }
+result: { id_text: string }
 ```

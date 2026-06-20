@@ -107,6 +107,24 @@ pub struct ResolvedCol {
     pub not_null: bool,
 }
 
+/// Whether `Cast` nodes propagate non-null from their inner
+/// expression. Decided once per `Analyzer` at connect time via a
+/// `pg_cast` probe: if the connected database has any user-defined
+/// function-based cast (`castmethod = 'f'` AND `oid >= 16384`),
+/// we stay conservative (some `castfunc` could return NULL on
+/// non-NULL input). Otherwise we trust — built-in casts are either
+/// binary, I/O (which throws rather than returns NULL), or use
+/// `pg_catalog` functions that never return NULL on non-NULL input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CastPolicy {
+    /// No user-defined function casts in the database. `Cast { inner }`
+    /// inherits `inner`'s non-null verdict.
+    Trust,
+    /// At least one user-defined `castmethod='f'` cast exists. `Cast`
+    /// propagates non-null only over literal-class inner expressions.
+    Conservative,
+}
+
 /// Verdict-relevant classification of a function call. Computed once
 /// at lowering by matching `FuncCall.funcname` against the catalog
 /// short-name sets.

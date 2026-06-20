@@ -4,7 +4,7 @@
 //! the lowering pass to resolve `ColumnRef`s to `ResolvedCol` with the
 //! `not_null` bit already adjusted for outer-join widening.
 
-use crate::analyzed::Expr;
+use crate::analyzed::{CastPolicy, Expr};
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use tokio_postgres::Client;
@@ -19,6 +19,10 @@ pub struct Scope {
     derived: HashMap<String, Vec<DerivedColumn>>,
     nullable: HashSet<String>,
     non_null: HashSet<String>,
+    /// Per-analyzer cast policy — threaded through derived-column
+    /// resolution so the verdict for a CTE / derived column matches
+    /// what the top-level pass would produce.
+    cast_policy: CastPolicy,
 }
 
 #[derive(Debug, Clone)]
@@ -51,6 +55,7 @@ impl Scope {
         alias_to_table: HashMap<String, (String, String)>,
         nullable: HashSet<String>,
         non_null: HashSet<String>,
+        cast_policy: CastPolicy,
     ) -> Result<Self> {
         let distinct: HashSet<(String, String)> = alias_to_table.values().cloned().collect();
         let columns = fetch_attnotnull(client, &distinct).await?;
@@ -60,8 +65,10 @@ impl Scope {
                 Some((alias, ResolvedTable { schema, name, columns: cols }))
             })
             .collect();
-        Ok(Self { aliases, derived: HashMap::new(), nullable, non_null })
+        Ok(Self { aliases, derived: HashMap::new(), nullable, non_null, cast_policy })
     }
+
+    pub fn cast_policy(&self) -> CastPolicy { self.cast_policy }
 
     /// Attach derived-table aliases. Lowering pass calls this after
     /// `Scope::build` once it has the SQL parse tree — we can't do
@@ -128,7 +135,7 @@ impl Scope {
                 schema: String::new(),
                 table: alias.clone(),
                 alias: alias.clone(),
-                not_null: crate::lowering::is_non_null(&dcol.expr),
+                not_null: crate::lowering::is_non_null(&dcol.expr, self.cast_policy),
             });
         }
         if self.non_null.len() == 1 {

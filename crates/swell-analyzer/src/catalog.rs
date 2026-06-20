@@ -5,9 +5,32 @@
 //! schemas we care about. The result is cached on the analyzer so
 //! subsequent query analysis is allocation-only.
 
+use crate::analyzed::CastPolicy;
 use crate::ts_types::TypeCatalog;
 use std::collections::{BTreeMap, HashMap};
 use tokio_postgres::Client;
+
+/// One round-trip probe of `pg_cast`. Returns `CastPolicy::Trust` iff
+/// the connected database has no user-defined function-based casts
+/// (`oid >= 16384` is `FirstNormalObjectId` — everything below ships
+/// with core). `castmethod = 'f'` is the only method whose result can
+/// be NULL on non-NULL input; `'b'` (binary) and `'i'` (I/O) are
+/// total. Built-in `'f'` casts (in `pg_catalog`, oid < 16384) live in
+/// `pg_proc` functions that don't return NULL on non-NULL input
+/// either — they `ERROR` instead.
+pub async fn detect_cast_policy(client: &Client) -> CastPolicy {
+    match client.query_one(
+        "SELECT EXISTS (SELECT 1 FROM pg_cast WHERE castmethod = 'f' AND oid >= 16384)",
+        &[],
+    ).await {
+        Ok(row) if row.get::<_, bool>(0) => CastPolicy::Conservative,
+        Ok(_) => CastPolicy::Trust,
+        Err(e) => {
+            tracing::debug!("detect_cast_policy: {e}; defaulting to Conservative");
+            CastPolicy::Conservative
+        }
+    }
+}
 
 /// Pull every enum / domain / composite definition the analyzer needs in
 /// order to render TS types correctly. Restricted to the supplied schemas

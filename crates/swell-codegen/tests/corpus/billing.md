@@ -8,6 +8,12 @@ DROP SCHEMA IF EXISTS billing CASCADE;
 CREATE SCHEMA billing;
 SET search_path = billing, public;
 
+-- Defensive: clean up any leftover from `cast_policy.md`. Its setup
+-- creates a user-defined function-based cast which would otherwise
+-- persist into this suite's analyzer connect and flip the `pg_cast`
+-- probe to Conservative.
+DROP TYPE IF EXISTS public.swell_cast_test_type CASCADE;
+
 -- ---------- Custom types ----------
 
 CREATE TYPE role AS ENUM ('owner', 'admin', 'member', 'viewer');

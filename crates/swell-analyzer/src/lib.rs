@@ -12,8 +12,6 @@ pub mod plan;
 pub mod scope;
 pub mod lowering;
 pub mod build;
-pub mod explain_expr;
-pub mod nullability;
 pub mod param_nullability;
 pub mod json_shape;
 pub mod ts_types;
@@ -32,6 +30,10 @@ use tokio_postgres::{Client, Config, NoTls};
 pub struct Analyzer {
     pub client: Client,
     pub catalog: TypeCatalog,
+    /// Decided once at connect time via a `pg_cast` probe; threaded
+    /// through the lowering pass so `Cast` nodes' non-null verdict
+    /// matches reality for *this* database.
+    pub cast_policy: analyzed::CastPolicy,
 }
 
 pub struct AnalyzerOptions {
@@ -63,7 +65,9 @@ impl Analyzer {
             .context("loading pg_catalog")?;
         catalog.by_name = opts.type_overrides;
 
-        Ok(Self { client, catalog })
+        let cast_policy = catalog::detect_cast_policy(&client).await;
+
+        Ok(Self { client, catalog, cast_policy })
     }
 
     /// Cheap fingerprint over the relevant schemas — invalidates caches.
@@ -110,7 +114,7 @@ impl Analyzer {
         // tree this produces.
         let analyzed = build::build(
             &self.client, sql, &described, plan_walk.clone(),
-            &column_meta, &param_bindings,
+            &column_meta, &param_bindings, self.cast_policy,
         ).await?;
 
         let json_shapes = json_shape::infer_shapes(
@@ -133,7 +137,7 @@ impl Analyzer {
                 let expr = analyzed.outputs.get(i)
                     .map(|o| &o.expr)
                     .unwrap_or(&analyzed::Expr::Unknown);
-                let verdict = build::verdict(expr);
+                let verdict = build::verdict(expr, self.cast_policy);
                 let inferred_nullable = decide_nullability(c, &column_meta, verdict);
                 let oid_ts = catalog::render_for_oid(&self.catalog, c.type_.oid(), &c.type_, Direction::Read);
                 let json_ts = json_shapes.by_target.get(i).cloned().flatten();
