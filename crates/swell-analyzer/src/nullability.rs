@@ -40,6 +40,35 @@ pub enum NullVerdict {
     Unknown,
 }
 
+/// Function-call expression prefixes (matched against the lowercased
+/// trimmed expression) that guarantee a non-NULL result. Covers
+/// `count(...)`, array literal constructors, never-null window funcs,
+/// time / system builtins, and JSON / row builders.
+const NEVER_NULL_PREFIXES: &[&str] = &[
+    "count(", "array[",
+    // Window funcs that always return a value over a non-empty partition.
+    "row_number(", "rank(", "dense_rank(", "ntile(",
+    "cume_dist(", "percent_rank(",
+    // Time / system builtins.
+    "now(", "current_timestamp", "current_date", "current_time",
+    "localtimestamp", "localtime",
+    "current_user", "session_user", "current_database(",
+    "current_schema(", "current_setting(",
+    "gen_random_uuid(", "uuid_generate_v1(", "uuid_generate_v4(",
+    "pg_advisory_lock(", "pg_advisory_xact_lock(",
+    // JSON / row builders — construct from args, never short-circuit.
+    "jsonb_build_object(", "json_build_object(",
+    "jsonb_build_array(", "json_build_array(",
+    "to_jsonb(", "to_json(", "row_to_json(", "array_to_json(",
+];
+
+/// Aggregate prefixes that return NULL on an empty input set.
+const NULLABLE_AGG_PREFIXES: &[&str] = &[
+    "sum(", "avg(", "min(", "max(",
+    "array_agg(", "json_agg(", "jsonb_agg(",
+    "string_agg(", "bool_and(", "bool_or(",
+];
+
 #[derive(Debug, Clone)]
 pub struct NullabilityHints {
     pub by_column: Vec<NullVerdict>,
@@ -409,58 +438,10 @@ pub(crate) fn classify_with(
 
     let lower = trimmed.to_ascii_lowercase();
 
-    if lower.starts_with("count(") {
+    if NEVER_NULL_PREFIXES.iter().any(|p| lower.starts_with(p)) {
         return NullVerdict::NotNullable;
     }
-
-    // Array literal constructor — never null even when elements are.
-    if lower.starts_with("array[") {
-        return NullVerdict::NotNullable;
-    }
-
-    // Window functions that always return a value (the partition is
-    // non-empty by construction at the call site).
-    let non_null_window_funcs = [
-        "row_number(", "rank(", "dense_rank(", "ntile(",
-        "cume_dist(", "percent_rank(",
-    ];
-    if non_null_window_funcs.iter().any(|p| lower.starts_with(p)) {
-        return NullVerdict::NotNullable;
-    }
-
-    // SQL builtins / system functions that always produce a value.
-    let never_null_builtins = [
-        "now(", "current_timestamp", "current_date", "current_time",
-        "localtimestamp", "localtime",
-        "current_user", "session_user", "current_database(",
-        "current_schema(", "current_setting(",
-        "gen_random_uuid(", "uuid_generate_v1(", "uuid_generate_v4(",
-        "pg_advisory_lock(", "pg_advisory_xact_lock(",
-    ];
-    if never_null_builtins.iter().any(|p| lower.starts_with(p)) {
-        return NullVerdict::NotNullable;
-    }
-
-    // Functions whose return value is never NULL by construction (apart
-    // from the degenerate case of being called on NULL input). These build
-    // a value from their arguments and never short-circuit to NULL.
-    let never_null_funcs = [
-        "jsonb_build_object(", "json_build_object(",
-        "jsonb_build_array(", "json_build_array(",
-        "to_jsonb(", "to_json(",
-        "row_to_json(",
-        "array_to_json(",
-    ];
-    if never_null_funcs.iter().any(|p| lower.starts_with(p)) {
-        return NullVerdict::NotNullable;
-    }
-
-    let nullable_aggs = [
-        "sum(", "avg(", "min(", "max(",
-        "array_agg(", "json_agg(", "jsonb_agg(",
-        "string_agg(", "bool_and(", "bool_or(",
-    ];
-    if nullable_aggs.iter().any(|p| lower.starts_with(p)) {
+    if NULLABLE_AGG_PREFIXES.iter().any(|p| lower.starts_with(p)) {
         return NullVerdict::Nullable;
     }
 
