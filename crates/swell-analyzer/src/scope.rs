@@ -114,47 +114,44 @@ impl Scope {
             .iter()
             .filter_map(|(a, t)| t.col_not_null(col).map(|nn| (a, t, nn)))
             .collect();
-        if !matches.is_empty() {
-            let (_, first_table, _) = matches[0];
+        if let Some((alias, table, _)) = matches.first() {
             let same_table = matches
                 .iter()
-                .all(|(_, t, _)| t.schema == first_table.schema && t.name == first_table.name);
+                .all(|(_, t, _)| t.schema == table.schema && t.name == table.name);
             if !same_table {
                 return None;
             }
             let widening = matches.iter().any(|(a, _, _)| self.is_nullable_alias(a));
             let force_nn = matches.iter().any(|(a, _, _)| self.is_non_null_alias(a));
             let base_nn = matches.iter().all(|(_, _, nn)| *nn);
-            let (alias, table, _) = matches[0];
             return Some(BareResolved {
                 schema: table.schema.clone(),
                 table: table.name.clone(),
-                alias: alias.clone(),
+                alias: (*alias).clone(),
                 not_null: (base_nn || force_nn) && !widening,
                 typoid: table.col_typoid(col).unwrap_or(0),
             });
         }
-        let derived_matches: Vec<(&String, &DerivedColumn)> = self
+        let mut derived_matches = self
             .derived
             .iter()
-            .filter_map(|(a, cols)| cols.iter().find(|c| c.name == col).map(|c| (a, c)))
-            .collect();
-        if derived_matches.len() == 1 {
-            let (alias, dcol) = derived_matches[0];
-            return Some(BareResolved {
-                schema: String::new(),
-                table: alias.clone(),
-                alias: alias.clone(),
-                not_null: crate::lowering::is_non_null(&dcol.expr),
-                typoid: 0,
-            });
+            .filter_map(|(a, cols)| cols.iter().find(|c| c.name == col).map(|c| (a, c)));
+        if let Some((alias, dcol)) = derived_matches.next() {
+            if derived_matches.next().is_none() {
+                return Some(BareResolved {
+                    schema: String::new(),
+                    table: alias.clone(),
+                    alias: alias.clone(),
+                    not_null: crate::lowering::is_non_null(&dcol.expr),
+                    typoid: 0,
+                });
+            }
         }
         if self.non_null.len() == 1 {
-            let alias = self.non_null.iter().next()?.clone();
             return Some(BareResolved {
                 schema: String::new(),
                 table: String::new(),
-                alias,
+                alias: self.non_null.iter().next()?.clone(),
                 not_null: true,
                 typoid: 0,
             });
