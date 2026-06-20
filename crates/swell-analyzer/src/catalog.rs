@@ -64,9 +64,7 @@ pub async fn load_type_catalog(client: &Client, schemas: &[String]) -> anyhow::R
         )
         .await?;
     for row in &rows {
-        let oid: u32 = row.get(0);
-        let label: String = row.get(1);
-        cat.enums.entry(oid).or_default().push(label);
+        cat.enums.entry(row.get(0)).or_default().push(row.get(1));
     }
 
     // Domains. Domains can chain — walk parent edges to the ultimate
@@ -85,10 +83,7 @@ pub async fn load_type_catalog(client: &Client, schemas: &[String]) -> anyhow::R
         .await?;
     let mut parent: HashMap<u32, (u32, String)> = HashMap::new();
     for row in &rows {
-        let oid: u32 = row.get(0);
-        let base: u32 = row.get(1);
-        let base_name: String = row.get(3);
-        parent.insert(oid, (base, base_name));
+        parent.insert(row.get(0), (row.get(1), row.get(3)));
     }
     for &start in parent.keys() {
         let mut cur = start;
@@ -121,14 +116,10 @@ pub async fn load_type_catalog(client: &Client, schemas: &[String]) -> anyhow::R
         )
         .await?;
     for row in &rows {
-        let oid: u32 = row.get(0);
-        let name: String = row.get(1);
-        let field_oid: u32 = row.get(2);
-        let field_type_name: String = row.get(3);
         cat.composites
-            .entry(oid)
+            .entry(row.get(0))
             .or_default()
-            .push((name, field_oid, field_type_name));
+            .push((row.get(1), row.get(2), row.get(3)));
     }
 
     // Range and multirange types. Multiranges have rngmultitypid != 0.
@@ -146,10 +137,8 @@ pub async fn load_type_catalog(client: &Client, schemas: &[String]) -> anyhow::R
         )
         .await?;
     for row in &rows {
-        let rng_oid: u32 = row.get(0);
-        let elem_oid: u32 = row.get(1);
-        let elem_name: String = row.get(2);
-        let multi_oid: u32 = row.get(3);
+        let (rng_oid, elem_oid, elem_name, multi_oid): (u32, u32, String, u32) =
+            (row.get(0), row.get(1), row.get(2), row.get(3));
         cat.ranges.insert(rng_oid, (elem_oid, elem_name.clone()));
         if multi_oid != 0 {
             cat.ranges.insert(multi_oid, (elem_oid, elem_name));
@@ -172,10 +161,7 @@ pub async fn load_type_catalog(client: &Client, schemas: &[String]) -> anyhow::R
         )
         .await?;
     for row in &rows {
-        let arr_oid: u32 = row.get(0);
-        let elem_oid: u32 = row.get(1);
-        let elem_name: String = row.get(2);
-        cat.arrays.insert(arr_oid, (elem_oid, elem_name));
+        cat.arrays.insert(row.get(0), (row.get(1), row.get(2)));
     }
 
     cat.safe_builtin_procs = load_safe_builtin_procs(client).await?;

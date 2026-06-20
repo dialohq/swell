@@ -216,14 +216,9 @@ async fn fetch_columns(
         .await?;
     let mut out: HashMap<(String, String), HashMap<String, (bool, u32)>> = HashMap::new();
     for row in &rows {
-        let schema: String = row.get(0);
-        let table: String = row.get(1);
-        let col: String = row.get(2);
-        let nn: bool = row.get(3);
-        let oid: u32 = row.get(4);
-        out.entry((schema, table))
+        out.entry((row.get(0), row.get(1)))
             .or_default()
-            .insert(col, (nn, oid));
+            .insert(row.get(2), (row.get(3), row.get(4)));
     }
     Ok(out)
 }
