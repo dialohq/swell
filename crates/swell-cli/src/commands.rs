@@ -267,13 +267,11 @@ async fn maybe_connect(cfg: &Config, opts: RunOpts) -> Result<Option<Analyzer>> 
         .by_name
         .iter()
         .map(|(k, v)| {
-            (
-                k.clone(),
-                swell_analyzer::TypeOverride {
-                    parse: v.parse().to_string(),
-                    serialize: v.serialize().to_string(),
-                },
-            )
+            let o = swell_analyzer::TypeOverride {
+                parse: v.parse().to_string(),
+                serialize: v.serialize().to_string(),
+            };
+            (k.clone(), o)
         })
         .collect();
     let res = Analyzer::connect(AnalyzerOptions {
