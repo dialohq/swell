@@ -24,16 +24,13 @@ pub struct RunOpts {
 }
 
 impl RunOpts {
+    // `gen` and `prepare` share semantics — DB-on, prune-on, require-off.
     pub const GEN: Self = Self {
         allow_db: true,
         prune: true,
         require_cache: false,
     };
-    pub const PREPARE: Self = Self {
-        allow_db: true,
-        prune: true,
-        require_cache: false,
-    };
+    pub const PREPARE: Self = Self::GEN;
     pub const CHECK: Self = Self {
         allow_db: false,
         prune: false,
@@ -139,48 +136,15 @@ async fn run_pipeline(cfg: &Config, opts: RunOpts) -> Result<RunSummary> {
     let scanned = scan_project(cfg)?;
     info!("found {} sql() call sites", scanned.len());
 
-    let unique: BTreeMap<String, &ScannedQuery> = scanned
-        .iter()
-        .map(|q| (q.static_parts.first().cloned().unwrap_or_default(), q))
-        .fold(BTreeMap::new(), |mut acc, (k, v)| {
-            acc.entry(k).or_insert(v);
-            acc
-        });
+    let mut unique: BTreeMap<String, &ScannedQuery> = BTreeMap::new();
+    for q in &scanned {
+        let k = q.static_parts.first().cloned().unwrap_or_default();
+        unique.entry(k).or_insert(q);
+    }
     info!("{} unique queries", unique.len());
 
     let cache_dir = cfg.root.join(&cfg.cache.dir);
-
-    let analyzer = if opts.allow_db && cfg.database.url.is_some() {
-        match Analyzer::connect(AnalyzerOptions {
-            database_url: cfg.database.url.clone().unwrap(),
-            schemas: cfg.database.schemas.clone(),
-            type_overrides: cfg
-                .types
-                .by_name
-                .iter()
-                .map(|(k, v)| {
-                    (
-                        k.clone(),
-                        swell_analyzer::TypeOverride {
-                            parse: v.parse().to_string(),
-                            serialize: v.serialize().to_string(),
-                        },
-                    )
-                })
-                .collect(),
-        })
-        .await
-        {
-            Ok(a) => Some(a),
-            Err(e) if !opts.require_cache => {
-                warn!("could not connect to Postgres: {e:#}; trying offline cache");
-                None
-            }
-            Err(e) => return Err(e).context("connecting to dev Postgres"),
-        }
-    } else {
-        None
-    };
+    let analyzer = maybe_connect(cfg, opts).await?;
 
     let schema_fp = match &analyzer {
         Some(an) => an
@@ -292,6 +256,40 @@ async fn run_pipeline(cfg: &Config, opts: RunOpts) -> Result<RunSummary> {
         ));
     }
     Ok(RunSummary { hits, errors })
+}
+
+async fn maybe_connect(cfg: &Config, opts: RunOpts) -> Result<Option<Analyzer>> {
+    if !opts.allow_db || cfg.database.url.is_none() {
+        return Ok(None);
+    }
+    let type_overrides = cfg
+        .types
+        .by_name
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.clone(),
+                swell_analyzer::TypeOverride {
+                    parse: v.parse().to_string(),
+                    serialize: v.serialize().to_string(),
+                },
+            )
+        })
+        .collect();
+    let res = Analyzer::connect(AnalyzerOptions {
+        database_url: cfg.database.url.clone().unwrap(),
+        schemas: cfg.database.schemas.clone(),
+        type_overrides,
+    })
+    .await;
+    match res {
+        Ok(a) => Ok(Some(a)),
+        Err(e) if !opts.require_cache => {
+            warn!("could not connect to Postgres: {e:#}; trying offline cache");
+            Ok(None)
+        }
+        Err(e) => Err(e).context("connecting to dev Postgres"),
+    }
 }
 
 /// Distinct `(schema, table)` pairs referenced by any analysed query

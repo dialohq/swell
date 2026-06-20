@@ -9,8 +9,9 @@
 //! Anything else falls back to the OID-based mapping (`unknown` for
 //! opaque jsonb, overridable via config or `as "col: T"`).
 
+use crate::pg_util::{norm_schema, quote_field, range_var_alias, string_parts, walk_from_tree};
 use crate::ts_types::{Direction, TypeCatalog};
-use pg_query::protobuf::{node, FuncCall, RangeVar, SelectStmt};
+use pg_query::protobuf::{node, FuncCall};
 use std::collections::HashMap;
 use tokio_postgres::Client;
 
@@ -37,7 +38,7 @@ pub async fn infer_shapes(
             return out;
         }
     };
-    let Some(select) = find_top_select(&parsed.protobuf) else {
+    let Some(select) = crate::pg_util::select_stmts(&parsed.protobuf).next() else {
         return out;
     };
     let alias_oids = resolve_alias_oids(client, &build_alias_map(&select.from_clause)).await;
@@ -59,46 +60,19 @@ pub async fn infer_shapes(
     out
 }
 
-fn find_top_select(p: &pg_query::protobuf::ParseResult) -> Option<&SelectStmt> {
-    p.stmts
-        .iter()
-        .find_map(|raw| match &raw.stmt.as_ref()?.node {
-            Some(node::Node::SelectStmt(s)) => Some(s.as_ref()),
-            _ => None,
-        })
-}
-
 fn build_alias_map(from_clause: &[pg_query::protobuf::Node]) -> HashMap<String, (String, String)> {
     let mut out = HashMap::new();
     for n in from_clause {
-        walk_from(n, &mut out);
+        walk_from_tree(n, &mut |n| {
+            if let Some(node::Node::RangeVar(rv)) = n.node.as_ref() {
+                out.insert(
+                    range_var_alias(rv),
+                    (rv.schemaname.clone(), rv.relname.clone()),
+                );
+            }
+        });
     }
     out
-}
-
-fn walk_from(n: &pg_query::protobuf::Node, out: &mut HashMap<String, (String, String)>) {
-    match n.node.as_ref() {
-        Some(node::Node::RangeVar(rv)) => insert_rangevar(rv, out),
-        Some(node::Node::JoinExpr(j)) => {
-            if let Some(l) = &j.larg {
-                walk_from(l, out);
-            }
-            if let Some(r) = &j.rarg {
-                walk_from(r, out);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn insert_rangevar(rv: &RangeVar, out: &mut HashMap<String, (String, String)>) {
-    let alias = rv
-        .alias
-        .as_ref()
-        .map(|a| a.aliasname.clone())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| rv.relname.clone());
-    out.insert(alias, (rv.schemaname.clone(), rv.relname.clone()));
 }
 
 async fn resolve_alias_oids(
@@ -109,14 +83,10 @@ async fn resolve_alias_oids(
     if alias_map.is_empty() {
         return out;
     }
-    let schema_of = |s: &String| {
-        if s.is_empty() {
-            "public".to_string()
-        } else {
-            s.clone()
-        }
-    };
-    let schemas: Vec<String> = alias_map.values().map(|(s, _)| schema_of(s)).collect();
+    let schemas: Vec<String> = alias_map
+        .values()
+        .map(|(s, _)| norm_schema(s).to_string())
+        .collect();
     let names: Vec<String> = alias_map.values().map(|(_, n)| n.clone()).collect();
     let Ok(rows) = client
         .query(
@@ -138,7 +108,7 @@ async fn resolve_alias_oids(
         .map(|row| ((row.get(0), row.get(1)), row.get::<_, i64>(2) as u32))
         .collect();
     for (alias, (s, n)) in alias_map {
-        if let Some(&oid) = by_relname.get(&(schema_of(s), n.clone())) {
+        if let Some(&oid) = by_relname.get(&(norm_schema(s).to_string(), n.clone())) {
             out.insert(alias.clone(), oid);
         }
     }
@@ -168,18 +138,8 @@ fn infer_node<'a>(
 /// `expr::T` → the catalog's render for `T` (handles domains, enums,
 /// composites; falls back to built-in name mapping).
 fn infer_type_cast(catalog: &TypeCatalog, tc: &pg_query::protobuf::TypeCast) -> Option<String> {
-    let names: Vec<String> = tc
-        .type_name
-        .as_ref()?
-        .names
-        .iter()
-        .filter_map(|n| match n.node.as_ref()? {
-            node::Node::String(s) => Some(s.sval.clone()),
-            _ => None,
-        })
-        .collect();
-    let name = names.last()?;
-    Some(catalog.render_oid(0, name, Direction::Read))
+    let names = string_parts(&tc.type_name.as_ref()?.names);
+    Some(catalog.render_oid(0, names.last()?, Direction::Read))
 }
 
 async fn infer_func(
@@ -267,13 +227,7 @@ fn resolve_to_safe_builtin<'c>(catalog: &'c TypeCatalog, fc: &FuncCall) -> Optio
 }
 
 fn funcname_parts(fc: &FuncCall) -> Vec<String> {
-    fc.funcname
-        .iter()
-        .filter_map(|n| match n.node.as_ref()? {
-            node::Node::String(s) => Some(s.sval.clone()),
-            _ => None,
-        })
-        .collect()
+    string_parts(&fc.funcname)
 }
 
 fn funcname_split(parts: &[String]) -> Option<(Option<&str>, &str)> {
@@ -406,19 +360,11 @@ async fn infer_column_ref(
     alias_oids: &HashMap<String, u32>,
     cr: &pg_query::protobuf::ColumnRef,
 ) -> Option<String> {
-    let parts: Vec<String> = cr
-        .fields
-        .iter()
-        .filter_map(|n| match n.node.as_ref()? {
-            node::Node::String(s) => Some(s.sval.clone()),
-            _ => None,
-        })
-        .collect();
+    let parts = string_parts(&cr.fields);
     let (alias, col) = match parts.as_slice() {
         // Bare column — unknown which table.
         [_] => return None,
-        [a, c] => (a.clone(), c.clone()),
-        [_, .., a, c] => (a.clone(), c.clone()),
+        [a, c] | [_, .., a, c] => (a.clone(), c.clone()),
         _ => return None,
     };
     let table_oid = *alias_oids.get(&alias)?;
@@ -497,19 +443,11 @@ async fn infer_table_ref(
     let node::Node::ColumnRef(cr) = arg.node.as_ref()? else {
         return None;
     };
-    let parts: Vec<String> = cr
-        .fields
-        .iter()
-        .filter_map(|n| match n.node.as_ref()? {
-            node::Node::String(s) => Some(s.sval.clone()),
-            _ => None,
-        })
-        .collect();
-    if parts.len() != 1 {
+    let parts = string_parts(&cr.fields);
+    let [alias] = parts.as_slice() else {
         return None;
-    }
-    let table_oid = *alias_oids.get(&parts[0])?;
-    let attrs = fetch_attrs(client, table_oid, None).await;
+    };
+    let attrs = fetch_attrs(client, *alias_oids.get(alias)?, None).await;
     if attrs.is_empty() {
         return None;
     }
@@ -536,16 +474,5 @@ fn infer_a_const(c: &pg_query::protobuf::AConst) -> String {
         Some(Val::Sval(_)) => "string".to_string(),
         Some(Val::Boolval(_)) => "boolean".to_string(),
         _ => "unknown".to_string(),
-    }
-}
-
-fn quote_field(name: &str) -> String {
-    let simple = !name.is_empty()
-        && name.chars().next().unwrap().is_ascii_alphabetic()
-        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-    if simple {
-        name.to_string()
-    } else {
-        format!("\"{}\"", name.replace('"', "\\\""))
     }
 }

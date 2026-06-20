@@ -2,57 +2,33 @@
 //! a verdict-ready node.
 
 use crate::analyzed::{Expr, FuncKind, Lit, ResolvedCol};
+use crate::pg_util::{funcname_last, string_parts};
 use crate::query::TableColRef;
 use crate::scope::Scope;
 use pg_query::protobuf::{a_const::Val, node::Node as NB, Node, SubLinkType, TypeName};
 
 /// Aggregates that return `NULL` on empty input.
+#[rustfmt::skip]
 const NULLABLE_AGGS: &[&str] = &[
-    "sum",
-    "avg",
-    "min",
-    "max",
-    "array_agg",
-    "json_agg",
-    "jsonb_agg",
-    "string_agg",
-    "bool_and",
-    "bool_or",
+    "sum", "avg", "min", "max",
+    "array_agg", "json_agg", "jsonb_agg", "string_agg",
+    "bool_and", "bool_or",
 ];
 
 /// Functions guaranteed non-NULL by construction.
+#[rustfmt::skip]
 const NEVER_NULL_FUNCS: &[&str] = &[
     "count",
-    "row_number",
-    "rank",
-    "dense_rank",
-    "ntile",
-    "cume_dist",
-    "percent_rank",
-    "now",
-    "current_timestamp",
-    "current_date",
-    "current_time",
-    "localtimestamp",
-    "localtime",
-    "current_user",
-    "session_user",
-    "current_database",
-    "current_schema",
-    "current_setting",
-    "gen_random_uuid",
-    "uuid_generate_v1",
-    "uuid_generate_v4",
-    "pg_advisory_lock",
-    "pg_advisory_xact_lock",
-    "jsonb_build_object",
-    "json_build_object",
-    "jsonb_build_array",
-    "json_build_array",
-    "to_jsonb",
-    "to_json",
-    "row_to_json",
-    "array_to_json",
+    "row_number", "rank", "dense_rank", "ntile", "cume_dist", "percent_rank",
+    "now", "current_timestamp", "current_date", "current_time",
+    "localtimestamp", "localtime",
+    "current_user", "session_user", "current_database",
+    "current_schema", "current_setting",
+    "gen_random_uuid", "uuid_generate_v1", "uuid_generate_v4",
+    "pg_advisory_lock", "pg_advisory_xact_lock",
+    "jsonb_build_object", "json_build_object",
+    "jsonb_build_array", "json_build_array",
+    "to_jsonb", "to_json", "row_to_json", "array_to_json",
 ];
 
 pub fn lower(node: &Node, scope: &Scope) -> Expr {
@@ -104,29 +80,21 @@ pub fn lower(node: &Node, scope: &Scope) -> Expr {
                 .is_some_and(|d| is_non_null(&lower(d, scope))),
         },
         NB::FuncCall(fc) => {
-            let Some(NB::String(s)) = fc.funcname.last().and_then(|n| n.node.as_ref()) else {
+            let Some(name) = funcname_last(fc) else {
                 return Expr::Unknown;
             };
-            let name = s.sval.as_str();
             let args = lower_args(&fc.args, scope);
             if name == "coalesce" {
-                Expr::Coalesce(args)
-            } else if NEVER_NULL_FUNCS.contains(&name) {
-                Expr::Func {
-                    kind: FuncKind::NeverNull,
-                    args,
-                }
-            } else if NULLABLE_AGGS.contains(&name) {
-                Expr::Func {
-                    kind: FuncKind::NullableAgg,
-                    args,
-                }
-            } else {
-                Expr::Func {
-                    kind: FuncKind::Other,
-                    args,
-                }
+                return Expr::Coalesce(args);
             }
+            let kind = if NEVER_NULL_FUNCS.contains(&name) {
+                FuncKind::NeverNull
+            } else if NULLABLE_AGGS.contains(&name) {
+                FuncKind::NullableAgg
+            } else {
+                FuncKind::Other
+            };
+            Expr::Func { kind, args }
         }
         NB::ColumnRef(cr) => lower_column_ref(cr, scope)
             .map(Expr::Column)
@@ -182,11 +150,8 @@ fn is_provably_one_row_select(s: &pg_query::protobuf::SelectStmt) -> bool {
         let Some(NB::FuncCall(fc)) = val.node.as_ref() else {
             return false;
         };
-        let name = fc.funcname.last().and_then(|n| match n.node.as_ref()? {
-            NB::String(s) => Some(s.sval.as_str()),
-            _ => None,
-        });
-        matches!(name, Some(n) if NEVER_NULL_FUNCS.contains(&n) || NULLABLE_AGGS.contains(&n))
+        matches!(funcname_last(fc),
+            Some(n) if NEVER_NULL_FUNCS.contains(&n) || NULLABLE_AGGS.contains(&n))
     })
 }
 
@@ -195,29 +160,22 @@ fn lower_args(args: &[Node], scope: &Scope) -> Vec<Expr> {
 }
 
 fn lower_column_ref(cr: &pg_query::protobuf::ColumnRef, scope: &Scope) -> Option<ResolvedCol> {
-    let parts: Vec<&str> = cr
-        .fields
-        .iter()
-        .filter_map(|n| match n.node.as_ref()? {
-            NB::String(s) => Some(s.sval.as_str()),
-            _ => None,
-        })
-        .collect();
+    let parts = string_parts(&cr.fields);
     let (alias, col) = match parts.as_slice() {
         [col] => {
             let r = scope.resolve_bare(col)?;
             return Some(ResolvedCol {
                 table_ref: TableColRef {
-                    schema: r.schema.clone(),
-                    table: r.table.clone(),
-                    column: (*col).to_string(),
+                    schema: r.schema,
+                    table: r.table,
+                    column: col.clone(),
                 },
                 alias: r.alias,
                 not_null: r.not_null,
                 typoid: r.typoid,
             });
         }
-        [alias, col] | [_, alias, col] => (*alias, *col),
+        [alias, col] | [_, alias, col] => (alias.as_str(), col.as_str()),
         _ => return None,
     };
     if let Some(table) = scope.resolve_alias(alias) {
@@ -345,9 +303,5 @@ fn inner_type_oid(e: &Expr) -> Option<u32> {
 }
 
 fn resolve_typename_oid(tn: &TypeName, scope: &Scope) -> Option<u32> {
-    let last = tn.names.last()?;
-    let NB::String(s) = last.node.as_ref()? else {
-        return None;
-    };
-    scope.typname_oid(&s.sval)
+    scope.typname_oid(string_parts(&tn.names).last()?)
 }

@@ -6,6 +6,7 @@
 //! `coalesce($1, …)`) keep the param nullable since callers can
 //! legitimately pass NULL there.
 
+use crate::pg_util::norm_schema;
 use crate::query::TableColRef;
 use pg_query::protobuf::{node, InsertStmt, UpdateStmt};
 use std::collections::{HashMap, HashSet};
@@ -57,7 +58,7 @@ pub async fn infer(client: &Client, sql: &str, n_params: usize) -> Vec<ParamInfo
         if b.param_index == 0 || b.param_index > n_params {
             continue;
         }
-        let schema = normalize_schema(&b.schema);
+        let schema = norm_schema(&b.schema).to_string();
         let key = (schema.clone(), b.table.clone(), b.column.clone());
         let entry = &mut out[b.param_index - 1];
         let Some(&not_null) = attnotnull.get(&key) else {
@@ -87,7 +88,7 @@ async fn resolve_attnotnull(
         .iter()
         .map(|b| {
             (
-                normalize_schema(&b.schema),
+                norm_schema(&b.schema).to_string(),
                 b.table.clone(),
                 b.column.clone(),
             )
@@ -200,13 +201,5 @@ fn collect_update(upd: &UpdateStmt, out: &mut Vec<Binding>) {
             table: rel.relname.clone(),
             column: rt.name.clone(),
         });
-    }
-}
-
-fn normalize_schema(s: &str) -> String {
-    if s.is_empty() {
-        "public".to_string()
-    } else {
-        s.to_string()
     }
 }

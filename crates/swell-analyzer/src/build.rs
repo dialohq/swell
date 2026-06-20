@@ -34,30 +34,6 @@ pub async fn build(
     param_bindings: &HashMap<usize, TableColRef>,
     unsafe_casts: HashSet<(u32, u32)>,
     typname_to_oid: HashMap<String, u32>,
-) -> Result<Analyzed> {
-    build_inner(
-        client,
-        sql,
-        described,
-        plan,
-        column_meta,
-        param_bindings,
-        unsafe_casts,
-        typname_to_oid,
-        &HashSet::new(),
-    )
-    .await
-}
-
-async fn build_inner(
-    client: &Client,
-    sql: &str,
-    described: &DescribedQuery,
-    plan: PlanWalk,
-    column_meta: &ColumnMeta,
-    param_bindings: &HashMap<usize, TableColRef>,
-    unsafe_casts: HashSet<(u32, u32)>,
-    typname_to_oid: HashMap<String, u32>,
     visited: &HashSet<u32>,
 ) -> Result<Analyzed> {
     let mut scope = Scope::build(
@@ -177,16 +153,12 @@ enum TargetSource {
 }
 
 fn collect_target_source(sql: &str) -> TargetSource {
-    let Ok(parsed) = pg_query::parse(sql) else {
-        return TargetSource::Unknown;
-    };
-    let Some(raw) = parsed.protobuf.stmts.into_iter().next() else {
-        return TargetSource::Unknown;
-    };
-    let Some(boxed) = raw.stmt else {
-        return TargetSource::Unknown;
-    };
-    let Some(body) = (*boxed).node else {
+    let body = pg_query::parse(sql)
+        .ok()
+        .and_then(|p| p.protobuf.stmts.into_iter().next())
+        .and_then(|raw| raw.stmt)
+        .and_then(|boxed| boxed.node);
+    let Some(body) = body else {
         return TargetSource::Unknown;
     };
     let targets = match body {
@@ -267,9 +239,8 @@ fn analyze_view_refs<'a>(
         if candidates.is_empty() {
             return Ok(HashMap::new());
         }
-        let view_oids = fetch_view_oids(client, &candidates).await;
         let mut out = HashMap::new();
-        for (alias, oid) in view_oids {
+        for (alias, oid) in fetch_view_oids(client, &candidates).await {
             if visited.contains(&oid) {
                 continue;
             }
@@ -295,7 +266,7 @@ fn analyze_view_refs<'a>(
             let column_meta = crate::resolve_column_meta(client, &pairs).await;
             let mut next_visited = visited.clone();
             next_visited.insert(oid);
-            let analyzed = build_inner(
+            let analyzed = build(
                 client,
                 &view_sql,
                 &described,
@@ -307,7 +278,7 @@ fn analyze_view_refs<'a>(
                 &next_visited,
             )
             .await?;
-            let cols: Vec<DerivedColumn> = analyzed
+            let cols = analyzed
                 .outputs
                 .into_iter()
                 .map(|o| DerivedColumn {
@@ -326,38 +297,20 @@ fn find_rangevar_aliases(sql: &str) -> Vec<(String, String, String)> {
     let Ok(parsed) = pg_query::parse(sql) else {
         return out;
     };
-    for raw in &parsed.protobuf.stmts {
-        let Some(NB::SelectStmt(select)) = raw.stmt.as_deref().and_then(|s| s.node.as_ref()) else {
-            continue;
-        };
+    for select in crate::pg_util::select_stmts(&parsed.protobuf) {
         for from in &select.from_clause {
-            walk_rangevars(from, &mut out);
+            crate::pg_util::walk_from_tree(from, &mut |n| {
+                if let Some(NB::RangeVar(rv)) = n.node.as_ref() {
+                    out.push((
+                        crate::pg_util::range_var_alias(rv),
+                        rv.schemaname.clone(),
+                        rv.relname.clone(),
+                    ));
+                }
+            });
         }
     }
     out
-}
-
-fn walk_rangevars(n: &Node, out: &mut Vec<(String, String, String)>) {
-    match n.node.as_ref() {
-        Some(NB::RangeVar(rv)) => {
-            let alias = rv
-                .alias
-                .as_ref()
-                .map(|a| a.aliasname.clone())
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| rv.relname.clone());
-            out.push((alias, rv.schemaname.clone(), rv.relname.clone()));
-        }
-        Some(NB::JoinExpr(je)) => {
-            if let Some(l) = je.larg.as_deref() {
-                walk_rangevars(l, out);
-            }
-            if let Some(r) = je.rarg.as_deref() {
-                walk_rangevars(r, out);
-            }
-        }
-        _ => {}
-    }
 }
 
 /// Filter `RangeVar` candidates by `pg_class.relkind = 'v'`. Returns
@@ -371,7 +324,7 @@ async fn fetch_view_oids(
     }
     let schemas: Vec<&str> = candidates
         .iter()
-        .map(|(_, s, _)| if s.is_empty() { "public" } else { s.as_str() })
+        .map(|(_, s, _)| crate::pg_util::norm_schema(s))
         .collect();
     let names: Vec<&str> = candidates.iter().map(|(_, _, n)| n.as_str()).collect();
     let rows = match client
@@ -401,13 +354,11 @@ async fn fetch_view_oids(
     candidates
         .iter()
         .filter_map(|(alias, schema, name)| {
-            let s = if schema.is_empty() {
-                "public".to_string()
-            } else {
-                schema.clone()
-            };
             by_name
-                .get(&(s, name.clone()))
+                .get(&(
+                    crate::pg_util::norm_schema(schema).to_string(),
+                    name.clone(),
+                ))
                 .map(|oid| (alias.clone(), *oid))
         })
         .collect()
@@ -428,10 +379,7 @@ fn collect_derived(sql: &str, scope: &Scope) -> HashMap<String, Vec<DerivedColum
     let Ok(parsed) = pg_query::parse(sql) else {
         return out;
     };
-    for raw in &parsed.protobuf.stmts {
-        let Some(NB::SelectStmt(select)) = raw.stmt.as_deref().and_then(|s| s.node.as_ref()) else {
-            continue;
-        };
+    for select in crate::pg_util::select_stmts(&parsed.protobuf) {
         if let Some(wc) = &select.with_clause {
             for cte_node in &wc.ctes {
                 let Some(NB::CommonTableExpr(cte)) = cte_node.node.as_ref() else {
@@ -448,44 +396,23 @@ fn collect_derived(sql: &str, scope: &Scope) -> HashMap<String, Vec<DerivedColum
             }
         }
         for from in &select.from_clause {
-            collect_derived_from(from, scope, &mut out);
+            crate::pg_util::walk_from_tree(from, &mut |n| {
+                let Some(NB::RangeSubselect(rs)) = n.node.as_ref() else {
+                    return;
+                };
+                let alias = match rs.alias.as_ref() {
+                    Some(a) if !a.aliasname.is_empty() => a,
+                    _ => return,
+                };
+                if let Some(cols) =
+                    lower_subquery_columns(rs.subquery.as_deref(), &alias.colnames, scope)
+                {
+                    out.insert(alias.aliasname.clone(), cols);
+                }
+            });
         }
     }
     out
-}
-
-fn collect_derived_from(node: &Node, scope: &Scope, out: &mut HashMap<String, Vec<DerivedColumn>>) {
-    match node.node.as_ref() {
-        Some(NB::RangeSubselect(rs)) => {
-            let Some(alias_name) = rs
-                .alias
-                .as_ref()
-                .map(|a| a.aliasname.clone())
-                .filter(|s| !s.is_empty())
-            else {
-                return;
-            };
-            let alias_colnames: Vec<Node> = rs
-                .alias
-                .as_ref()
-                .map(|a| a.colnames.clone())
-                .unwrap_or_default();
-            if let Some(cols) =
-                lower_subquery_columns(rs.subquery.as_deref(), &alias_colnames, scope)
-            {
-                out.insert(alias_name, cols);
-            }
-        }
-        Some(NB::JoinExpr(je)) => {
-            if let Some(l) = je.larg.as_deref() {
-                collect_derived_from(l, scope, out);
-            }
-            if let Some(r) = je.rarg.as_deref() {
-                collect_derived_from(r, scope, out);
-            }
-        }
-        _ => {}
-    }
 }
 
 fn lower_subquery_columns(
@@ -504,13 +431,8 @@ fn lower_select_columns(
     aliascolnames: &[Node],
     scope: &Scope,
 ) -> Option<Vec<DerivedColumn>> {
-    let alias_names: Vec<Option<String>> = aliascolnames
-        .iter()
-        .map(|n| match n.node.as_ref()? {
-            NB::String(s) => Some(s.sval.clone()),
-            _ => None,
-        })
-        .collect();
+    let alias_names = crate::pg_util::string_parts(aliascolnames);
+    let alias_at = |i: usize| alias_names.get(i).cloned().unwrap_or_default();
     // Set-op or recursive CTE: base case (`larg`) sets the floor.
     if select.op != SETOP_NONE {
         return select
@@ -529,7 +451,7 @@ fn lower_select_columns(
                 .iter()
                 .enumerate()
                 .map(|(i, expr)| DerivedColumn {
-                    name: alias_names.get(i).cloned().flatten().unwrap_or_default(),
+                    name: alias_at(i),
                     expr: lower(expr, scope),
                 })
                 .collect(),
@@ -548,7 +470,6 @@ fn lower_select_columns(
                 let name = alias_names
                     .get(i)
                     .cloned()
-                    .flatten()
                     .unwrap_or_else(|| rt.name.clone());
                 Some(DerivedColumn {
                     name,

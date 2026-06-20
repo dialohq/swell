@@ -173,14 +173,11 @@ impl Scope {
     /// First alias (alphabetically) pointing at `(schema, table)` —
     /// deterministic tiebreak for star-expansion outputs on self-joins.
     pub fn find_alias(&self, schema: &str, table: &str) -> Option<&str> {
-        let mut matches: Vec<&str> = self
-            .aliases
+        self.aliases
             .iter()
             .filter(|(_, t)| t.schema == schema && t.name == table)
             .map(|(a, _)| a.as_str())
-            .collect();
-        matches.sort();
-        matches.into_iter().next()
+            .min()
     }
 }
 
