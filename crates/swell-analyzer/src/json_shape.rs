@@ -149,26 +149,21 @@ async fn infer_func(
     // Resolve to a canonical pg_catalog short name — refuses user-defined
     // shadows so we never produce a structural type that doesn't match
     // the runtime row.
-    let canonical = resolve_to_safe_builtin(catalog, fc)?;
-    match canonical {
+    let infer = |node| async move {
+        infer_node(client, catalog, alias_oids, node)
+            .await
+            .unwrap_or_else(|| "unknown".to_string())
+    };
+    match resolve_to_safe_builtin(catalog, fc)? {
         "jsonb_build_object" | "json_build_object" => {
             infer_build_object(client, catalog, alias_oids, &fc.args).await
         }
-        "jsonb_agg" | "json_agg" => {
-            let arg = fc.args.first()?;
-            let inner = infer_node(client, catalog, alias_oids, arg)
-                .await
-                .unwrap_or_else(|| "unknown".to_string());
-            Some(format!("{}[]", inner))
-        }
+        "jsonb_agg" | "json_agg" => Some(format!("{}[]", infer(fc.args.first()?).await)),
         "to_jsonb" | "row_to_json" => {
             infer_table_ref(client, catalog, alias_oids, fc.args.first()?).await
         }
         "jsonb_object_agg" | "json_object_agg" => {
-            let val_ts = infer_node(client, catalog, alias_oids, fc.args.get(1)?)
-                .await
-                .unwrap_or_else(|| "unknown".to_string());
-            Some(format!("Record<string, {}>", val_ts))
+            Some(format!("Record<string, {}>", infer(fc.args.get(1)?).await))
         }
         _ => None,
     }
