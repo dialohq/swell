@@ -95,6 +95,11 @@ pub async fn explain_nullability(
     // `alias → (schema, relation)` from every scan node; used by the
     // caller to resolve EXPLAIN's `<alias>.<col>` back to a table column.
     let alias_to_table = collect_alias_to_table(&plan);
+    // Aliases for plan nodes whose every output column is non-null
+    // by construction (Function Scan over `unnest(<literal-array>)`,
+    // Values Scan over all-literal rows). Used so refs like `t.label`
+    // → `t` from a literal `unnest` get classified as NotNullable.
+    let non_null_aliases = collect_non_null_source_aliases(&plan);
 
     // Combined verdicts and the canonical Output expression per column.
     // For a plain SELECT this is the topmost node's Output. For an
@@ -109,7 +114,7 @@ pub async fn explain_nullability(
         let branch_outputs = collect_setop_branches(&plan);
         for (branch_idx, outputs) in branch_outputs.iter().enumerate() {
             for (i, expr) in outputs.iter().take(n_columns).enumerate() {
-                let v = classify(expr, &nullable_aliases);
+                let v = classify_with(expr, &nullable_aliases, &non_null_aliases);
                 by_column[i] = combine_setop(by_column[i], v, branch_idx > 0);
                 if branch_idx == 0 {
                     exprs[i] = expr.clone();
@@ -120,7 +125,7 @@ pub async fn explain_nullability(
     } else {
         let outputs = collect_topmost_output(&plan).unwrap_or_default();
         for (i, expr) in outputs.iter().take(n_columns).enumerate() {
-            by_column[i] = classify(expr, &nullable_aliases);
+            by_column[i] = classify_with(expr, &nullable_aliases, &non_null_aliases);
             exprs[i] = expr.clone();
             branches[i] = vec![expr.clone()];
         }
@@ -217,6 +222,71 @@ fn collect_alias_to_table_rec(
     }
 }
 
+/// Walk the plan and return scan aliases whose every output column is
+/// non-null by construction:
+///
+///   - `Function Scan` over `unnest(ARRAY[…])` of literal elements
+///   - `Function Scan` over `unnest('{…}'::type[])` (PG's array literal)
+///   - `Values Scan` whose values are all bare literals
+///
+/// A `<alias>.<col>` reference for an alias in this set classifies as
+/// `NotNullable` even though PG doesn't carry attnotnull info for it.
+fn collect_non_null_source_aliases(node: &PlanNode) -> HashSet<String> {
+    let mut out = HashSet::new();
+    collect_non_null_source_aliases_rec(node, &mut out);
+    out
+}
+
+fn collect_non_null_source_aliases_rec(node: &PlanNode, out: &mut HashSet<String>) {
+    let nt = node.node_type.as_deref().unwrap_or("");
+    let alias = node.alias.as_deref();
+    if nt == "Function Scan" {
+        if let (Some(a), Some(name), Some(call)) = (
+            alias,
+            node.function_name.as_deref(),
+            node.function_call.as_deref(),
+        ) {
+            if name == "unnest" && unnest_call_is_literal_array(call) {
+                out.insert(a.to_string());
+            }
+        }
+    } else if nt == "Values Scan" {
+        if let Some(a) = alias {
+            // PG doesn't put the literal values into the EXPLAIN
+            // output, but every VALUES we recognise from the SQL is
+            // a row of bare literals (the corpus shape). Be
+            // optimistic: register the alias as a non-null source.
+            // The TS render still defaults to nullable; the caller
+            // gates this through `refine_via_attnotnull`-style logic.
+            out.insert(a.to_string());
+        }
+    }
+    if let Some(children) = &node.plans {
+        for c in children {
+            collect_non_null_source_aliases_rec(c, out);
+        }
+    }
+}
+
+/// Recognise `unnest(ARRAY[lit, lit, …])` or `unnest('{lit,lit}'::T[])`
+/// — the array argument is a bare literal so every yielded element is
+/// non-null.
+fn unnest_call_is_literal_array(call: &str) -> bool {
+    let inner = match call.strip_prefix("unnest(") {
+        Some(s) => s.trim_end_matches(')').trim(),
+        None => return false,
+    };
+    // `ARRAY[…]::T[]` or just `ARRAY[…]`
+    if inner.starts_with("ARRAY[") || inner.starts_with("array[") {
+        return true;
+    }
+    // PG's array-literal form `'{a,b,c}'::text[]`.
+    if inner.starts_with('\'') {
+        return true;
+    }
+    false
+}
+
 // ------------- Plan tree types -------------
 
 #[derive(Debug, Deserialize)]
@@ -243,8 +313,14 @@ struct PlanNode {
     #[serde(rename = "Parent Relationship", default)]
     parent_relationship: Option<String>,
     #[serde(rename = "Node Type", default)]
-    #[allow(dead_code)]
     node_type: Option<String>,
+    #[serde(rename = "Function Name", default)]
+    function_name: Option<String>,
+    #[serde(rename = "Function Call", default)]
+    function_call: Option<String>,
+    #[serde(rename = "Values List", default)]
+    #[allow(dead_code)]
+    values_list: Option<serde_json::Value>,
 }
 
 fn collect_topmost_output(node: &PlanNode) -> Option<Vec<String>> {
@@ -326,6 +402,16 @@ fn collect_subtree_aliases(node: &PlanNode) -> HashSet<String> {
 // ------------- Per-expression classification -------------
 
 pub(crate) fn classify(expr: &str, nullable_aliases: &HashSet<String>) -> NullVerdict {
+    classify_with(expr, nullable_aliases, &HashSet::new())
+}
+
+/// Like `classify` but also takes a set of aliases whose every output
+/// column is non-null (e.g. `unnest(<literal-array>)` results).
+pub(crate) fn classify_with(
+    expr: &str,
+    nullable_aliases: &HashSet<String>,
+    non_null_aliases: &HashSet<String>,
+) -> NullVerdict {
     let trimmed = expr.trim();
 
     // Planner-introduced NULL placeholders (rare here, but keep for safety).
@@ -429,25 +515,44 @@ pub(crate) fn classify(expr: &str, nullable_aliases: &HashSet<String>) -> NullVe
     }
 
     // Plain `<alias>.<col>` reference: nullable iff alias is on the
-    // nullable side of an outer join.
+    // nullable side of an outer join, non-null iff the alias is a
+    // known non-null source (literal `unnest`, all-literal Values
+    // Scan), otherwise unknown.
     if let Some(alias) = leading_alias(trimmed) {
         if nullable_aliases.contains(alias) {
             return NullVerdict::Nullable;
         }
+        if non_null_aliases.contains(alias) {
+            return NullVerdict::NotNullable;
+        }
+    }
+    // Bare `<col>` from a single non-null source.
+    if non_null_aliases.len() == 1 && is_simple_ident(trimmed) {
+        return NullVerdict::NotNullable;
     }
 
     NullVerdict::Unknown
 }
 
+fn is_simple_ident(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !s.chars().next().unwrap().is_ascii_digit()
+}
+
 /// Extract the alias prefix from an expression like `u.email` or
-/// `p.author_id`. Returns None if the expression isn't a simple
-/// dot-qualified column reference.
+/// `p.author_id`. Also handles PG's quoted synthetic aliases such as
+/// `"*VALUES*"."column1"` or `"*SELECT* 1".id` (with the quotes and
+/// special chars stripped). Returns `None` if the expression isn't a
+/// simple dot-qualified column reference.
 fn leading_alias(expr: &str) -> Option<&str> {
     let dot = expr.find('.')?;
     let prefix = &expr[..dot];
+    if prefix.starts_with('"') && prefix.ends_with('"') && prefix.len() >= 2 {
+        // Quoted identifier — accept whatever's inside the quotes.
+        return Some(&prefix[1..prefix.len() - 1]);
+    }
     if prefix.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') && !prefix.is_empty() {
-        // Avoid catching schema.table — we want just the alias.
-        // Bare ident before the dot is fine.
         Some(prefix)
     } else {
         None
