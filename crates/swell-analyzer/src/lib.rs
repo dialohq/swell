@@ -142,9 +142,8 @@ impl Analyzer {
                 let inferred_ts = infer_setop_literal_union(expr)
                     .or_else(|| json_shapes.by_target.get(i).cloned().flatten())
                     .unwrap_or(oid_ts);
-
-                // SQLx-style override markers in the alias: `col!`
-                // forces NOT NULL, `col?` forces nullable.
+                // SQLx-style override markers in the alias: `col!` forces
+                // NOT NULL, `col?` forces nullable.
                 let force_nullable = match c.name.chars().last() {
                     Some('!') => Some(false),
                     Some('?') => Some(true),
