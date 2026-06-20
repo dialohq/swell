@@ -479,169 +479,145 @@ mod tests {
         }
     }
 
+    fn with_tables(tables: &[TableSchema]) -> CodegenOptions<'_> {
+        CodegenOptions { tables, ..Default::default() }
+    }
+
+    #[track_caller]
+    fn assert_has(out: &str, needle: &str) {
+        assert!(out.contains(needle), "expected `{needle}` in:\n{out}");
+    }
+
+    #[track_caller]
+    fn assert_lacks(out: &str, needle: &str) {
+        assert!(!out.contains(needle), "did not expect `{needle}` in:\n{out}");
+    }
+
     #[test]
     fn extra_imports_render_after_swell_import() {
         let imports = vec![(
-            "@/lib/types".to_string(),
-            vec!["ImportSchema".to_string(), "JsonSchema".to_string()],
+            "@/lib/types".into(),
+            vec!["ImportSchema".into(), "JsonSchema".into()],
         )];
-        let out = render(
-            &[],
-            CodegenOptions { extra_imports: &imports, tables: &[] },
-        );
-        assert!(
-            out.contains("import { type ImportSchema, type JsonSchema } from \"@/lib/types\";"),
-            "expected extra import line, got: {}",
-            out
-        );
+        let out = render(&[], CodegenOptions { extra_imports: &imports, tables: &[] });
+        assert_has(&out, "import { type ImportSchema, type JsonSchema } from \"@/lib/types\";");
     }
 
     #[test]
     fn empty_module_emits_empty_registry_augmentation() {
         let out = render(&[], CodegenOptions::default());
-        assert!(out.contains("import { type Json, type SqlText } from \"@dialo/swell\""), "got: {}", out);
-        assert!(out.contains("declare module \"@dialo/swell\" {"), "got: {}", out);
-        assert!(out.contains("  interface Registry {}\n"), "got: {}", out);
-        assert!(!out.contains("export function q"), "should not emit q; q lives in swell now: {}", out);
+        assert_has(&out, "import { type Json, type SqlText } from \"@dialo/swell\"");
+        assert_has(&out, "declare module \"@dialo/swell\" {");
+        assert_has(&out, "  interface Registry {}\n");
+        // q lives in swell now; codegen should never emit it.
+        assert_lacks(&out, "export function q");
     }
 
     #[test]
     fn entry_no_params() {
-        let queries = vec![q(
-            "SELECT 1",
-            vec![],
-            vec![col("?column?", "number", false)],
-        )];
-        let out = render(&queries, CodegenOptions::default());
-        assert!(
-            out.contains("    \"SELECT 1\": { params: []; row: { \"?column?\": number } };"),
-            "got: {}",
-            out
+        let out = render(
+            &[q("SELECT 1", vec![], vec![col("?column?", "number", false)])],
+            CodegenOptions::default(),
         );
+        assert_has(&out, "    \"SELECT 1\": { params: []; row: { \"?column?\": number } };");
     }
 
     #[test]
     fn entry_with_params() {
-        let queries = vec![q(
-            "SELECT id FROM users WHERE id = $1",
-            vec![p("string", true)],
-            vec![col("id", "string", false)],
-        )];
-        let out = render(&queries, CodegenOptions::default());
-        assert!(
-            out.contains(
-                "    \"SELECT id FROM users WHERE id = $1\": { params: [string | null]; row: { id: string } };"
-            ),
-            "got: {}",
-            out
+        let out = render(
+            &[q("SELECT id FROM users WHERE id = $1",
+                vec![p("string", true)],
+                vec![col("id", "string", false)])],
+            CodegenOptions::default(),
         );
+        assert_has(&out, "    \"SELECT id FROM users WHERE id = $1\": { params: [string | null]; row: { id: string } };");
     }
 
     #[test]
     fn entry_write_only_query() {
-        let queries = vec![q(
-            "DELETE FROM users WHERE id = $1",
-            vec![p("string", true)],
-            vec![],
-        )];
-        let out = render(&queries, CodegenOptions::default());
-        assert!(
-            out.contains(
-                "    \"DELETE FROM users WHERE id = $1\": { params: [string | null]; row: never };"
-            ),
-            "got: {}",
-            out
+        let out = render(
+            &[q("DELETE FROM users WHERE id = $1",
+                vec![p("string", true)], vec![])],
+            CodegenOptions::default(),
         );
+        assert_has(&out, "    \"DELETE FROM users WHERE id = $1\": { params: [string | null]; row: never };");
     }
 
     #[test]
     fn multiline_query_renders_as_computed_template_literal_key() {
-        let queries = vec![q(
-            "SELECT id, email\nFROM users\nWHERE id = $1",
-            vec![p("string", true)],
-            vec![col("id", "string", false)],
-        )];
-        let out = render(&queries, CodegenOptions::default());
-        assert!(
-            out.contains("    [`SELECT id, email\nFROM users\nWHERE id = $1`]: { params:"),
-            "expected computed template-literal key, got: {}",
-            out
+        let out = render(
+            &[q("SELECT id, email\nFROM users\nWHERE id = $1",
+                vec![p("string", true)],
+                vec![col("id", "string", false)])],
+            CodegenOptions::default(),
         );
+        assert_has(&out, "    [`SELECT id, email\nFROM users\nWHERE id = $1`]: { params:");
     }
 
     #[test]
     fn template_literal_escapes_backticks_and_interpolation() {
-        let queries = vec![q(
-            "SELECT '`x`' AS a, '${y}' AS b\nFROM t",
-            vec![],
-            vec![col("a", "string", false)],
-        )];
-        let out = render(&queries, CodegenOptions::default());
-        assert!(out.contains("\\`x\\`"), "backtick not escaped: {}", out);
-        assert!(out.contains("\\${y}"), "interpolation not escaped: {}", out);
+        let out = render(
+            &[q("SELECT '`x`' AS a, '${y}' AS b\nFROM t",
+                vec![], vec![col("a", "string", false)])],
+            CodegenOptions::default(),
+        );
+        assert_has(&out, "\\`x\\`");
+        assert_has(&out, "\\${y}");
     }
 
     #[test]
     fn multiple_entries_render_in_one_interface() {
-        let queries = vec![
-            q("SELECT 1", vec![], vec![col("n", "number", false)]),
-            q("SELECT 2", vec![], vec![col("n", "number", false)]),
-        ];
-        let out = render(&queries, CodegenOptions::default());
-        assert!(out.contains("declare module \"@dialo/swell\" {\n  interface Registry {\n"), "missing block open: {}", out);
-        assert!(out.contains("    \"SELECT 1\": { params: []; row: { n: number } };\n"), "missing entry 1: {}", out);
-        assert!(out.contains("    \"SELECT 2\": { params: []; row: { n: number } };\n"), "missing entry 2: {}", out);
-        assert!(out.contains("  }\n}\n"), "missing block close: {}", out);
+        let out = render(
+            &[
+                q("SELECT 1", vec![], vec![col("n", "number", false)]),
+                q("SELECT 2", vec![], vec![col("n", "number", false)]),
+            ],
+            CodegenOptions::default(),
+        );
+        assert_has(&out, "declare module \"@dialo/swell\" {\n  interface Registry {\n");
+        assert_has(&out, "    \"SELECT 1\": { params: []; row: { n: number } };\n");
+        assert_has(&out, "    \"SELECT 2\": { params: []; row: { n: number } };\n");
+        assert_has(&out, "  }\n}\n");
     }
 
     #[test]
     fn unknown_params_stay_unwidened() {
-        let queries = vec![q(
-            "SELECT 1 WHERE $1::int = 1",
-            vec![p("unknown", true)],
-            vec![],
-        )];
-        let out = render(&queries, CodegenOptions::default());
-        assert!(out.contains("params: [unknown];"), "got: {}", out);
+        let out = render(
+            &[q("SELECT 1 WHERE $1::int = 1", vec![p("unknown", true)], vec![])],
+            CodegenOptions::default(),
+        );
+        assert_has(&out, "params: [unknown];");
     }
 
     #[test]
     fn non_null_params_render_without_union() {
-        let queries = vec![q(
-            "INSERT INTO t (a) VALUES ($1)",
-            vec![p("string", false)],
-            vec![],
-        )];
-        let out = render(&queries, CodegenOptions::default());
-        assert!(out.contains("params: [string];"), "got: {}", out);
+        let out = render(
+            &[q("INSERT INTO t (a) VALUES ($1)", vec![p("string", false)], vec![])],
+            CodegenOptions::default(),
+        );
+        assert_has(&out, "params: [string];");
     }
 
     #[test]
     fn tables_render_as_exported_interfaces() {
-        let tables = vec![
-            ts("scheduler", "campaigns", vec![
-                ("id", "number", true),
-                ("name", "string", true),
-                ("owner_id", "string", false),  // nullable
-            ]),
-        ];
-        let out = render(&[], CodegenOptions {
-            tables: &tables, ..Default::default()
-        });
-        assert!(out.contains("export interface SchedulerCampaigns {\n"), "got: {}", out);
-        assert!(out.contains("  id: number;\n"), "got: {}", out);
-        assert!(out.contains("  name: string;\n"), "got: {}", out);
-        assert!(out.contains("  owner_id: string | null;\n"), "got: {}", out);
+        let tables = vec![ts("scheduler", "campaigns", vec![
+            ("id", "number", true),
+            ("name", "string", true),
+            ("owner_id", "string", false),
+        ])];
+        let out = render(&[], with_tables(&tables));
+        assert_has(&out, "export interface SchedulerCampaigns {\n");
+        assert_has(&out, "  id: number;\n");
+        assert_has(&out, "  name: string;\n");
+        assert_has(&out, "  owner_id: string | null;\n");
     }
 
     #[test]
     fn public_schema_is_elided_from_type_name() {
         let tables = vec![ts("public", "users", vec![("id", "string", true)])];
-        let out = render(&[], CodegenOptions {
-            tables: &tables, ..Default::default()
-        });
-        assert!(out.contains("export interface Users {"), "got: {}", out);
-        assert!(!out.contains("PublicUsers"), "should elide public schema, got: {}", out);
+        let out = render(&[], with_tables(&tables));
+        assert_has(&out, "export interface Users {");
+        assert_lacks(&out, "PublicUsers");
     }
 
     #[test]
@@ -650,123 +626,89 @@ mod tests {
         // SELECT-* short-circuit doesn't fire and we exercise the
         // indexed-access path.
         let tables = vec![ts("scheduler", "campaigns", vec![
-            ("id", "number", true),
-            ("name", "string", true),
-            ("owner_id", "string", false),
+            ("id", "number", true), ("name", "string", true), ("owner_id", "string", false),
         ])];
-        let queries = vec![q(
-            "SELECT id, name FROM scheduler.campaigns WHERE id = $1",
-            vec![p("number", true)],
-            vec![
-                col_from("id", "number", false, "scheduler", "campaigns"),
-                col_from("name", "string", false, "scheduler", "campaigns"),
-            ],
-        )];
-        let out = render(&queries, CodegenOptions {
-            tables: &tables, ..Default::default()
-        });
-        assert!(out.contains("row: { id: SchedulerCampaigns[\"id\"]; name: SchedulerCampaigns[\"name\"] }"),
-            "got: {}", out);
+        let out = render(
+            &[q("SELECT id, name FROM scheduler.campaigns WHERE id = $1",
+                vec![p("number", true)],
+                vec![
+                    col_from("id", "number", false, "scheduler", "campaigns"),
+                    col_from("name", "string", false, "scheduler", "campaigns"),
+                ])],
+            with_tables(&tables),
+        );
+        assert_has(&out, "row: { id: SchedulerCampaigns[\"id\"]; name: SchedulerCampaigns[\"name\"] }");
     }
 
     #[test]
     fn param_ref_keeps_inferred_write_direction_ts_type() {
-        // Params skip the `Table["col"]` substitution that columns get:
-        // the `Table` interface is rendered with read-direction (parse)
-        // types, so a `types.by_name` split (e.g. timestamp parses to
-        // Spacetime, serializes from Date) would otherwise leak the read
-        // shape into INSERT/UPDATE positions. Params keep the analyzer's
-        // write-direction `ts_type` verbatim instead.
-        let tables = vec![ts("public", "events", vec![
-            ("at", "Spacetime", true),  // read-side shape (Tables["events"]["at"])
-        ])];
-        let queries = vec![q(
-            "INSERT INTO events (at) VALUES ($1)",
-            // Analyzer set ts_type = "Date" (write-side) but kept the
-            // table_ref pointing at the column.
-            vec![p_from("Date", false, "public", "events", "at")],
-            vec![],
-        )];
-        let out = render(&queries, CodegenOptions {
-            tables: &tables, ..Default::default()
-        });
-        assert!(out.contains("params: [Date]"),
-            "param should keep write-direction ts_type, got: {}", out);
-        assert!(!out.contains("params: [Events["),
-            "param must NOT use indexed table access (that interface is read-direction), got: {}", out);
+        // The Table interface is rendered with read-direction (parse)
+        // types; a `types.by_name` split (e.g. timestamp parses to
+        // Spacetime, serializes from Date) would otherwise leak the
+        // read shape into INSERT/UPDATE positions. Params keep the
+        // analyzer's write-direction `ts_type` verbatim.
+        let tables = vec![ts("public", "events", vec![("at", "Spacetime", true)])];
+        let out = render(
+            &[q("INSERT INTO events (at) VALUES ($1)",
+                vec![p_from("Date", false, "public", "events", "at")], vec![])],
+            with_tables(&tables),
+        );
+        assert_has(&out, "params: [Date]");
+        assert_lacks(&out, "params: [Events[");
     }
 
     #[test]
     fn column_ref_still_uses_indexed_access_after_param_fix() {
-        // Sanity: changing param rendering must not regress column
-        // rendering — columns still go through the indexed-access path.
-        // The extra column keeps the SELECT-* short-circuit from firing.
+        // Sanity: param rendering changes must not regress column
+        // rendering. The extra column keeps the SELECT-* short-circuit
+        // from firing.
         let tables = vec![ts("public", "events", vec![
-            ("at", "Spacetime", true),
-            ("kind", "string", true),
+            ("at", "Spacetime", true), ("kind", "string", true),
         ])];
-        let queries = vec![q(
-            "SELECT at FROM events",
-            vec![],
-            vec![col_from("at", "Spacetime", false, "public", "events")],
-        )];
-        let out = render(&queries, CodegenOptions {
-            tables: &tables, ..Default::default()
-        });
-        assert!(out.contains("row: { at: Events[\"at\"] }"), "got: {}", out);
+        let out = render(
+            &[q("SELECT at FROM events", vec![],
+                vec![col_from("at", "Spacetime", false, "public", "events")])],
+            with_tables(&tables),
+        );
+        assert_has(&out, "row: { at: Events[\"at\"] }");
     }
 
     #[test]
     fn nullable_join_widens_table_ref() {
-        // LEFT JOIN makes a NOT NULL base column nullable in the result.
-        // Codegen keeps the table ref but unions with null.
+        // LEFT JOIN widens a NOT NULL base column to nullable; codegen
+        // keeps the table ref but unions with null.
         let tables = vec![ts("public", "posts", vec![("body", "string", true)])];
-        let queries = vec![q(
-            "SELECT p.body FROM users u LEFT JOIN posts p ON p.author_id = u.id",
-            vec![],
-            vec![col_from("body", "string", true, "public", "posts")],
-        )];
-        let out = render(&queries, CodegenOptions {
-            tables: &tables, ..Default::default()
-        });
-        assert!(out.contains("row: { body: Posts[\"body\"] | null }"), "got: {}", out);
+        let out = render(
+            &[q("SELECT p.body FROM users u LEFT JOIN posts p ON p.author_id = u.id",
+                vec![], vec![col_from("body", "string", true, "public", "posts")])],
+            with_tables(&tables),
+        );
+        assert_has(&out, "row: { body: Posts[\"body\"] | null }");
     }
 
     #[test]
     fn cross_schema_disambiguation_no_collision() {
         // public.campaigns elides to "Campaigns"; scheduler.campaigns
-        // becomes "SchedulerCampaigns". These don't actually collide,
-        // so codegen keeps the public-elided name.
+        // becomes "SchedulerCampaigns" — no collision, keep both.
         let tables = vec![
             ts("public", "campaigns", vec![("id", "string", true)]),
             ts("scheduler", "campaigns", vec![("id", "number", true)]),
         ];
-        let out = render(&[], CodegenOptions {
-            tables: &tables, ..Default::default()
-        });
-        assert!(out.contains("export interface Campaigns "), "got: {}", out);
-        assert!(out.contains("export interface SchedulerCampaigns "), "got: {}", out);
+        let out = render(&[], with_tables(&tables));
+        assert_has(&out, "export interface Campaigns ");
+        assert_has(&out, "export interface SchedulerCampaigns ");
     }
 
     #[test]
     fn same_pretty_name_in_different_schemas_disambiguates() {
-        // Same default-stripped pretty name in two non-public schemas →
-        // include the schema prefix on both to disambiguate.
+        // Two non-public schemas with the same table name disambiguate
+        // by including the schema prefix on both.
         let tables = vec![
             ts("scheduler", "campaigns", vec![("id", "number", true)]),
-            // Synthetic collision: a fake schema whose name maps to
-            // the same PascalCase as `scheduler` after stripping
-            // doesn't exist in practice — instead, simulate a direct
-            // tie by injecting two non-public schemas with identical
-            // table names but distinct schema names.
             ts("scheduler_beta", "campaigns", vec![("id", "number", true)]),
         ];
-        let out = render(&[], CodegenOptions {
-            tables: &tables, ..Default::default()
-        });
-        // Both already get unique names without further work
-        // (SchedulerCampaigns vs SchedulerBetaCampaigns).
-        assert!(out.contains("export interface SchedulerCampaigns "), "got: {}", out);
-        assert!(out.contains("export interface SchedulerBetaCampaigns "), "got: {}", out);
+        let out = render(&[], with_tables(&tables));
+        assert_has(&out, "export interface SchedulerCampaigns ");
+        assert_has(&out, "export interface SchedulerBetaCampaigns ");
     }
 }
