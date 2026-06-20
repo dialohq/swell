@@ -10,3 +10,8 @@ rust-version.workspace = true
 swell-analyzer = { workspace = true }
 serde = { workspace = true }
 anyhow = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tokio-postgres = { workspace = true }
+similar = "2.6"
