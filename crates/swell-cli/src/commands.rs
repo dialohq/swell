@@ -25,17 +25,11 @@ pub struct RunOpts {
 
 impl RunOpts {
     // `gen` and `prepare` share semantics — DB-on, prune-on, require-off.
-    pub const GEN: Self = Self {
-        allow_db: true,
-        prune: true,
-        require_cache: false,
-    };
+    #[rustfmt::skip]
+    pub const GEN: Self = Self { allow_db: true, prune: true, require_cache: false };
     pub const PREPARE: Self = Self::GEN;
-    pub const CHECK: Self = Self {
-        allow_db: false,
-        prune: false,
-        require_cache: true,
-    };
+    #[rustfmt::skip]
+    pub const CHECK: Self = Self { allow_db: false, prune: false, require_cache: true };
 }
 
 pub struct RunSummary {
@@ -288,27 +282,21 @@ async fn maybe_connect(cfg: &Config, opts: RunOpts) -> Result<Option<Analyzer>> 
 /// Distinct `(schema, table)` pairs referenced by any analysed query
 /// → `TableSchema`s in one round trip. Missing tables are skipped.
 async fn fetch_referenced_tables(an: &Analyzer, queries: &[InferredQuery]) -> Vec<TableSchema> {
-    let mut pairs: BTreeSet<(String, String)> = BTreeSet::new();
-    for q in queries {
-        for c in &q.columns {
-            if let Some(r) = &c.table_ref {
-                pairs.insert((r.schema.clone(), r.table.clone()));
-            }
-        }
-        for p in &q.params {
-            if let Some(r) = &p.table_ref {
-                pairs.insert((r.schema.clone(), r.table.clone()));
-            }
-        }
-    }
-    let pairs_vec: Vec<(String, String)> = pairs.into_iter().collect();
-    match an.table_schemas(&pairs_vec).await {
-        Ok(t) => t,
-        Err(e) => {
+    let pairs: BTreeSet<(String, String)> = queries
+        .iter()
+        .flat_map(|q| {
+            let cols = q.columns.iter().filter_map(|c| c.table_ref.as_ref());
+            let params = q.params.iter().filter_map(|p| p.table_ref.as_ref());
+            cols.chain(params)
+                .map(|r| (r.schema.clone(), r.table.clone()))
+        })
+        .collect();
+    an.table_schemas(&pairs.into_iter().collect::<Vec<_>>())
+        .await
+        .unwrap_or_else(|e| {
             tracing::debug!("table_schemas failed: {e:#}");
             Vec::new()
-        }
-    }
+        })
 }
 
 fn scan_project(cfg: &Config) -> Result<Vec<ScannedQuery>> {

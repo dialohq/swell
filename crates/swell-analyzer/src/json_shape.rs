@@ -184,7 +184,7 @@ async fn infer_user_func_return(
     catalog: &TypeCatalog,
     fc: &FuncCall,
 ) -> Option<String> {
-    let names = funcname_parts(fc);
+    let names = string_parts(&fc.funcname);
     let (schema, name) = funcname_split(&names)?;
     let row = client
         .query_opt(
@@ -216,7 +216,7 @@ async fn infer_user_func_return(
 /// falls through to the default Json rendering — worst case opaque,
 /// never wrong.
 fn resolve_to_safe_builtin<'c>(catalog: &'c TypeCatalog, fc: &FuncCall) -> Option<&'c str> {
-    let parts = funcname_parts(fc);
+    let parts = string_parts(&fc.funcname);
     let (schema, name) = funcname_split(&parts)?;
     match schema {
         Some("pg_catalog") | None => {
@@ -224,10 +224,6 @@ fn resolve_to_safe_builtin<'c>(catalog: &'c TypeCatalog, fc: &FuncCall) -> Optio
         }
         Some(_) => None,
     }
-}
-
-fn funcname_parts(fc: &FuncCall) -> Vec<String> {
-    string_parts(&fc.funcname)
 }
 
 fn funcname_split(parts: &[String]) -> Option<(Option<&str>, &str)> {
