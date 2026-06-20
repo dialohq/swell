@@ -8,6 +8,7 @@
 pub mod analyzed;
 pub mod build;
 pub mod catalog;
+pub mod comment_hints;
 pub mod describe;
 pub mod json_shape;
 pub mod lowering;
@@ -109,6 +110,8 @@ impl Analyzer {
             json_shape::infer_shapes(&self.client, &self.catalog, sql, described.columns.len())
                 .await;
 
+        let hints = comment_hints::collect(sql, described.columns.len()).unwrap_or_default();
+
         let params: Vec<InferredParam> = described
             .params
             .iter()
@@ -149,13 +152,32 @@ impl Analyzer {
                     Some('?') => Some(true),
                     _ => None,
                 };
+                // Comment hints (`--@swell.<attr>`) take precedence over
+                // the alias markers and the inferred verdict. When any
+                // hint applies we drop the base-column `table_ref` so
+                // the override surfaces verbatim in the generated TS
+                // instead of being masked by an indexed-access lookup.
+                let mut nullable = force_nullable.unwrap_or(inferred_nullable);
+                let mut ts_type = inferred_ts;
+                let col_hints = hints.get(i).map(Vec::as_slice).unwrap_or(&[]);
+                for hint in col_hints {
+                    match hint {
+                        comment_hints::Hint::ForceNotNull(nn) => nullable = !*nn,
+                        comment_hints::Hint::Type(t) => ts_type = t.clone(),
+                    }
+                }
+                let table_ref = if col_hints.is_empty() {
+                    column_meta
+                        .get(&(c.table_oid, c.attnum))
+                        .map(|m| m.table_ref.clone())
+                } else {
+                    None
+                };
                 InferredColumn {
                     name: c.name.clone(),
-                    nullable: force_nullable.unwrap_or(inferred_nullable),
-                    ts_type: inferred_ts,
-                    table_ref: column_meta
-                        .get(&(c.table_oid, c.attnum))
-                        .map(|m| m.table_ref.clone()),
+                    nullable,
+                    ts_type,
+                    table_ref,
                 }
             })
             .collect();
