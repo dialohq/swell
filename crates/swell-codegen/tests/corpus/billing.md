@@ -141,6 +141,18 @@ CREATE TABLE audit_events (
     created_at   timestamptz NOT NULL DEFAULT now()
 );
 
+-- Feature flags exercise CHECK-based literal narrowing on text columns:
+-- swell reduces a column-bound CHECK predicate (equality / IN / ANY /
+-- IS NULL OR <pred>) into a TS literal union and applies it to the
+-- column's `text` rendering.
+CREATE TABLE feature_flags (
+    id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    scope         text NOT NULL CHECK (scope IN ('global', 'workspace', 'user')),
+    tier          text NOT NULL CHECK (tier = ANY (ARRAY['free', 'pro', 'enterprise'])),
+    pinned_to     text CHECK (pinned_to IS NULL OR pinned_to = 'beta'),
+    locked_value  text NOT NULL CHECK (locked_value = 'on')
+);
+
 -- ---------- Functions ----------
 
 -- Sum of paid invoices in cents for a workspace. The `SET search_path`
@@ -217,6 +229,13 @@ export interface BillingAuditEvents {
   target_id: string | null;
   payload: Json;
   created_at: Date;
+}
+export interface BillingFeatureFlags {
+  id: string;
+  scope: "global" | "workspace" | "user";
+  tier: "free" | "pro" | "enterprise";
+  pinned_to: "beta" | null;
+  locked_value: "on";
 }
 export interface BillingInvoices {
   id: string;
@@ -1299,4 +1318,48 @@ SELECT member_count FROM billing.workspace_overview WHERE workspace_id = $1
 ```ts
 $1: string | null
 result: { member_count: BillingWorkspaceOverview["member_count"] }
+```
+
+## Check IN narrows the row type via table reference
+
+```sql
+SELECT scope FROM billing.feature_flags WHERE id = $1
+```
+
+```ts
+$1: string | null
+result: { scope: BillingFeatureFlags["scope"] }
+```
+
+## Check ANY narrows the row type via table reference
+
+```sql
+SELECT tier FROM billing.feature_flags WHERE id = $1
+```
+
+```ts
+$1: string | null
+result: { tier: BillingFeatureFlags["tier"] }
+```
+
+## Check equality narrows to a single literal
+
+```sql
+SELECT locked_value FROM billing.feature_flags WHERE id = $1
+```
+
+```ts
+$1: string | null
+result: { locked_value: BillingFeatureFlags["locked_value"] }
+```
+
+## Check IS NULL OR widens the union with null
+
+```sql
+SELECT pinned_to FROM billing.feature_flags WHERE id = $1
+```
+
+```ts
+$1: string | null
+result: { pinned_to: BillingFeatureFlags["pinned_to"] }
 ```

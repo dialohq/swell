@@ -8,6 +8,7 @@
 pub mod analyzed;
 pub mod build;
 pub mod catalog;
+pub mod checks;
 pub mod describe;
 pub mod json_shape;
 pub mod lowering;
@@ -109,6 +110,18 @@ impl Analyzer {
             json_shape::infer_shapes(&self.client, &self.catalog, sql, described.columns.len())
                 .await;
 
+        // CHECK refinements per (schema, table) referenced by any
+        // base-column column_meta entry. Cached per table to avoid
+        // re-running the pg_constraint query for repeat references.
+        let mut check_refs: HashMap<(String, String), Vec<checks::ColRefinement>> = HashMap::new();
+        for m in column_meta.values() {
+            let key = (m.table_ref.schema.clone(), m.table_ref.table.clone());
+            if !check_refs.contains_key(&key) {
+                let v = checks::refinements_for(&self.client, &key.0, &key.1).await;
+                check_refs.insert(key, v);
+            }
+        }
+
         let params: Vec<InferredParam> = described
             .params
             .iter()
@@ -142,6 +155,11 @@ impl Analyzer {
                 let inferred_ts = infer_setop_literal_union(expr)
                     .or_else(|| json_shapes.by_target.get(i).cloned().flatten())
                     .unwrap_or(oid_ts);
+                let inferred_ts = refine_with_check(
+                    inferred_ts,
+                    column_meta.get(&(c.table_oid, c.attnum)),
+                    &check_refs,
+                );
                 // SQLx-style override markers in the alias: `col!` forces
                 // NOT NULL, `col?` forces nullable.
                 let force_nullable = match c.name.chars().last() {
@@ -209,15 +227,71 @@ impl Analyzer {
                     not_null: row.get(5),
                 });
         }
-        Ok(grouped
+        let mut out: Vec<TableSchema> = grouped
             .into_iter()
             .map(|((schema, table), columns)| TableSchema {
                 schema,
                 table,
                 columns,
             })
-            .collect())
+            .collect();
+        // Apply CHECK refinements per table. A refinement only
+        // overrides the TS type when the base render is *narrowable*
+        // (string / number / boolean / Json) — domain renderings,
+        // enums, composites etc. stay intact.
+        for t in &mut out {
+            apply_check_refinements(
+                &checks::refinements_for(&self.client, &t.schema, &t.table).await,
+                &mut t.columns,
+            );
+        }
+        Ok(out)
     }
+}
+
+fn apply_check_refinements(refs: &[checks::ColRefinement], cols: &mut [TableSchemaColumn]) {
+    for r in refs {
+        if let Some(c) = cols.iter_mut().find(|c| c.name == r.column) {
+            if is_narrowable(&c.ts_type) {
+                // The row-type renderer appends ` | null` based on
+                // `not_null`, so strip an explicit trailing ` | null`
+                // from the refinement to avoid `"beta" | null | null`.
+                let refined = if !c.not_null {
+                    r.refined_ts
+                        .strip_suffix(" | null")
+                        .unwrap_or(&r.refined_ts)
+                        .to_string()
+                } else {
+                    r.refined_ts.clone()
+                };
+                c.ts_type = refined;
+            }
+        }
+    }
+}
+
+fn is_narrowable(ts: &str) -> bool {
+    matches!(ts, "string" | "number" | "boolean" | "Json")
+}
+
+fn refine_with_check(
+    ts: String,
+    meta: Option<&build::ResolvedBaseCol>,
+    refs: &HashMap<(String, String), Vec<checks::ColRefinement>>,
+) -> String {
+    if !is_narrowable(&ts) {
+        return ts;
+    }
+    let Some(m) = meta else { return ts };
+    let key = (m.table_ref.schema.clone(), m.table_ref.table.clone());
+    let Some(refinements) = refs.get(&key) else {
+        return ts;
+    };
+    refinements
+        .iter()
+        .find(|r| r.column == m.table_ref.column)
+        .map(|r| r.refined_ts.clone())
+        .unwrap_or(ts)
 }
 
 /// All `(table_oid, attnum)` pairs in a described query, suitable to
