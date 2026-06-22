@@ -10,6 +10,7 @@ pub mod build;
 pub mod catalog;
 pub mod checks;
 pub mod describe;
+pub mod fk_join;
 pub mod json_shape;
 pub mod lowering;
 pub mod param_nullability;
@@ -121,6 +122,22 @@ impl Analyzer {
             .collect();
         let check_refs = checks::fetch_refinements(&self.client, &referenced_tables).await;
 
+        // Every base table the plan scans — superset of `referenced_
+        // tables` that also covers join-only children (a CHECK on a
+        // table whose columns aren't selected still drives fk-join
+        // variants). Row refinements feed `fk_join`.
+        let scanned_tables: Vec<(String, String)> = plan_walk
+            .alias_to_table
+            .values()
+            .cloned()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        let table_cols_ts =
+            fetch_table_column_ts(&self.client, &self.catalog, &scanned_tables).await;
+        let row_refs =
+            checks::fetch_row_refinements(&self.client, &scanned_tables, &table_cols_ts).await;
+
         let params: Vec<InferredParam> = described
             .params
             .iter()
@@ -173,7 +190,37 @@ impl Analyzer {
             })
             .collect();
 
-        let row_variants = build_row_variants(sql, &analyzed, &plan_walk, &columns);
+        // LEFT JOIN over a nullable FK → discriminated row variants
+        // (the absent arc of an exclusive-arc CHECK is provably null).
+        let out_cols: Vec<fk_join::OutputCol> = described
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, dc)| {
+                let ic = &columns[i];
+                let base_nn = column_meta
+                    .get(&(dc.table_oid, dc.attnum))
+                    .is_some_and(|m| m.not_null);
+                fk_join::OutputCol {
+                    name: ic.name.clone(),
+                    alias: analyzed
+                        .outputs
+                        .get(i)
+                        .and_then(|o| lowering::as_column(&o.expr))
+                        .map(|r| r.alias.clone())
+                        .unwrap_or_default(),
+                    table: ic.table_ref.as_ref().map(|t| (t.schema.clone(), t.table.clone())),
+                    column: ic.table_ref.as_ref().map(|t| t.column.clone()),
+                    ts_type: ic.ts_type.clone(),
+                    widened: base_nn && ic.nullable,
+                }
+            })
+            .collect();
+        let fk_variants =
+            fk_join::left_join_fk_variants(&self.client, sql, &plan_walk, &out_cols, &row_refs)
+                .await;
+
+        let row_variants = build_row_variants(sql, &analyzed, &plan_walk, &columns, fk_variants);
         Ok(InferredQuery {
             sql: sql.to_string(),
             params,
@@ -266,6 +313,53 @@ impl Analyzer {
 
 fn column_ts_with_nullability(c: &TableSchemaColumn) -> String {
     if c.not_null { c.ts_type.clone() } else { format!("{} | null", c.ts_type) }
+}
+
+/// `(schema, table) → (column → TS render with `| null`)` for every
+/// requested table. Feeds `checks::fetch_row_refinements` (which needs
+/// each column's base rendering for `num_nonnulls` non-null forms and
+/// the searched-CASE `Exclude<Base, …>` catch-all).
+async fn fetch_table_column_ts(
+    client: &Client,
+    catalog: &TypeCatalog,
+    tables: &[(String, String)],
+) -> HashMap<(String, String), HashMap<String, String>> {
+    let mut out: HashMap<(String, String), HashMap<String, String>> = HashMap::new();
+    if tables.is_empty() {
+        return out;
+    }
+    let schemas: Vec<&str> = tables.iter().map(|(s, _)| s.as_str()).collect();
+    let names: Vec<&str> = tables.iter().map(|(_, t)| t.as_str()).collect();
+    let Ok(rows) = client
+        .query(
+            r#"
+        WITH ask(schema, name) AS (SELECT * FROM unnest($1::text[], $2::text[]))
+        SELECT n.nspname, c.relname, a.attname, a.atttypid::bigint, t.typname, a.attnotnull
+        FROM ask
+        JOIN pg_namespace n ON n.nspname = ask.schema
+        JOIN pg_class c     ON c.relnamespace = n.oid AND c.relname = ask.name
+        JOIN pg_attribute a ON a.attrelid = c.oid
+        JOIN pg_type t      ON t.oid = a.atttypid
+        WHERE a.attnum > 0 AND NOT a.attisdropped
+        "#,
+            &[&schemas, &names],
+        )
+        .await
+        .inspect_err(|e| tracing::debug!("fetch_table_column_ts: {e}"))
+    else {
+        return out;
+    };
+    for row in &rows {
+        let oid: i64 = row.get(3);
+        let typname: String = row.get(4);
+        let not_null: bool = row.get(5);
+        let base = catalog.render_oid(oid as u32, &typname, Direction::Read);
+        let ts = if not_null { base } else { format!("{base} | null") };
+        out.entry((row.get(0), row.get(1)))
+            .or_default()
+            .insert(row.get(2), ts);
+    }
+    out
 }
 
 fn apply_column_refinements(
@@ -393,10 +487,11 @@ fn build_row_variants(
     analyzed: &analyzed::Analyzed,
     plan_walk: &plan::PlanWalk,
     columns: &[InferredColumn],
+    fk_variants: Vec<RowVariant>,
 ) -> Vec<RowVariant> {
     build_full_join_variants(analyzed, plan_walk, columns)
         .or_else(|| build_grouping_sets_variants(sql, columns))
-        .unwrap_or_default()
+        .unwrap_or(fk_variants)
 }
 
 fn build_full_join_variants(

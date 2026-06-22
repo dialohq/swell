@@ -226,6 +226,55 @@ CREATE TABLE shipments (
     END)
 );
 
+-- ---------- LEFT JOIN over a nullable FK ----------
+-- Parent relations for the exclusive-arc / optional-belongs-to demos.
+CREATE TABLE articles (
+    id      uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    title   text NOT NULL,
+    body    text NOT NULL
+);
+
+CREATE TABLE comments (
+    id    uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    body  text NOT NULL
+);
+
+CREATE TABLE alerts (
+    id        uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    message   text NOT NULL,
+    severity  text NOT NULL
+);
+
+-- Exclusive arc: a notification points at exactly one parent — a
+-- comment OR a system alert — enforced by the CHECK. LEFT JOINing both
+-- parents and reading the CHECK lets swell emit a discriminated row
+-- union: the absent arc's columns are provably null in each variant.
+CREATE TABLE notifications (
+    id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    recipient   uuid NOT NULL,
+    comment_id  uuid REFERENCES comments(id),
+    alert_id    uuid REFERENCES alerts(id),
+    CHECK (num_nonnulls(comment_id, alert_id) = 1)
+);
+
+-- Single optional arc: a feed item is inline prose XOR a link to an
+-- article. LEFT JOINing the article anti-correlates `prose` and the
+-- joined `title`.
+CREATE TABLE feed_items (
+    id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    prose       text,
+    article_id  uuid REFERENCES articles(id),
+    CHECK (num_nonnulls(prose, article_id) = 1)
+);
+
+-- A nullable FK with no correlating CHECK. Selecting the fk column
+-- still correlates it with the joined parent's presence.
+CREATE TABLE bookmarks (
+    id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    owner_id    uuid NOT NULL,
+    article_id  uuid REFERENCES articles(id)
+);
+
 -- ---------- Functions ----------
 
 -- Sum of paid invoices in cents for a workspace. The `SET search_path`
@@ -293,6 +342,16 @@ GROUP BY w.id, u.email, u.last_login_at;
 # Common types
 
 ```ts
+export interface BillingAlerts {
+  id: string;
+  message: string;
+  severity: string;
+}
+export interface BillingArticles {
+  id: string;
+  title: string;
+  body: string;
+}
 export interface BillingAuditEvents {
   id: string;
   workspace_id: string | null;
@@ -310,6 +369,15 @@ export interface BillingBlocksBase {
   body: string | null;
 }
 export type BillingBlocks = BillingBlocksBase & ({ body: null; kind: "image"; url: string } | { body: string; kind: "text"; url: null });
+export interface BillingBookmarks {
+  id: string;
+  owner_id: string;
+  article_id: string | null;
+}
+export interface BillingComments {
+  id: string;
+  body: string;
+}
 export interface BillingContactsBase {
   id: string;
   email: string | null;
@@ -323,6 +391,12 @@ export interface BillingFeatureFlags {
   pinned_to: "beta" | null;
   locked_value: "on";
 }
+export interface BillingFeedItemsBase {
+  id: string;
+  prose: string | null;
+  article_id: string | null;
+}
+export type BillingFeedItems = BillingFeedItemsBase & ({ article_id: null; prose: string } | { article_id: string; prose: null });
 export interface BillingFieldConfigsBase {
   id: string;
   field_type: string;
@@ -348,6 +422,13 @@ export interface BillingMemberships {
   joined_at: Date;
   invited_by: string | null;
 }
+export interface BillingNotificationsBase {
+  id: string;
+  recipient: string;
+  comment_id: string | null;
+  alert_id: string | null;
+}
+export type BillingNotifications = BillingNotificationsBase & ({ alert_id: null; comment_id: string } | { alert_id: string; comment_id: null });
 export interface BillingPayloads {
   id: string;
   payload: { body: string; kind: "text" } & Record<string, Json> | { kind: "image"; url: string } & Record<string, Json>;
@@ -1556,4 +1637,75 @@ SELECT * FROM billing.shipments WHERE id = $1
 ```ts
 $1: string | null
 result: BillingShipments
+```
+
+## Left join nullable FK exclusive arc yields a discriminated row union
+
+```sql
+SELECT n.id, n.recipient, c.body AS comment_body, a.message AS alert_message
+FROM billing.notifications n
+LEFT JOIN billing.comments c ON c.id = n.comment_id
+LEFT JOIN billing.alerts   a ON a.id = n.alert_id
+WHERE n.recipient = $1
+```
+
+```ts
+$1: string | null
+result: { id: BillingNotifications["id"]; recipient: BillingNotifications["recipient"]; comment_body: BillingComments["body"]; alert_message: null } | { id: BillingNotifications["id"]; recipient: BillingNotifications["recipient"]; comment_body: null; alert_message: BillingAlerts["message"] }
+```
+
+## Left join nullable FK single arc anti-correlates prose and title
+
+```sql
+SELECT f.prose, ar.title
+FROM billing.feed_items f
+LEFT JOIN billing.articles ar ON ar.id = f.article_id
+WHERE f.id = $1
+```
+
+```ts
+$1: string | null
+result: { prose: string; title: null } | { prose: null; title: BillingArticles["title"] }
+```
+
+## Left join nullable FK without check correlates selected fk with parent
+
+```sql
+SELECT b.article_id, ar.title
+FROM billing.bookmarks b
+LEFT JOIN billing.articles ar ON ar.id = b.article_id
+WHERE b.id = $1
+```
+
+```ts
+$1: string | null
+result: { article_id: string; title: BillingArticles["title"] } | { article_id: null; title: null }
+```
+
+## Left join nullable FK without check and unselected fk stays flat
+
+```sql
+SELECT b.id, ar.title
+FROM billing.bookmarks b
+LEFT JOIN billing.articles ar ON ar.id = b.article_id
+WHERE b.id = $1
+```
+
+```ts
+$1: string | null
+result: { id: BillingBookmarks["id"]; title: BillingArticles["title"] | null }
+```
+
+## Reverse orientation has-many left join does not narrow
+
+```sql
+SELECT a.id, b.article_id
+FROM billing.articles a
+LEFT JOIN billing.bookmarks b ON b.article_id = a.id
+WHERE a.id = $1
+```
+
+```ts
+$1: string | null
+result: { id: BillingArticles["id"]; article_id: BillingBookmarks["article_id"] }
 ```
