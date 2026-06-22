@@ -141,6 +141,140 @@ CREATE TABLE audit_events (
     created_at   timestamptz NOT NULL DEFAULT now()
 );
 
+-- Feature flags exercise CHECK-based literal narrowing on text columns:
+-- swell reduces a column-bound CHECK predicate (equality / IN / ANY /
+-- IS NULL OR <pred>) into a TS literal union and applies it to the
+-- column's `text` rendering.
+CREATE TABLE feature_flags (
+    id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    scope         text NOT NULL CHECK (scope IN ('global', 'workspace', 'user')),
+    tier          text NOT NULL CHECK (tier = ANY (ARRAY['free', 'pro', 'enterprise'])),
+    pinned_to     text CHECK (pinned_to IS NULL OR pinned_to = 'beta'),
+    locked_value  text NOT NULL CHECK (locked_value = 'on')
+);
+
+-- Tier 2: jsonb object shapes. AND-chain of jsonb_typeof / ?& / ->-typed
+-- predicates reduces to a TS object type.
+CREATE TABLE widgets (
+    id    uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    meta  jsonb NOT NULL CHECK (
+        jsonb_typeof(meta) = 'object'
+        AND meta ?& ARRAY['width', 'height']
+        AND jsonb_typeof(meta -> 'width') = 'number'
+        AND jsonb_typeof(meta -> 'height') = 'number'
+    )
+);
+
+-- Tier 3 col-level: OR over AND-chains reduces to a TS union.
+CREATE TABLE payloads (
+    id       uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    payload  jsonb NOT NULL CHECK (
+        (payload ->> 'kind' = 'text'
+         AND jsonb_typeof(payload -> 'body') = 'string')
+        OR (payload ->> 'kind' = 'image'
+            AND jsonb_typeof(payload -> 'url') = 'string')
+    )
+);
+
+-- Tier 3 row-level (num_nonnulls): exactly one of `email` / `phone`
+-- non-null per row → TS row variants.
+CREATE TABLE contacts (
+    id     uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    email  text,
+    phone  text,
+    CHECK (num_nonnulls(email, phone) = 1)
+);
+
+-- Tier 3 row-level (CASE): discriminant column pins per-branch
+-- refinement on the JSON config; ELSE false makes it exhaustive.
+CREATE TABLE field_configs (
+    id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    field_type  text NOT NULL,
+    config      jsonb NOT NULL,
+    CHECK (CASE
+        WHEN field_type = 'text'   THEN jsonb_typeof(config -> 'maxLength') = 'number'
+        WHEN field_type = 'select' THEN jsonb_typeof(config -> 'options')   = 'array'
+        ELSE false
+    END)
+);
+
+-- Multi-column OR-of-AND row narrowing: each branch pins a different
+-- combination of `kind` (literal) and which of `url` / `body` is
+-- non-null. The row reducer recognises arbitrary AND-chains of
+-- atomic predicates (`= lit`, `IS NOT NULL`, `IS NULL`).
+CREATE TABLE blocks (
+    id    uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    kind  text NOT NULL,
+    url   text,
+    body  text,
+    CHECK (
+        (kind = 'image' AND url  IS NOT NULL AND body IS NULL)
+        OR (kind = 'text' AND body IS NOT NULL AND url  IS NULL)
+    )
+);
+
+-- CASE THEN with a NullTest narrows a non-discriminant column per
+-- variant; ELSE true widens with the discriminant catch-all.
+CREATE TABLE shipments (
+    id        uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    status    text NOT NULL,
+    paid_at   timestamptz,
+    CHECK (CASE
+        WHEN status = 'paid'  THEN paid_at IS NOT NULL
+        WHEN status = 'draft' THEN paid_at IS NULL
+        ELSE true
+    END)
+);
+
+-- ---------- LEFT JOIN over a nullable FK ----------
+-- Parent relations for the exclusive-arc / optional-belongs-to demos.
+CREATE TABLE articles (
+    id      uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    title   text NOT NULL,
+    body    text NOT NULL
+);
+
+CREATE TABLE comments (
+    id    uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    body  text NOT NULL
+);
+
+CREATE TABLE alerts (
+    id        uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    message   text NOT NULL,
+    severity  text NOT NULL
+);
+
+-- Exclusive arc: a notification points at exactly one parent — a
+-- comment OR a system alert — enforced by the CHECK. LEFT JOINing both
+-- parents and reading the CHECK lets swell emit a discriminated row
+-- union: the absent arc's columns are provably null in each variant.
+CREATE TABLE notifications (
+    id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    recipient   uuid NOT NULL,
+    comment_id  uuid REFERENCES comments(id),
+    alert_id    uuid REFERENCES alerts(id),
+    CHECK (num_nonnulls(comment_id, alert_id) = 1)
+);
+
+-- Single optional arc: a feed item is inline prose XOR a link to an
+-- article. LEFT JOINing the article anti-correlates `prose` and the
+-- joined `title`.
+CREATE TABLE feed_items (
+    id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    prose       text,
+    article_id  uuid REFERENCES articles(id),
+    CHECK (num_nonnulls(prose, article_id) = 1)
+);
+
+-- A nullable FK with no correlating CHECK. Selecting the fk column
+-- still correlates it with the joined parent's presence.
+CREATE TABLE bookmarks (
+    id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    owner_id    uuid NOT NULL,
+    article_id  uuid REFERENCES articles(id)
+);
+
 -- ---------- Functions ----------
 
 -- Sum of paid invoices in cents for a workspace. The `SET search_path`
@@ -208,6 +342,16 @@ GROUP BY w.id, u.email, u.last_login_at;
 # Common types
 
 ```ts
+export interface BillingAlerts {
+  id: string;
+  message: string;
+  severity: string;
+}
+export interface BillingArticles {
+  id: string;
+  title: string;
+  body: string;
+}
 export interface BillingAuditEvents {
   id: string;
   workspace_id: string | null;
@@ -218,6 +362,47 @@ export interface BillingAuditEvents {
   payload: Json;
   created_at: Date;
 }
+export interface BillingBlocksBase {
+  id: string;
+  kind: string;
+  url: string | null;
+  body: string | null;
+}
+export type BillingBlocks = BillingBlocksBase & ({ body: null; kind: "image"; url: string } | { body: string; kind: "text"; url: null });
+export interface BillingBookmarks {
+  id: string;
+  owner_id: string;
+  article_id: string | null;
+}
+export interface BillingComments {
+  id: string;
+  body: string;
+}
+export interface BillingContactsBase {
+  id: string;
+  email: string | null;
+  phone: string | null;
+}
+export type BillingContacts = BillingContactsBase & ({ email: string; phone: null } | { email: null; phone: string });
+export interface BillingFeatureFlags {
+  id: string;
+  scope: "global" | "workspace" | "user";
+  tier: "free" | "pro" | "enterprise";
+  pinned_to: "beta" | null;
+  locked_value: "on";
+}
+export interface BillingFeedItemsBase {
+  id: string;
+  prose: string | null;
+  article_id: string | null;
+}
+export type BillingFeedItems = BillingFeedItemsBase & ({ article_id: null; prose: string } | { article_id: string; prose: null });
+export interface BillingFieldConfigsBase {
+  id: string;
+  field_type: string;
+  config: Json;
+}
+export type BillingFieldConfigs = BillingFieldConfigsBase & ({ config: { maxLength: number } & Record<string, Json>; field_type: "text" } | { config: { options: Json[] } & Record<string, Json>; field_type: "select" });
 export interface BillingInvoices {
   id: string;
   subscription_id: string;
@@ -236,6 +421,17 @@ export interface BillingMemberships {
   role: "owner" | "admin" | "member" | "viewer";
   joined_at: Date;
   invited_by: string | null;
+}
+export interface BillingNotificationsBase {
+  id: string;
+  recipient: string;
+  comment_id: string | null;
+  alert_id: string | null;
+}
+export type BillingNotifications = BillingNotificationsBase & ({ alert_id: null; comment_id: string } | { alert_id: string; comment_id: null });
+export interface BillingPayloads {
+  id: string;
+  payload: { body: string; kind: "text" } & Record<string, Json> | { kind: "image"; url: string } & Record<string, Json>;
 }
 export interface BillingPlans {
   id: string;
@@ -256,6 +452,12 @@ export interface BillingPromotions {
   discount_pct: string;
   code_lower: string | null;
 }
+export interface BillingShipmentsBase {
+  id: string;
+  status: string;
+  paid_at: Date | null;
+}
+export type BillingShipments = BillingShipmentsBase & ({ paid_at: Date; status: "paid" } | { paid_at: null; status: "draft" } | { status: Exclude<string, "paid" | "draft"> });
 export interface BillingSubscriptions {
   id: string;
   workspace_id: string;
@@ -276,6 +478,10 @@ export interface BillingUsers {
   created_at: Date;
   last_login_at: Date | null;
   metadata: Json;
+}
+export interface BillingWidgets {
+  id: string;
+  meta: { height: number; width: number } & Record<string, Json>;
 }
 export interface BillingWorkspaceOverview {
   workspace_id: string | null;
@@ -1299,4 +1505,207 @@ SELECT member_count FROM billing.workspace_overview WHERE workspace_id = $1
 ```ts
 $1: string | null
 result: { member_count: BillingWorkspaceOverview["member_count"] }
+```
+
+## Check IN narrows the row type via table reference
+
+```sql
+SELECT scope FROM billing.feature_flags WHERE id = $1
+```
+
+```ts
+$1: string | null
+result: { scope: BillingFeatureFlags["scope"] }
+```
+
+## Check ANY narrows the row type via table reference
+
+```sql
+SELECT tier FROM billing.feature_flags WHERE id = $1
+```
+
+```ts
+$1: string | null
+result: { tier: BillingFeatureFlags["tier"] }
+```
+
+## Check equality narrows to a single literal
+
+```sql
+SELECT locked_value FROM billing.feature_flags WHERE id = $1
+```
+
+```ts
+$1: string | null
+result: { locked_value: BillingFeatureFlags["locked_value"] }
+```
+
+## Check IS NULL OR widens the union with null
+
+```sql
+SELECT pinned_to FROM billing.feature_flags WHERE id = $1
+```
+
+```ts
+$1: string | null
+result: { pinned_to: BillingFeatureFlags["pinned_to"] }
+```
+
+## Check tier 2 narrows jsonb to an object shape
+
+```sql
+SELECT meta FROM billing.widgets WHERE id = $1
+```
+
+```ts
+$1: string | null
+result: { meta: BillingWidgets["meta"] }
+```
+
+## Check tier 3 col-level OR over AND-chains narrows jsonb to a union
+
+```sql
+SELECT payload FROM billing.payloads WHERE id = $1
+```
+
+```ts
+$1: string | null
+result: { payload: BillingPayloads["payload"] }
+```
+
+## Check tier 3 row-level num_nonnulls emits a row variant intersection
+
+```sql
+SELECT email, phone FROM billing.contacts WHERE id = $1
+```
+
+```ts
+$1: string | null
+result: { email: BillingContacts["email"]; phone: BillingContacts["phone"] }
+```
+
+## Check tier 3 row-level CASE discriminates field configs by type
+
+```sql
+SELECT field_type, config FROM billing.field_configs WHERE id = $1
+```
+
+```ts
+$1: string | null
+result: { field_type: BillingFieldConfigs["field_type"]; config: BillingFieldConfigs["config"] }
+```
+
+## Check tier 2 jsonb arrow expression on narrowed col loses table ref
+
+```sql
+SELECT meta -> 'width' AS width FROM billing.widgets WHERE id = $1
+```
+
+```ts
+$1: string | null
+result: { width: Json | null }
+```
+
+## Select star against table with row variants preserves intersection
+
+```sql
+SELECT * FROM billing.contacts WHERE id = $1
+```
+
+```ts
+$1: string | null
+result: BillingContacts
+```
+
+## Check OR-of-AND with multi-column narrowing emits row variants
+
+```sql
+SELECT * FROM billing.blocks WHERE id = $1
+```
+
+```ts
+$1: string | null
+result: BillingBlocks
+```
+
+## Check CASE THEN with IS NOT NULL pins per-branch nullability
+
+```sql
+SELECT * FROM billing.shipments WHERE id = $1
+```
+
+```ts
+$1: string | null
+result: BillingShipments
+```
+
+## Left join nullable FK exclusive arc yields a discriminated row union
+
+```sql
+SELECT n.id, n.recipient, c.body AS comment_body, a.message AS alert_message
+FROM billing.notifications n
+LEFT JOIN billing.comments c ON c.id = n.comment_id
+LEFT JOIN billing.alerts   a ON a.id = n.alert_id
+WHERE n.recipient = $1
+```
+
+```ts
+$1: string | null
+result: { id: BillingNotifications["id"]; recipient: BillingNotifications["recipient"]; comment_body: BillingComments["body"]; alert_message: null } | { id: BillingNotifications["id"]; recipient: BillingNotifications["recipient"]; comment_body: null; alert_message: BillingAlerts["message"] }
+```
+
+## Left join nullable FK single arc anti-correlates prose and title
+
+```sql
+SELECT f.prose, ar.title
+FROM billing.feed_items f
+LEFT JOIN billing.articles ar ON ar.id = f.article_id
+WHERE f.id = $1
+```
+
+```ts
+$1: string | null
+result: { prose: string; title: null } | { prose: null; title: BillingArticles["title"] }
+```
+
+## Left join nullable FK without check correlates selected fk with parent
+
+```sql
+SELECT b.article_id, ar.title
+FROM billing.bookmarks b
+LEFT JOIN billing.articles ar ON ar.id = b.article_id
+WHERE b.id = $1
+```
+
+```ts
+$1: string | null
+result: { article_id: string; title: BillingArticles["title"] } | { article_id: null; title: null }
+```
+
+## Left join nullable FK without check and unselected fk stays flat
+
+```sql
+SELECT b.id, ar.title
+FROM billing.bookmarks b
+LEFT JOIN billing.articles ar ON ar.id = b.article_id
+WHERE b.id = $1
+```
+
+```ts
+$1: string | null
+result: { id: BillingBookmarks["id"]; title: BillingArticles["title"] | null }
+```
+
+## Reverse orientation has-many left join does not narrow
+
+```sql
+SELECT a.id, b.article_id
+FROM billing.articles a
+LEFT JOIN billing.bookmarks b ON b.article_id = a.id
+WHERE a.id = $1
+```
+
+```ts
+$1: string | null
+result: { id: BillingArticles["id"]; article_id: BillingBookmarks["article_id"] }
 ```

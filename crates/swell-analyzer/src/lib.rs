@@ -8,7 +8,9 @@
 pub mod analyzed;
 pub mod build;
 pub mod catalog;
+pub mod checks;
 pub mod describe;
+pub mod fk_join;
 pub mod json_shape;
 pub mod lowering;
 pub mod param_nullability;
@@ -19,8 +21,8 @@ pub mod scope;
 pub mod ts_types;
 
 pub use query::{
-    InferredColumn, InferredParam, InferredQuery, RowVariant, TableColRef, TableSchema,
-    TableSchemaColumn,
+    InferredColumn, InferredParam, InferredQuery, RowVariant, TableColRef, TableRowCheck,
+    TableRowVariant, TableSchema, TableSchemaColumn,
 };
 pub use ts_types::{Direction, TypeCatalog, TypeOverride};
 
@@ -109,6 +111,33 @@ impl Analyzer {
             json_shape::infer_shapes(&self.client, &self.catalog, sql, described.columns.len())
                 .await;
 
+        // CHECK refinements for every distinct base table referenced
+        // by column_meta. Tier 1-3 column-level refinements feed into
+        // the per-query column rendering; row-level refinements are
+        // surfaced on `TableSchema.row_checks` by `table_schemas`.
+        let referenced_tables: Vec<(String, String)> = column_meta.values()
+            .map(|m| (m.table_ref.schema.clone(), m.table_ref.table.clone()))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        let check_refs = checks::fetch_refinements(&self.client, &referenced_tables).await;
+
+        // Every base table the plan scans — superset of `referenced_
+        // tables` that also covers join-only children (a CHECK on a
+        // table whose columns aren't selected still drives fk-join
+        // variants). Row refinements feed `fk_join`.
+        let scanned_tables: Vec<(String, String)> = plan_walk
+            .alias_to_table
+            .values()
+            .cloned()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        let table_cols_ts =
+            fetch_table_column_ts(&self.client, &self.catalog, &scanned_tables).await;
+        let row_refs =
+            checks::fetch_row_refinements(&self.client, &scanned_tables, &table_cols_ts).await;
+
         let params: Vec<InferredParam> = described
             .params
             .iter()
@@ -142,6 +171,9 @@ impl Analyzer {
                 let inferred_ts = infer_setop_literal_union(expr)
                     .or_else(|| json_shapes.by_target.get(i).cloned().flatten())
                     .unwrap_or(oid_ts);
+                let table_ref_opt = column_meta.get(&(c.table_oid, c.attnum))
+                    .map(|m| m.table_ref.clone());
+                let inferred_ts = refine_with_check(inferred_ts, table_ref_opt.as_ref(), &check_refs);
                 // SQLx-style override markers in the alias: `col!` forces
                 // NOT NULL, `col?` forces nullable.
                 let force_nullable = match c.name.chars().last() {
@@ -153,14 +185,42 @@ impl Analyzer {
                     name: c.name.clone(),
                     nullable: force_nullable.unwrap_or(inferred_nullable),
                     ts_type: inferred_ts,
-                    table_ref: column_meta
-                        .get(&(c.table_oid, c.attnum))
-                        .map(|m| m.table_ref.clone()),
+                    table_ref: table_ref_opt,
                 }
             })
             .collect();
 
-        let row_variants = build_row_variants(sql, &analyzed, &plan_walk, &columns);
+        // LEFT JOIN over a nullable FK → discriminated row variants
+        // (the absent arc of an exclusive-arc CHECK is provably null).
+        let out_cols: Vec<fk_join::OutputCol> = described
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, dc)| {
+                let ic = &columns[i];
+                let base_nn = column_meta
+                    .get(&(dc.table_oid, dc.attnum))
+                    .is_some_and(|m| m.not_null);
+                fk_join::OutputCol {
+                    name: ic.name.clone(),
+                    alias: analyzed
+                        .outputs
+                        .get(i)
+                        .and_then(|o| lowering::as_column(&o.expr))
+                        .map(|r| r.alias.clone())
+                        .unwrap_or_default(),
+                    table: ic.table_ref.as_ref().map(|t| (t.schema.clone(), t.table.clone())),
+                    column: ic.table_ref.as_ref().map(|t| t.column.clone()),
+                    ts_type: ic.ts_type.clone(),
+                    widened: base_nn && ic.nullable,
+                }
+            })
+            .collect();
+        let fk_variants =
+            fk_join::left_join_fk_variants(&self.client, sql, &plan_walk, &out_cols, &row_refs)
+                .await;
+
+        let row_variants = build_row_variants(sql, &analyzed, &plan_walk, &columns, fk_variants);
         Ok(InferredQuery {
             sql: sql.to_string(),
             params,
@@ -209,15 +269,137 @@ impl Analyzer {
                     not_null: row.get(5),
                 });
         }
-        Ok(grouped
+        let mut out: Vec<TableSchema> = grouped
             .into_iter()
             .map(|((schema, table), columns)| TableSchema {
                 schema,
                 table,
                 columns,
+                row_checks: Vec::new(),
             })
-            .collect())
+            .collect();
+        // Apply CHECK refinements per table. Column-level (Tier 1-3)
+        // override `ts_type` when narrowable; row-level (Tier 3 cross-
+        // column) populate `row_checks` for codegen to render as
+        // `Base & (variants)`.
+        let pairs_for_checks: Vec<(String, String)> =
+            out.iter().map(|t| (t.schema.clone(), t.table.clone())).collect();
+        let col_refs = checks::fetch_refinements(&self.client, &pairs_for_checks).await;
+        for t in &mut out {
+            apply_column_refinements(&t.schema, &t.table, &col_refs, &mut t.columns);
+        }
+        // Row-level CHECKs need the per-column base TS rendering so the
+        // `Exclude<Base, ...>` catch-all has its base type. Build that
+        // map first, then fetch and attach refinements.
+        let table_columns: HashMap<(String, String), HashMap<String, String>> = out.iter()
+            .map(|t| {
+                let cols = t.columns.iter()
+                    .map(|c| (c.name.clone(), column_ts_with_nullability(c)))
+                    .collect();
+                ((t.schema.clone(), t.table.clone()), cols)
+            })
+            .collect();
+        let row_refs = checks::fetch_row_refinements(
+            &self.client, &pairs_for_checks, &table_columns,
+        ).await;
+        for t in &mut out {
+            if let Some(refs) = row_refs.get(&(t.schema.clone(), t.table.clone())) {
+                t.row_checks = refs.iter().cloned().map(|r| r.into_table_check()).collect();
+            }
+        }
+        Ok(out)
     }
+}
+
+fn column_ts_with_nullability(c: &TableSchemaColumn) -> String {
+    if c.not_null { c.ts_type.clone() } else { format!("{} | null", c.ts_type) }
+}
+
+/// `(schema, table) → (column → TS render with `| null`)` for every
+/// requested table. Feeds `checks::fetch_row_refinements` (which needs
+/// each column's base rendering for `num_nonnulls` non-null forms and
+/// the searched-CASE `Exclude<Base, …>` catch-all).
+async fn fetch_table_column_ts(
+    client: &Client,
+    catalog: &TypeCatalog,
+    tables: &[(String, String)],
+) -> HashMap<(String, String), HashMap<String, String>> {
+    let mut out: HashMap<(String, String), HashMap<String, String>> = HashMap::new();
+    if tables.is_empty() {
+        return out;
+    }
+    let schemas: Vec<&str> = tables.iter().map(|(s, _)| s.as_str()).collect();
+    let names: Vec<&str> = tables.iter().map(|(_, t)| t.as_str()).collect();
+    let Ok(rows) = client
+        .query(
+            r#"
+        WITH ask(schema, name) AS (SELECT * FROM unnest($1::text[], $2::text[]))
+        SELECT n.nspname, c.relname, a.attname, a.atttypid::bigint, t.typname, a.attnotnull
+        FROM ask
+        JOIN pg_namespace n ON n.nspname = ask.schema
+        JOIN pg_class c     ON c.relnamespace = n.oid AND c.relname = ask.name
+        JOIN pg_attribute a ON a.attrelid = c.oid
+        JOIN pg_type t      ON t.oid = a.atttypid
+        WHERE a.attnum > 0 AND NOT a.attisdropped
+        "#,
+            &[&schemas, &names],
+        )
+        .await
+        .inspect_err(|e| tracing::debug!("fetch_table_column_ts: {e}"))
+    else {
+        return out;
+    };
+    for row in &rows {
+        let oid: i64 = row.get(3);
+        let typname: String = row.get(4);
+        let not_null: bool = row.get(5);
+        let base = catalog.render_oid(oid as u32, &typname, Direction::Read);
+        let ts = if not_null { base } else { format!("{base} | null") };
+        out.entry((row.get(0), row.get(1)))
+            .or_default()
+            .insert(row.get(2), ts);
+    }
+    out
+}
+
+fn apply_column_refinements(
+    schema: &str,
+    table: &str,
+    refs: &HashMap<(String, String, String), checks::Refinement>,
+    cols: &mut [TableSchemaColumn],
+) {
+    for c in cols.iter_mut() {
+        let key = (schema.to_string(), table.to_string(), c.name.clone());
+        let Some(r) = refs.get(&key) else { continue };
+        if !is_narrowable(&c.ts_type) { continue }
+        let Some(rendered) = r.render_ts() else { continue };
+        // Row-type renderer appends ` | null` on nullable cols, so
+        // strip an explicit trailing ` | null` to avoid duplication.
+        c.ts_type = if !c.not_null {
+            rendered.strip_suffix(" | null").unwrap_or(&rendered).to_string()
+        } else {
+            rendered
+        };
+    }
+}
+
+fn is_narrowable(ts: &str) -> bool {
+    matches!(ts, "string" | "number" | "boolean" | "Json")
+}
+
+fn refine_with_check(
+    ts: String,
+    table_ref: Option<&TableColRef>,
+    refs: &HashMap<(String, String, String), checks::Refinement>,
+) -> String {
+    if !is_narrowable(&ts) {
+        return ts;
+    }
+    let Some(tref) = table_ref else { return ts };
+    let key = (tref.schema.clone(), tref.table.clone(), tref.column.clone());
+    refs.get(&key)
+        .and_then(|r| r.render_ts())
+        .unwrap_or(ts)
 }
 
 /// All `(table_oid, attnum)` pairs in a described query, suitable to
@@ -305,10 +487,11 @@ fn build_row_variants(
     analyzed: &analyzed::Analyzed,
     plan_walk: &plan::PlanWalk,
     columns: &[InferredColumn],
+    fk_variants: Vec<RowVariant>,
 ) -> Vec<RowVariant> {
     build_full_join_variants(analyzed, plan_walk, columns)
         .or_else(|| build_grouping_sets_variants(sql, columns))
-        .unwrap_or_default()
+        .unwrap_or(fk_variants)
 }
 
 fn build_full_join_variants(
